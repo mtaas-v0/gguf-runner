@@ -83,6 +83,7 @@ enum ModelFamily {
     Qwen3Vl,
     Qwen3Moe,
     Qwen3Next,
+    BertFamily,
 }
 
 struct ModelIdentity {
@@ -379,6 +380,21 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
                 identity.key_prefix
             );
         }
+    } else if arch == "bert"
+        || arch == "nomic-bert"
+        || arch == "roberta"
+        || arch == "xlm-roberta"
+        || arch == "bert-large"
+        || arch == "distilbert"
+        || arch == "electra"
+        || arch == "camembert"
+        || arch == "albert"
+    {
+        identity.family = ModelFamily::BertFamily;
+        identity.key_prefix = arch.to_string();
+        if debug_mode {
+            eprintln!("Detected BERT-family architecture '{arch}', using {arch}.* keys");
+        }
     }
 
     identity
@@ -389,7 +405,7 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
     let is_qwen3vlmoe_arch = arch == "qwen3vlmoe" || arch.starts_with("qwen3vlmoe");
     if arch.starts_with("deepseek") {
         return Err(format!(
-            "unsupported GGUF architecture '{arch}': DeepSeek models are not implemented yet in this runtime (supported: llama, gemma, qwen2, qwen35, qwen3vl, qwen3moe, qwen3next)"
+            "unsupported GGUF architecture '{arch}': DeepSeek models are not implemented yet in this runtime (supported: llama, gemma, qwen2, qwen35, qwen3vl, qwen3moe, qwen3next, bert, nomic-bert, roberta)"
         ));
     }
     let identity = detect_model_identity(gguf, debug_mode);
@@ -449,6 +465,7 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         head_dim: 0,
         rope_dim: 0,
         rope_sections: [0; 4],
+        is_bert_family: identity.family == ModelFamily::BertFamily,
         is_gemma3: identity.family == ModelFamily::Gemma,
         is_qwen2: identity.family == ModelFamily::Qwen2 || identity.family == ModelFamily::Qwen35,
         is_qwen35: identity.family == ModelFamily::Qwen35,

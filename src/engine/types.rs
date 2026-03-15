@@ -373,6 +373,7 @@ pub(crate) struct Config {
     pub(crate) head_dim: usize,
     pub(crate) rope_dim: usize,
     pub(crate) rope_sections: [usize; 4],
+    pub(crate) is_bert_family: bool,
     pub(crate) is_gemma3: bool,
     pub(crate) is_qwen2: bool,
     pub(crate) is_qwen35: bool,
@@ -437,6 +438,9 @@ pub(crate) struct TransformerWeights {
     pub(crate) attn_qk_norm_present: Vec<bool>,
     pub(crate) attn_post_norm: Vec<f32>,
     pub(crate) ffn_post_norm: Vec<f32>,
+    /// Bias vectors for BERT-family post-LayerNorm (empty for non-BERT models).
+    pub(crate) attn_post_norm_bias: Vec<f32>,
+    pub(crate) ffn_post_norm_bias: Vec<f32>,
 }
 
 pub(crate) struct RunState {

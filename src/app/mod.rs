@@ -27,13 +27,16 @@ const MAX_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4"];
-const REPL_COMMANDS: [&str; 8] = [
+const REPL_COMMANDS: [&str; 11] = [
     "help",
     "model",
     "image",
     "images",
     "clear-images",
     "clear",
+    "doc",
+    "docs",
+    "clear-docs",
     "exit",
     "quit",
 ];
@@ -238,6 +241,11 @@ pub(crate) fn run() -> Result<(), String> {
         }
     }
 
+    // --rag-build: build (or rebuild) the RAG index and exit without generating.
+    if cli.rag_build {
+        return run_rag_build_mode(&cli);
+    }
+
     match cli.mode {
         CliOperationMode::Oneshot => {
             let mut runtime = generation::ModelRuntime::load(&cli)?;
@@ -295,6 +303,43 @@ fn run_oneshot_mode(
     Ok(())
 }
 
+fn run_rag_build_mode(cli: &CliOptions) -> Result<(), String> {
+    let src = cli
+        .rag_source
+        .as_deref()
+        .ok_or("--rag-build requires --rag-source <wiki-dir>".to_string())?;
+    let idx_path = cli
+        .rag_index
+        .as_deref()
+        .ok_or("--rag-build requires --rag-index <output.ragidx>".to_string())?;
+    let enc_path = cli
+        .rag_encoder
+        .clone()
+        .or_else(|| crate::rag::encoder::discover_embedding_sidecar(&cli.model))
+        .ok_or(
+            "--rag-build requires --rag-encoder <embed.gguf> or an auto-discoverable embed*.gguf next to the model".to_string(),
+        )?;
+
+    eprintln!("RAG build: encoder='{enc_path}', source='{src}', index='{idx_path}'");
+    let mut encoder = crate::rag::DocumentEncoder::load(&enc_path, cli.debug)?;
+    let src_path = std::path::Path::new(src);
+    let index = crate::rag::RagIndex::build_from_dir(
+        src_path,
+        &mut encoder,
+        cli.rag_max_chars_per_chunk,
+        cli.rag_max_tokens_per_chunk,
+        None,
+        cli.debug || cli.profiling,
+    )?;
+    eprintln!("RAG build: {} chunks embedded, saving…", index.len());
+    index.save(std::path::Path::new(idx_path))?;
+    eprintln!("RAG build: index saved to '{idx_path}'");
+    if cli.profiling {
+        print_profile_report();
+    }
+    Ok(())
+}
+
 fn run_repl_mode(cli: &CliOptions) -> Result<(), String> {
     if !cli.images.is_empty() || !cli.videos.is_empty() || !cli.audios.is_empty() {
         return Err("`--image/--video/--audio` are not supported in repl mode yet".to_string());
@@ -309,6 +354,9 @@ pub(crate) enum ReplCommandAction {
     ListImages,
     ClearImages,
     ClearState,
+    LoadDocSource(String),
+    ClearDocs,
+    DocStatus,
     ModelPrompt(String),
 }
 
@@ -342,6 +390,17 @@ pub(crate) fn handle_repl_command(cli: &CliOptions, input: &str) -> ReplCommandA
         "images" => ReplCommandAction::ListImages,
         "clear-images" => ReplCommandAction::ClearImages,
         "clear" => ReplCommandAction::ClearState,
+        "doc" => {
+            if rest.is_empty() {
+                ReplCommandAction::Messages(vec![
+                    "Usage: /doc <path-to-wiki-directory>".to_string(),
+                ])
+            } else {
+                ReplCommandAction::LoadDocSource(rest.to_string())
+            }
+        }
+        "docs" => ReplCommandAction::DocStatus,
+        "clear-docs" => ReplCommandAction::ClearDocs,
         "exit" | "quit" => ReplCommandAction::Exit,
         _ => ReplCommandAction::Messages(vec![format!(
             "Unknown command '/{}'. Type /help for commands.",
@@ -360,7 +419,7 @@ fn expand_repl_tab_completion(input: &str) -> String {
         return "/".to_string();
     }
     if let Some((typed_cmd, rest)) = split_repl_command_and_rest(&sanitized)
-        && typed_cmd == "image"
+        && matches!(typed_cmd, "image" | "doc")
         && rest.starts_with(char::is_whitespace)
     {
         if let Some(completed) = complete_filesystem_path(rest.trim_start()) {
@@ -467,6 +526,9 @@ pub(crate) fn repl_help_lines() -> Vec<String> {
         "  /images        List active image attachments".to_string(),
         "  /clear-images  Remove all active image attachments".to_string(),
         "  /clear         Reset chat history and active attachments".to_string(),
+        "  /doc <dir>     Load knowledge from a wiki directory".to_string(),
+        "  /docs          Show active knowledge status".to_string(),
+        "  /clear-docs    Drop active knowledge index".to_string(),
         "  /exit          Exit REPL".to_string(),
         "  /quit          Exit REPL".to_string(),
         "  /e<Tab> expands to /exit".to_string(),

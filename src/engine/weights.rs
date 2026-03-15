@@ -363,27 +363,45 @@ pub(crate) fn init_weights_from_gguf(
         } else {
             Vec::new()
         };
-    let mut attn_post_norm = if p.is_gemma3 {
+    let mut attn_post_norm = if p.is_gemma3 || p.is_bert_family {
         vec![0.0f32; n_layers * p.dim]
     } else {
         Vec::new()
     };
-    let mut ffn_post_norm = if p.is_gemma3 {
+    let mut ffn_post_norm = if p.is_gemma3 || p.is_bert_family {
+        vec![0.0f32; n_layers * p.dim]
+    } else {
+        Vec::new()
+    };
+    let mut attn_post_norm_bias: Vec<f32> = if p.is_bert_family {
+        vec![0.0f32; n_layers * p.dim]
+    } else {
+        Vec::new()
+    };
+    let mut ffn_post_norm_bias: Vec<f32> = if p.is_bert_family {
         vec![0.0f32; n_layers * p.dim]
     } else {
         Vec::new()
     };
 
     for l in 0..n_layers {
-        let attn_norm = load_layer_tensor_float(gguf, l, "attn_norm.weight", p.dim)?;
-        rms_att_weight[l * p.dim..(l + 1) * p.dim].copy_from_slice(&attn_norm);
-
-        let ffn_norm = if p.is_qwen3next {
-            load_layer_tensor_float(gguf, l, "post_attention_norm.weight", p.dim)?
+        // BERT-family uses post-norm: skip pre-norm tensors (they don't exist in the GGUF).
+        // Fill with 1.0 so that rmsnorm(x, weight=1) ≈ identity (pre-norm is bypassed in
+        // inference when is_bert_family is true; these slots are never actually read then).
+        if p.is_bert_family {
+            rms_att_weight[l * p.dim..(l + 1) * p.dim].fill(1.0);
+            rms_ffn_weight[l * p.dim..(l + 1) * p.dim].fill(1.0);
         } else {
-            load_layer_tensor_float(gguf, l, "ffn_norm.weight", p.dim)?
-        };
-        rms_ffn_weight[l * p.dim..(l + 1) * p.dim].copy_from_slice(&ffn_norm);
+            let attn_norm = load_layer_tensor_float(gguf, l, "attn_norm.weight", p.dim)?;
+            rms_att_weight[l * p.dim..(l + 1) * p.dim].copy_from_slice(&attn_norm);
+
+            let ffn_norm = if p.is_qwen3next {
+                load_layer_tensor_float(gguf, l, "post_attention_norm.weight", p.dim)?
+            } else {
+                load_layer_tensor_float(gguf, l, "ffn_norm.weight", p.dim)?
+            };
+            rms_ffn_weight[l * p.dim..(l + 1) * p.dim].copy_from_slice(&ffn_norm);
+        }
 
         if p.is_qwen3next {
             if find_gguf_tensor(gguf, &format!("blk.{l}.attn_qkv.weight")).is_some() {
@@ -580,6 +598,15 @@ pub(crate) fn init_weights_from_gguf(
                     load_layer_tensor_quantized(gguf, l, "ffn_down.weight", p.dim, p.hidden_dim)?;
                 w3[l] = load_layer_tensor_quantized(gguf, l, "ffn_up.weight", p.hidden_dim, p.dim)?;
             }
+        } else if p.is_bert_family
+            && find_gguf_tensor(gguf, &format!("blk.{l}.attn_qkv.weight")).is_some()
+        {
+            // BERT-style fused QKV (nomic-bert, all-minilm …).
+            // Pack into wq[l] with rows = q_dim + 2*kv_dim; inference extracts slices via
+            // matmul_quantized_rows.
+            let total_qkv = q_dim + 2 * kv_dim;
+            wq[l] = load_layer_tensor_quantized(gguf, l, "attn_qkv.weight", total_qkv, p.dim)?;
+            wo[l] = load_layer_tensor_quantized(gguf, l, "attn_output.weight", p.dim, q_dim)?;
         } else {
             wq[l] = load_layer_tensor_quantized(gguf, l, "attn_q.weight", q_dim, p.dim)?;
             wk[l] = load_layer_tensor_quantized(gguf, l, "attn_k.weight", kv_dim, p.dim)?;
@@ -647,10 +674,28 @@ pub(crate) fn init_weights_from_gguf(
 
             let pfn = load_layer_tensor_float(gguf, l, "post_ffw_norm.weight", p.dim)?;
             ffn_post_norm[l * p.dim..(l + 1) * p.dim].copy_from_slice(&pfn);
+        } else if p.is_bert_family {
+            // Post-attention LayerNorm (applied after attn residual).
+            let pan = load_layer_tensor_float(gguf, l, "attn_output_norm.weight", p.dim)?;
+            attn_post_norm[l * p.dim..(l + 1) * p.dim].copy_from_slice(&pan);
+            let pan_b = load_layer_tensor_float(gguf, l, "attn_output_norm.bias", p.dim)?;
+            attn_post_norm_bias[l * p.dim..(l + 1) * p.dim].copy_from_slice(&pan_b);
+
+            // Post-FFN LayerNorm (applied after FFN residual).
+            let pfn = load_layer_tensor_float(gguf, l, "layer_output_norm.weight", p.dim)?;
+            ffn_post_norm[l * p.dim..(l + 1) * p.dim].copy_from_slice(&pfn);
+            let pfn_b = load_layer_tensor_float(gguf, l, "layer_output_norm.bias", p.dim)?;
+            ffn_post_norm_bias[l * p.dim..(l + 1) * p.dim].copy_from_slice(&pfn_b);
         }
     }
 
-    let rms_final_weight = load_tensor_float(gguf, "output_norm.weight", Some(p.dim))?;
+    // BERT models have no output projection norm; the per-block post-norms are the final norms.
+    let rms_final_weight =
+        if p.is_bert_family && find_gguf_tensor(gguf, "output_norm.weight").is_none() {
+            vec![1.0f32; p.dim]
+        } else {
+            load_tensor_float(gguf, "output_norm.weight", Some(p.dim))?
+        };
 
     let mut wcls_is_embed = false;
     let wcls = if find_gguf_tensor(gguf, "output.weight").is_some() {
@@ -703,5 +748,7 @@ pub(crate) fn init_weights_from_gguf(
         attn_qk_norm_present,
         attn_post_norm,
         ffn_post_norm,
+        attn_post_norm_bias,
+        ffn_post_norm_bias,
     })
 }

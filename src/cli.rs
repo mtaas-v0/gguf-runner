@@ -804,6 +804,55 @@ struct Cli {
 
     #[arg(long = "layer-debug-pos", hide = true, env = "GGUF_LAYER_DEBUG_POS")]
     layer_debug_pos: Option<usize>,
+
+    // --- RAG flags ---
+    #[arg(
+        long = "rag-encoder",
+        value_name = "encoder.gguf",
+        help = "Path to embedding sidecar GGUF used for RAG retrieval"
+    )]
+    rag_encoder: Option<String>,
+
+    #[arg(
+        long = "rag-index",
+        value_name = "path",
+        help = "Path to a pre-built .ragidx file to load or save"
+    )]
+    rag_index: Option<String>,
+
+    #[arg(
+        long = "rag-source",
+        value_name = "dir",
+        help = "Wiki source directory; used to build the index when --rag-index is missing or --rag-build is set"
+    )]
+    rag_source: Option<String>,
+
+    #[arg(
+        long = "rag-top-k",
+        default_value_t = 5,
+        help = "Number of chunks to inject per turn"
+    )]
+    rag_top_k: usize,
+
+    #[arg(
+        long = "rag-max-chars-per-chunk",
+        default_value_t = 1800,
+        help = "Soft character limit per indexed chunk"
+    )]
+    rag_max_chars_per_chunk: usize,
+
+    #[arg(
+        long = "rag-max-tokens-per-chunk",
+        default_value_t = 0,
+        help = "Optional token cap per indexed chunk after tokenization (0 disables the cap)"
+    )]
+    rag_max_tokens_per_chunk: usize,
+
+    #[arg(
+        long = "rag-build",
+        help = "Build the RAG index from --rag-source, save to --rag-index, then exit"
+    )]
+    rag_build: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -861,6 +910,13 @@ pub(crate) struct CliOptions {
     pub(crate) x86_avx512vnni_q8: Option<bool>,
     pub(crate) layer_debug: Option<bool>,
     pub(crate) layer_debug_pos: Option<usize>,
+    pub(crate) rag_encoder: Option<String>,
+    pub(crate) rag_index: Option<String>,
+    pub(crate) rag_source: Option<String>,
+    pub(crate) rag_top_k: usize,
+    pub(crate) rag_max_chars_per_chunk: usize,
+    pub(crate) rag_max_tokens_per_chunk: usize,
+    pub(crate) rag_build: bool,
 }
 
 impl CliOptions {
@@ -889,6 +945,7 @@ impl CliOptions {
         }
         let requested_tools_enabled = !allowed_tools.is_empty();
         if !cli.show_features
+            && !cli.rag_build
             && matches!(mode, CliOperationMode::Oneshot)
             && cli.prompt.trim().is_empty()
         {
@@ -970,6 +1027,13 @@ impl CliOptions {
             x86_avx512vnni_q8: cli.x86_avx512vnni_q8,
             layer_debug: cli.layer_debug,
             layer_debug_pos: cli.layer_debug_pos,
+            rag_encoder: cli.rag_encoder,
+            rag_index: cli.rag_index,
+            rag_source: cli.rag_source,
+            rag_top_k: cli.rag_top_k,
+            rag_max_chars_per_chunk: cli.rag_max_chars_per_chunk,
+            rag_max_tokens_per_chunk: cli.rag_max_tokens_per_chunk,
+            rag_build: cli.rag_build,
         })
     }
 }

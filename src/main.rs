@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod engine;
+mod rag;
 mod tools;
 mod vendors;
 

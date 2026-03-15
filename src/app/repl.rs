@@ -26,6 +26,7 @@ struct ReplApp {
     history: Vec<String>,
     history_index: Option<usize>,
     active_images: Vec<String>,
+    rag_loaded: bool,
     chat_history: Vec<ChatMessage>,
     pending_user_prompt: Option<String>,
     pending_assistant_output: String,
@@ -51,6 +52,7 @@ impl ReplApp {
             history: Vec::new(),
             history_index: None,
             active_images: Vec::new(),
+            rag_loaded: false,
             chat_history: Vec::new(),
             pending_user_prompt: None,
             pending_assistant_output: String::new(),
@@ -478,6 +480,11 @@ enum WorkerCommand {
         chat_history: Vec<ChatMessage>,
         active_images: Vec<String>,
     },
+    LoadRag {
+        encoder_path: Option<String>,
+        source_dir: String,
+    },
+    ClearRag,
     Shutdown,
 }
 
@@ -485,9 +492,30 @@ enum WorkerEvent {
     RuntimeReady(Result<(), String>),
     Runtime(RuntimeEvent),
     TurnFinished(Result<(), String>),
+    RagLoaded(Result<String, String>),
+    RagProgress(String),
 }
 
 pub(crate) fn run(cli: &CliOptions) -> Result<(), String> {
+    // Install a panic hook that restores the terminal before printing the panic
+    // message.  Without this, a panic in any thread (e.g. a worker thread) leaves
+    // the terminal in raw mode with a broken scroll region, making the shell
+    // unusable until the user runs `reset`.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Best-effort: ignore errors — we are already in a bad state.
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            Show,                // un-hide the cursor
+            MoveTo(0, u16::MAX), // move to bottom so output doesn't clobber history
+        );
+        // Reset scroll region and emit a newline so the shell prompt appears cleanly.
+        let _ = write!(io::stdout(), "\x1b[r\n");
+        let _ = io::stdout().flush();
+        prev_hook(info);
+    }));
+
     let mut terminal = TerminalGuard::new()?;
     let mut app = ReplApp::new();
     let (command_tx, event_rx) = spawn_worker(cli.clone());
@@ -538,6 +566,10 @@ pub(crate) fn run(cli: &CliOptions) -> Result<(), String> {
     }
 
     let _ = command_tx.send(WorkerCommand::Shutdown);
+
+    // Remove our panic hook now that raw mode is no longer active.
+    // take_hook() pops the current hook and reinstates the default.
+    let _ = std::panic::take_hook();
     Ok(())
 }
 
@@ -580,6 +612,30 @@ fn worker_main(
                         );
                         runtime.set_runtime_event_callback(None);
                         let _ = event_tx.send(WorkerEvent::TurnFinished(result));
+                    }
+                    WorkerCommand::LoadRag {
+                        encoder_path,
+                        source_dir,
+                    } => {
+                        let progress_tx =
+                            std::sync::Arc::new(std::sync::Mutex::new(event_tx.clone()));
+                        let progress_cb: std::sync::Arc<dyn Fn(String) + Send + Sync> =
+                            std::sync::Arc::new(move |msg| {
+                                if let Ok(tx) = progress_tx.lock() {
+                                    let _ = tx.send(WorkerEvent::RagProgress(msg));
+                                }
+                            });
+                        let result = runtime.load_rag_from_dir(
+                            encoder_path.as_deref(),
+                            &source_dir,
+                            Some(progress_cb),
+                        );
+                        let _ = event_tx.send(WorkerEvent::RagLoaded(result));
+                    }
+                    WorkerCommand::ClearRag => {
+                        runtime.clear_rag();
+                        let _ = event_tx
+                            .send(WorkerEvent::RagLoaded(Ok("RAG index cleared.".to_string())));
                     }
                     WorkerCommand::Shutdown => break,
                 }
@@ -630,11 +686,12 @@ fn run_worker_turn(
         || cli.tool_enablement.rmdir;
 
     if cli.tools_enabled
-        && agent::prompt_likely_requires_tools(
-            prompt,
-            filesystem_tools_enabled,
-            shell_tools_enabled,
-        )
+        && (runtime.has_rag_index()
+            || agent::prompt_likely_requires_tools(
+                prompt,
+                filesystem_tools_enabled,
+                shell_tools_enabled,
+            ))
     {
         agent::run_agent_loop_collect_with_history_callback(
             runtime,
@@ -737,6 +794,25 @@ fn drain_worker_events(
                 terminal.ensure_output_line_closed(app)?;
                 app.set_status("Error");
                 terminal.print_prefixed_lines(app, "[err] ", &format!("Turn failed: {err}"))?;
+            }
+            Ok(WorkerEvent::RagProgress(msg)) => {
+                app.set_status(msg);
+            }
+            Ok(WorkerEvent::RagLoaded(Ok(msg))) => {
+                app.busy = false;
+                app.rag_loaded = !msg.contains("cleared");
+                terminal.print_prefixed_lines(app, "[sys] ", &msg)?;
+                if app.runtime_ready {
+                    app.set_ready_status();
+                }
+            }
+            Ok(WorkerEvent::RagLoaded(Err(err))) => {
+                app.busy = false;
+                app.rag_loaded = false;
+                terminal.print_prefixed_lines(app, "[err] ", &format!("RAG load failed: {err}"))?;
+                if app.runtime_ready {
+                    app.set_ready_status();
+                }
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
@@ -886,6 +962,58 @@ fn dispatch_prompt(
                 ),
             )?;
             if app.runtime_ready {
+                app.set_ready_status();
+            }
+            return Ok(false);
+        }
+        crate::app::ReplCommandAction::LoadDocSource(source_dir) => {
+            if !app.runtime_ready {
+                terminal.print_prefixed_lines(app, "[err] ", "Runtime is not ready yet.")?;
+                return Ok(false);
+            }
+            if app.busy {
+                terminal.print_prefixed_lines(
+                    app,
+                    "[sys] ",
+                    "A turn is already running. Wait for it to finish before loading documents.",
+                )?;
+                return Ok(false);
+            }
+            app.busy = true;
+            app.set_status("Building knowledge index…");
+            let _ = command_tx.send(WorkerCommand::LoadRag {
+                encoder_path: cli.rag_encoder.clone(),
+                source_dir,
+            });
+            return Ok(false);
+        }
+        crate::app::ReplCommandAction::ClearDocs => {
+            if !app.runtime_ready {
+                terminal.print_prefixed_lines(app, "[err] ", "Runtime is not ready yet.")?;
+                return Ok(false);
+            }
+            if app.busy {
+                terminal.print_prefixed_lines(
+                    app,
+                    "[sys] ",
+                    "A turn is already running. Wait for it to finish before clearing documents.",
+                )?;
+                return Ok(false);
+            }
+            app.busy = true;
+            let _ = command_tx.send(WorkerCommand::ClearRag);
+            return Ok(false);
+        }
+        crate::app::ReplCommandAction::DocStatus => {
+            let lines = if app.rag_loaded {
+                vec![format!("Knowledge active — top-k: {}", cli.rag_top_k,)]
+            } else {
+                vec!["No knowledge loaded. Use /doc <dir> to load a wiki directory.".to_string()]
+            };
+            for line in lines {
+                terminal.print_prefixed_lines(app, "[sys] ", &line)?;
+            }
+            if !app.busy && app.runtime_ready {
                 app.set_ready_status();
             }
             return Ok(false);

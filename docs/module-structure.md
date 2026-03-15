@@ -19,6 +19,11 @@ src/
     agent.rs
     repl.rs
   cli.rs
+  rag/
+    mod.rs
+    chunker.rs
+    encoder.rs
+    index_io.rs
   tools.rs
   engine/
     mod.rs
@@ -175,6 +180,32 @@ src/
   - streamed visible output chunks for TUI REPL
   - debug-line emission without writing directly to terminal during REPL turns
 - For REPL multi-turn chat, trims oldest encoded turns when chat history outgrows the model context window, preserving the newest exchange.
+
+### `src/rag/mod.rs`
+
+- RAG module entrypoint and shared index types.
+- Owns:
+  - index build orchestration from chunked source documents
+  - chunk embedding scheduling/progress reporting
+  - in-memory embedding matrix assembly for retrieval
+  - cosine-similarity retrieval plus keyword rescue
+  - prompt-context injection helpers
+- Keeps RAG-specific indexing and retrieval flow outside `app/` and `engine/`, while consuming generic engine/runtime primitives and the sidecar encoder exposed by `src/rag/encoder.rs`.
+
+### `src/rag/chunker.rs`
+
+- Source-to-chunk preprocessing for RAG indexing.
+- Walks document trees, splits markdown by heading/paragraph structure, and applies lightweight language-aware chunking for supported code files.
+
+### `src/rag/encoder.rs`
+
+- Embedding sidecar GGUF loader and document/query embedding runtime.
+- Owns tokenizer use for the sidecar model, pooling policy, reusable BERT prefill scratch buffers, head-major attention staging, cached RoPE tables, and the embedding fast path used during index builds and retrieval.
+
+### `src/rag/index_io.rs`
+
+- Binary `.ragidx` serialization/deserialization for persisted RAG indexes.
+- Encodes chunk metadata and embedding vectors for save/load without coupling persistence details into the retrieval path.
 
 ### `src/app/agent.rs`
 
@@ -340,7 +371,7 @@ src/
 
 - Numerical and sampling kernels used by inference.
 - `math.rs`: normalization, softmax, vector math, Qwen3Next SSM linear attention helpers.
-- `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64 + x86 VNNI targets, x86 AVX-VNNI/AVX512-VNNI Q8 paths, and x86 Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, AMD-aware x86 MR4 dispatch preference (AVX2-first on AMD), and architecture-specific matmul row prefetch helpers (x86 + aarch64).
+- `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64 + x86 VNNI targets, x86 AVX-VNNI/AVX512-VNNI Q8 paths, and x86 Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, AMD-aware x86 MR4 dispatch preference (AVX2-first on AMD), architecture-specific matmul row prefetch helpers (x86 + aarch64), and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
 
 ### `src/engine/runtime/*`

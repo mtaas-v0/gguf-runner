@@ -522,6 +522,42 @@ pub(crate) fn dequantize_tensor(
     Ok(dst)
 }
 
+#[inline]
+fn dequantize_row_into(
+    ttype: GgmlType,
+    src: &[u8],
+    dst: &mut [f32],
+    k: usize,
+) -> Result<(), String> {
+    match ttype.0 {
+        GGML_TYPE_F32 => {
+            for (i, slot) in dst[..k].iter_mut().enumerate() {
+                *slot = read_f32_le(src, i * 4);
+            }
+        }
+        GGML_TYPE_F16 => dequantize_row_f16(src, dst, k),
+        GGML_TYPE_Q4_0 => dequantize_row_q4_0(src, dst, k),
+        GGML_TYPE_Q4_1 => dequantize_row_q4_1(src, dst, k),
+        GGML_TYPE_Q5_0 => dequantize_row_q5_0(src, dst, k),
+        GGML_TYPE_Q5_1 => dequantize_row_q5_1(src, dst, k),
+        GGML_TYPE_Q8_0 => dequantize_row_q8_0(src, dst, k),
+        GGML_TYPE_Q2_K => dequantize_row_q2_k(src, dst, k),
+        GGML_TYPE_Q3_K => dequantize_row_q3_k(src, dst, k),
+        GGML_TYPE_Q4_K => dequantize_row_q4_k(src, dst, k),
+        GGML_TYPE_Q5_K => dequantize_row_q5_k(src, dst, k),
+        GGML_TYPE_Q6_K => dequantize_row_q6_k(src, dst, k),
+        GGML_TYPE_IQ4_NL => dequantize_row_iq4_nl(src, dst, k),
+        GGML_TYPE_BF16 => dequantize_row_bf16(src, dst, k),
+        _ => {
+            return Err(format!(
+                "unsupported quantization type in batched matmul: {}",
+                ttype.0
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[inline(always)]
 pub(crate) fn dot_f32_scalar_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
     let mut sum = 0.0f32;
@@ -4767,4 +4803,147 @@ pub(crate) fn select_topk_softmax(
     }
 
     count
+}
+
+/// Batch matmul: `out[m × n_rows] = inp[m × n_cols] × qw[n_rows × n_cols]ᵀ`
+///
+/// For true batches (`m > 1`), each quantized weight row is dequantized once into a reusable
+/// scratch buffer and then dotted against all `m` input rows. This avoids re-reading and
+/// re-decoding the same quantized row for every token in the batch, which is critical for
+/// BERT-style embedding prefills.
+///
+/// For the single-row case (`m <= 1`), this falls back to `matmul_quantized_rows` so the
+/// architecture-specific micro-kernels remain in use for standard inference paths.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_quantized_batch_with_scratch(
+    out: &mut [f32],      // [m × n_rows]
+    inp: &[f32],          // [m × n_cols]
+    qw: &QuantizedTensor, // [qw.rows × n_cols]
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    dequantized_row: &mut Vec<f32>,
+) -> Result<(), String> {
+    let n = qw.cols;
+    if row_start + n_rows > qw.rows {
+        return Err(format!(
+            "matmul_quantized_batch: row window [{row_start},{}) out of bounds (qw.rows={})",
+            row_start + n_rows,
+            qw.rows
+        ));
+    }
+    if out.len() < m * n_rows || inp.len() < m * n {
+        return Err(format!(
+            "matmul_quantized_batch: shape mismatch (out={}, need {}; inp={}, need {})",
+            out.len(),
+            m * n_rows,
+            inp.len(),
+            m * n
+        ));
+    }
+
+    if m <= 1 {
+        for j in 0..m {
+            let x = &inp[j * n..(j + 1) * n];
+            let out_row = &mut out[j * n_rows..(j + 1) * n_rows];
+            matmul_quantized_rows(out_row, x, qw, row_start, n_rows, mapped)?;
+        }
+        return Ok(());
+    }
+
+    let prof_t0 = prof_start();
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = n_rows
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    if dequantized_row.len() < n {
+        dequantized_row.resize(n, 0.0);
+    }
+    for row_idx in 0..n_rows {
+        matmul_prefetch_row(mapped, data_offset, row_size, row_idx, n_rows);
+        let row_start = data_offset + row_idx * row_size;
+        let row = &mapped[row_start..row_start + row_size];
+        dequantize_row_into(qw.ttype, row, &mut dequantized_row[..n], n)?;
+        for batch_idx in 0..m {
+            let x = &inp[batch_idx * n..(batch_idx + 1) * n];
+            out[batch_idx * n_rows + row_idx] = dot_f32_simd(x, &dequantized_row[..n]);
+        }
+    }
+
+    prof_end(&PROF_MATMUL_NS, prof_t0);
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn matmul_quantized_batch(
+    out: &mut [f32],      // [m × n_rows]
+    inp: &[f32],          // [m × n_cols]
+    qw: &QuantizedTensor, // [qw.rows × n_cols]
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    let mut dequantized_row = Vec::new();
+    matmul_quantized_batch_with_scratch(
+        out,
+        inp,
+        qw,
+        mapped,
+        m,
+        row_start,
+        n_rows,
+        &mut dequantized_row,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matmul_quantized_batch_matches_repeated_rows_for_f32_weights() {
+        let weights: [f32; 12] = [
+            1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -2.0, 0.25, -0.75, 1.5, 2.5,
+        ];
+        let mapped: Vec<u8> = weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let qw = QuantizedTensor {
+            data_offset: 0,
+            ttype: GgmlType(GGML_TYPE_F32),
+            rows: 3,
+            cols: 4,
+        };
+
+        let inp: [f32; 8] = [1.0, 0.0, -1.0, 2.0, 0.5, 1.5, -0.5, 3.0];
+
+        let mut batch_out = vec![0.0f32; 2 * qw.rows];
+        matmul_quantized_batch(&mut batch_out, &inp, &qw, &mapped, 2, 0, qw.rows).unwrap();
+
+        let mut repeated_out = vec![0.0f32; 2 * qw.rows];
+        for batch_idx in 0..2 {
+            let x = &inp[batch_idx * qw.cols..(batch_idx + 1) * qw.cols];
+            let out_row = &mut repeated_out[batch_idx * qw.rows..(batch_idx + 1) * qw.rows];
+            matmul_quantized_rows(out_row, x, &qw, 0, qw.rows, &mapped).unwrap();
+        }
+
+        for (got, want) in batch_out.iter().zip(repeated_out.iter()) {
+            assert!((got - want).abs() < 1e-6, "got={got} want={want}");
+        }
+    }
 }

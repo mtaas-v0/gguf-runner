@@ -1,10 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::engine::kernels::{
-    accum, dot_f32_simd, get_row_size, l2_norm, matmul_f32_embeddings, matmul_quantized,
-    matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma,
-    rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace, scale_slice_inplace,
-    select_topk_softmax, sigmoid_mul_inplace, silu_and_mul_inplace, softmax,
+    accum, dot_f32_simd, get_row_size, l2_norm, layernorm_inplace, matmul_f32_embeddings,
+    matmul_quantized, matmul_quantized_rows, qwen3next_linear_attention_autoregressive, rmsnorm,
+    rmsnorm_gemma, rmsnorm_inplace, rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace,
+    scale_slice_inplace, select_topk_softmax, sigmoid_mul_inplace, silu_and_mul_inplace, softmax,
 };
 use crate::engine::profiling::{PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS, prof_end, prof_start};
 use crate::engine::switches::{
@@ -1060,7 +1060,10 @@ fn transformer_inner(
     }
 
     for l in 0..p.n_layers {
-        if p.is_gemma3 {
+        if p.is_bert_family {
+            // Post-norm architecture: no pre-attention norm — feed x directly into attention.
+            s.xb[..dim].copy_from_slice(&s.x[..dim]);
+        } else if p.is_gemma3 {
             rmsnorm_gemma(
                 &mut s.xb[..dim],
                 &s.x[..dim],
@@ -1149,6 +1152,25 @@ fn transformer_inner(
                         mapped,
                     )?;
                 }
+            } else if p.is_bert_family && w.wq[l].rows == q_dim + 2 * kv_dim {
+                // Fused QKV: Q rows [0, q_dim), K rows [q_dim, q_dim+kv_dim), V rows after.
+                matmul_quantized_rows(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], 0, q_dim, mapped)?;
+                matmul_quantized_rows(
+                    &mut s.k[..kv_dim],
+                    &s.xb[..dim],
+                    &w.wq[l],
+                    q_dim,
+                    kv_dim,
+                    mapped,
+                )?;
+                matmul_quantized_rows(
+                    &mut s.v[..kv_dim],
+                    &s.xb[..dim],
+                    &w.wq[l],
+                    q_dim + kv_dim,
+                    kv_dim,
+                    mapped,
+                )?;
             } else {
                 matmul_quantized(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], mapped)?;
                 matmul_quantized(&mut s.k[..kv_dim], &s.xb[..dim], &w.wk[l], mapped)?;
@@ -1783,18 +1805,32 @@ fn transformer_inner(
             );
         }
 
-        if p.is_gemma3 && !w.attn_post_norm.is_empty() {
-            rmsnorm_inplace(
-                &mut s.xb2[..dim],
+        if p.is_bert_family {
+            // Post-norm: residual first, then LayerNorm in-place on x.
+            accum(&mut s.x[..dim], &s.xb2[..dim], dim);
+            layernorm_inplace(
+                &mut s.x[..dim],
                 &w.attn_post_norm[l * dim..(l + 1) * dim],
+                &w.attn_post_norm_bias[l * dim..(l + 1) * dim],
                 dim,
                 eps,
             );
+        } else {
+            if p.is_gemma3 && !w.attn_post_norm.is_empty() {
+                rmsnorm_inplace(
+                    &mut s.xb2[..dim],
+                    &w.attn_post_norm[l * dim..(l + 1) * dim],
+                    dim,
+                    eps,
+                );
+            }
+            accum(&mut s.x[..dim], &s.xb2[..dim], dim);
         }
 
-        accum(&mut s.x[..dim], &s.xb2[..dim], dim);
-
-        if p.is_gemma3 {
+        if p.is_bert_family {
+            // Post-norm architecture: no pre-FFN norm — feed x directly into FFN.
+            s.xb[..dim].copy_from_slice(&s.x[..dim]);
+        } else if p.is_gemma3 {
             rmsnorm_gemma(
                 &mut s.xb[..dim],
                 &s.x[..dim],
@@ -2000,16 +2036,27 @@ fn transformer_inner(
             prof_end(&PROF_FFN_NS, ffn_prof);
         }
 
-        if p.is_gemma3 && !w.ffn_post_norm.is_empty() {
-            rmsnorm_inplace(
-                &mut s.xb[..dim],
+        if p.is_bert_family {
+            // Post-norm: residual first, then LayerNorm in-place on x.
+            accum(&mut s.x[..dim], &s.xb[..dim], dim);
+            layernorm_inplace(
+                &mut s.x[..dim],
                 &w.ffn_post_norm[l * dim..(l + 1) * dim],
+                &w.ffn_post_norm_bias[l * dim..(l + 1) * dim],
                 dim,
                 eps,
             );
+        } else {
+            if p.is_gemma3 && !w.ffn_post_norm.is_empty() {
+                rmsnorm_inplace(
+                    &mut s.xb[..dim],
+                    &w.ffn_post_norm[l * dim..(l + 1) * dim],
+                    dim,
+                    eps,
+                );
+            }
+            accum(&mut s.x[..dim], &s.xb[..dim], dim);
         }
-
-        accum(&mut s.x[..dim], &s.xb[..dim], dim);
 
         if do_layer_debug {
             eprintln!(
@@ -2035,7 +2082,9 @@ fn transformer_inner(
         }
     }
 
-    rmsnorm_inplace(&mut s.x[..dim], &w.rms_final_weight[..dim], dim, eps);
+    if !p.is_bert_family {
+        rmsnorm_inplace(&mut s.x[..dim], &w.rms_final_weight[..dim], dim, eps);
+    }
     sanitize_finite_inplace(&mut s.x[..dim]);
 
     if w.wcls_is_embed {

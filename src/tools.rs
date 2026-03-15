@@ -86,6 +86,8 @@ pub(crate) const RMDIR: &str = "rmdir";
 pub(crate) const SHELL_LIST_ALLOWED: &str = "shell_list_allowed";
 pub(crate) const SHELL_EXEC: &str = "shell_exec";
 pub(crate) const SHELL_REQUEST_ALLOWED: &str = "shell_request_allowed";
+/// RAG knowledge search — handled directly in the agent loop, not via ToolExecutor.
+pub(crate) const SEARCH_KNOWLEDGE: &str = "search_knowledge";
 
 pub(crate) const ALL_TOOL_NAMES: [&str; 8] = [
     READ_FILE,

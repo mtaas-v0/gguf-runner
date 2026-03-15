@@ -114,6 +114,7 @@ mod tests {
             head_dim: 0,
             rope_dim: 0,
             rope_sections: [0; 4],
+            is_bert_family: false,
             is_gemma3: false,
             is_qwen2: false,
             is_qwen35: true,

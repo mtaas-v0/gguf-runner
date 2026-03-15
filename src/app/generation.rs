@@ -17,6 +17,7 @@ use crate::engine::vision::{
     load_video_chunk_tensors, prepare_audios_for_multimodal, prepare_images_for_multimodal,
     prepare_videos_for_multimodal,
 };
+use crate::rag::{DocumentEncoder, RagIndex, prepend_rag_context};
 use image::{ImageFormat, ImageReader};
 use serde_json::Value;
 use std::cmp::Ordering;
@@ -891,6 +892,9 @@ pub(crate) struct GenerationSettings {
     pub(crate) vendor_decode_policy: crate::vendors::VendorDecodePolicy,
     pub(crate) vendor_multimodal_policy: crate::vendors::VendorMultimodalPolicy,
     pub(crate) runtime_event_callback: Option<RuntimeEventCallback>,
+    pub(crate) rag_top_k: usize,
+    pub(crate) rag_max_chars_per_chunk: usize,
+    pub(crate) rag_max_tokens_per_chunk: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -918,6 +922,80 @@ struct MmprojSidecarProbe {
     n_tensors: u64,
 }
 
+fn load_rag_components(
+    cli: &CliOptions,
+    debug_mode: bool,
+) -> Result<(Option<DocumentEncoder>, Option<RagIndex>), String> {
+    // Resolve encoder path: explicit flag > auto-discovery.
+    let encoder_path = cli
+        .rag_encoder
+        .clone()
+        .or_else(|| crate::rag::encoder::discover_embedding_sidecar(&cli.model));
+
+    let Some(enc_path) = encoder_path else {
+        if cli.rag_index.is_some() || cli.rag_source.is_some() {
+            return Err(
+                "RAG index/source specified but no embedding encoder found. \
+                 Provide --rag-encoder <embed.gguf> or place an embed*.gguf next to the model."
+                    .to_string(),
+            );
+        }
+        return Ok((None, None));
+    };
+
+    let mut encoder = DocumentEncoder::load(&enc_path, debug_mode)?;
+
+    // Resolve index: load from file if it exists, otherwise build from source dir.
+    let index = if let Some(ref idx_path) = cli.rag_index {
+        let p = std::path::Path::new(idx_path);
+        if p.exists() {
+            if debug_mode {
+                eprintln!("RAG: loading pre-built index from '{idx_path}'");
+            }
+            let idx = RagIndex::load(p)?;
+            eprintln!(
+                "RAG: loaded {} chunks (dim={}) from '{idx_path}'",
+                idx.len(),
+                encoder.dim()
+            );
+            Some(idx)
+        } else if let Some(ref src) = cli.rag_source {
+            let src_path = std::path::Path::new(src);
+            let idx = RagIndex::build_from_dir(
+                src_path,
+                &mut encoder,
+                cli.rag_max_chars_per_chunk,
+                cli.rag_max_tokens_per_chunk,
+                None,
+                debug_mode,
+            )?;
+            eprintln!("RAG: saving index to '{idx_path}'…");
+            idx.save(p)?;
+            Some(idx)
+        } else {
+            return Err(format!(
+                "RAG index file '{idx_path}' does not exist and --rag-source was not provided"
+            ));
+        }
+    } else if let Some(ref src) = cli.rag_source {
+        // No index file; build on-the-fly (not persisted).
+        let src_path = std::path::Path::new(src);
+        let idx = RagIndex::build_from_dir(
+            src_path,
+            &mut encoder,
+            cli.rag_max_chars_per_chunk,
+            cli.rag_max_tokens_per_chunk,
+            None,
+            debug_mode,
+        )?;
+        Some(idx)
+    } else {
+        None
+    };
+
+    Ok((Some(encoder), index))
+}
+
 pub(crate) struct ModelRuntime {
     checkpoint_path: String,
     gguf: GGUFFile,
@@ -929,6 +1007,8 @@ pub(crate) struct ModelRuntime {
     mmproj_sidecar: Option<MmprojSidecarProbe>,
     mmproj_candidates: Vec<String>,
     vision_encoder: Option<VisionEncoder>,
+    document_encoder: Option<DocumentEncoder>,
+    rag_index: Option<RagIndex>,
     kv_cache_format_logged: bool,
 }
 
@@ -1948,7 +2028,13 @@ impl ModelRuntime {
             vendor_decode_policy,
             vendor_multimodal_policy,
             runtime_event_callback: None,
+            rag_top_k: cli.rag_top_k,
+            rag_max_chars_per_chunk: cli.rag_max_chars_per_chunk,
+            rag_max_tokens_per_chunk: cli.rag_max_tokens_per_chunk,
         };
+
+        // --- RAG sidecar ---
+        let (document_encoder, rag_index) = load_rag_components(cli, debug_mode)?;
 
         Ok(Self {
             checkpoint_path: checkpoint.to_string(),
@@ -1961,6 +2047,8 @@ impl ModelRuntime {
             mmproj_sidecar,
             mmproj_candidates,
             vision_encoder,
+            document_encoder,
+            rag_index,
             kv_cache_format_logged: false,
         })
     }
@@ -2044,6 +2132,34 @@ impl ModelRuntime {
         system_prompt: &str,
     ) -> Result<String, String> {
         let debug_mode = self.settings.debug_mode;
+
+        // RAG: augment system_prompt with retrieved context, using the last user message as query.
+        let rag_system: String;
+        let system_prompt = if self.rag_index.is_some() && self.document_encoder.is_some() {
+            let query_text = messages
+                .iter()
+                .rev()
+                .find(|m| m.role == crate::vendors::ChatRole::User)
+                .map(|m| m.content.as_str())
+                .unwrap_or("");
+            let enc = self.document_encoder.as_mut().unwrap();
+            let prefixed = if enc.query_prefix().is_empty() {
+                query_text.to_string()
+            } else {
+                format!("{}{query_text}", enc.query_prefix())
+            };
+            let query_emb = enc.embed(&prefixed)?;
+            let chunks = self.rag_index.as_ref().unwrap().query(
+                &query_emb,
+                query_text,
+                self.settings.rag_top_k,
+            );
+            rag_system = prepend_rag_context(&chunks, system_prompt);
+            &rag_system
+        } else {
+            system_prompt
+        };
+
         let mut active_messages = messages.to_vec();
         let mut prompt_tokens: Vec<i32> = crate::vendors::encode_chat_messages(
             &mut self.tokenizer,
@@ -2136,8 +2252,88 @@ impl ModelRuntime {
         self.settings.vendor_decode_policy
     }
 
+    pub(crate) fn settings(&self) -> &GenerationSettings {
+        &self.settings
+    }
+
     pub(crate) fn set_debug_mode(&mut self, enabled: bool) {
         self.settings.debug_mode = enabled;
+    }
+
+    /// Load (or reload) an embedding encoder and build a RAG index from `source_dir`.
+    /// Returns a human-readable status string on success.
+    pub(crate) fn load_rag_from_dir(
+        &mut self,
+        encoder_path: Option<&str>,
+        source_dir: &str,
+        progress: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+    ) -> Result<String, String> {
+        let debug = self.settings.debug_mode;
+        let enc_path = encoder_path
+            .map(|s| s.to_string())
+            .or_else(|| crate::rag::encoder::discover_embedding_sidecar(&self.checkpoint_path))
+            .ok_or_else(|| {
+                "no embedding encoder found — use /rag-encoder <path> first".to_string()
+            })?;
+
+        let mut encoder = DocumentEncoder::load(&enc_path, debug)?;
+        let src = std::path::Path::new(source_dir);
+        let index = RagIndex::build_from_dir(
+            src,
+            &mut encoder,
+            self.settings.rag_max_chars_per_chunk,
+            self.settings.rag_max_tokens_per_chunk,
+            progress,
+            debug,
+        )?;
+        let summary = format!(
+            "RAG: {} chunks loaded from '{}' (encoder: '{}')",
+            index.len(),
+            source_dir,
+            enc_path
+        );
+        self.document_encoder = Some(encoder);
+        self.rag_index = Some(index);
+        Ok(summary)
+    }
+
+    /// Drop the active RAG encoder and index.
+    pub(crate) fn clear_rag(&mut self) {
+        self.document_encoder = None;
+        self.rag_index = None;
+    }
+
+    /// Returns true if a RAG index and encoder are both loaded.
+    pub(crate) fn has_rag_index(&self) -> bool {
+        self.rag_index.is_some() && self.document_encoder.is_some()
+    }
+
+    /// Query the RAG index and return a formatted knowledge block string.
+    /// Returns an error string on failure (embedding error, etc.).
+    pub(crate) fn search_rag(&mut self, query: &str, top_k: usize) -> Result<String, String> {
+        let (Some(index), Some(enc)) = (self.rag_index.as_ref(), self.document_encoder.as_mut())
+        else {
+            return Err("no RAG index loaded".to_string());
+        };
+        let prefixed = if enc.query_prefix().is_empty() {
+            query.to_string()
+        } else {
+            format!("{}{query}", enc.query_prefix())
+        };
+        let query_emb = enc.embed(&prefixed)?;
+        let chunks = index.query(&query_emb, query, top_k);
+        if chunks.is_empty() {
+            return Ok("No relevant knowledge found.".to_string());
+        }
+        let mut out = String::new();
+        for chunk in chunks {
+            out.push('[');
+            out.push_str(&chunk.source);
+            out.push_str("]\n");
+            out.push_str(&chunk.text);
+            out.push_str("\n\n");
+        }
+        Ok(out.trim_end().to_string())
     }
 
     pub(crate) fn generate_request(
@@ -2145,6 +2341,41 @@ impl ModelRuntime {
         request: &GenerationRequest,
         stream_stdout: bool,
     ) -> Result<String, String> {
+        // RAG: augment system_prompt with retrieved context if an index is loaded.
+        let rag_augmented: Option<GenerationRequest>;
+        let request = if self.rag_index.is_some() && self.document_encoder.is_some() {
+            let user_text: String = request
+                .parts
+                .iter()
+                .filter_map(|p| {
+                    if let ContentPart::Text(t) = p {
+                        Some(t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let top_k = self.settings.rag_top_k;
+            let enc = self.document_encoder.as_mut().unwrap();
+            let prefixed = if enc.query_prefix().is_empty() {
+                user_text.clone()
+            } else {
+                format!("{}{user_text}", enc.query_prefix())
+            };
+            let query_emb = enc.embed(&prefixed)?;
+            let idx = self.rag_index.as_ref().unwrap();
+            let chunks = idx.query(&query_emb, &user_text, top_k);
+            let new_system = prepend_rag_context(&chunks, &request.system_prompt);
+            rag_augmented = Some(GenerationRequest {
+                system_prompt: new_system,
+                parts: request.parts.clone(),
+            });
+            rag_augmented.as_ref().unwrap()
+        } else {
+            request
+        };
+
         let effective_request = self.expand_request_for_vendor_detail_crop(request)?;
         let media_requested = effective_request.parts.iter().any(|part| {
             matches!(

@@ -140,6 +140,27 @@ pub(crate) fn rmsnorm_gemma(o: &mut [f32], x: &[f32], weight: &[f32], size: usiz
     rmsnorm(o, x, weight, size, eps);
 }
 
+/// In-place standard LayerNorm: normalize x, then scale by weight and shift by bias.
+/// Used by BERT-family post-norm models.
+pub(crate) fn layernorm_inplace(
+    x: &mut [f32],
+    weight: &[f32],
+    bias: &[f32],
+    size: usize,
+    eps: f32,
+) {
+    let mean = x[..size].iter().sum::<f32>() / size as f32;
+    let var = x[..size]
+        .iter()
+        .map(|v| (v - mean) * (v - mean))
+        .sum::<f32>()
+        / size as f32;
+    let scale = 1.0 / (var + eps).sqrt();
+    for i in 0..size {
+        x[i] = weight[i] * ((x[i] - mean) * scale) + bias[i];
+    }
+}
+
 pub(crate) fn rmsnorm_per_head_gemma_inplace(
     x: &mut [f32],
     weight: &[f32],

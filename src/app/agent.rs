@@ -3,7 +3,7 @@ use crate::app::events::{
 };
 use crate::app::generation::ModelRuntime;
 use crate::cli::{CliOptions, ShellCommandDescriptionSpec, ToolPromptSpec};
-use crate::tools::ToolExecutor;
+use crate::tools::{SEARCH_KNOWLEDGE, ToolExecutor};
 use crate::vendors::{ChatMessage, ChatRole};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -302,11 +302,13 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
         &cli.allow_shell_commands,
     )?;
     let decode_policy = runtime.vendor_decode_policy();
+    let has_rag = runtime.has_rag_index();
     let system_prompt = build_agent_system_prompt(
         &cli.system_prompt,
         &tool_exec,
         &cli.tool_prompt_specs,
         &cli.shell_command_description_specs,
+        has_rag,
     );
     let mut transcript = Vec::new();
     for message in prior_chat_history {
@@ -390,25 +392,77 @@ pub(crate) fn run_agent_loop_collect_with_history_callback(
                 response: AgentResponse::ToolCall { tool, args },
                 raw: _raw,
             } => {
-                let tool_execution = tool_runner.execute(
-                    &mut tool_calls,
-                    ToolRunRequest {
-                        turn: turn + 1,
-                        max_turns,
-                        max_tool_calls: cli.max_tool_calls,
-                        tool,
-                        args,
-                    },
-                    &mut events,
-                )?;
-                transcript.push(AgentMessage {
-                    role: "assistant",
-                    content: tool_execution.assistant_transcript,
-                });
-                transcript.push(AgentMessage {
-                    role: "tool",
-                    content: tool_execution.tool_transcript,
-                });
+                // search_knowledge is handled directly — not via ToolExecutor.
+                if tool == SEARCH_KNOWLEDGE {
+                    if tool_calls >= cli.max_tool_calls {
+                        return Err(format!(
+                            "max-tool-calls ({}) reached before final response",
+                            cli.max_tool_calls
+                        ));
+                    }
+                    tool_calls += 1;
+                    let query = args
+                        .as_ref()
+                        .and_then(|a| a.get("query").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                    let top_k = args
+                        .as_ref()
+                        .and_then(|a| a.get("top_k").and_then(|v| v.as_u64()))
+                        .map(|v| v as usize)
+                        .unwrap_or(planner.runtime.settings().rag_top_k);
+                    push_agent_event(
+                        &mut events,
+                        AgentRunEvent::Log(RuntimeLog::system(format!(
+                            "Tool call [{}]: search_knowledge query={:?} top_k={top_k}",
+                            tool_calls, query
+                        ))),
+                        callback,
+                    );
+                    let result_text = match planner.runtime.search_rag(&query, top_k) {
+                        Ok(text) => text,
+                        Err(e) => format!("search_knowledge error: {e}"),
+                    };
+                    let tool_result = serde_json::json!({
+                        "ok": true,
+                        "tool": SEARCH_KNOWLEDGE,
+                        "query": query,
+                        "results": result_text
+                    });
+                    let tool_result_text =
+                        serde_json::to_string_pretty(&tool_result).map_err(|e| e.to_string())?;
+                    transcript.push(AgentMessage {
+                        role: "assistant",
+                        content: format!(
+                            "tool_call\n{}",
+                            serde_json::json!({"tool": SEARCH_KNOWLEDGE, "args": args.unwrap_or_else(|| serde_json::json!({}))})
+                        ),
+                    });
+                    transcript.push(AgentMessage {
+                        role: "tool",
+                        content: tool_result_text,
+                    });
+                } else {
+                    let tool_execution = tool_runner.execute(
+                        &mut tool_calls,
+                        ToolRunRequest {
+                            turn: turn + 1,
+                            max_turns,
+                            max_tool_calls: cli.max_tool_calls,
+                            tool,
+                            args,
+                        },
+                        &mut events,
+                    )?;
+                    transcript.push(AgentMessage {
+                        role: "assistant",
+                        content: tool_execution.assistant_transcript,
+                    });
+                    transcript.push(AgentMessage {
+                        role: "tool",
+                        content: tool_execution.tool_transcript,
+                    });
+                }
             }
             PlannerOutcome::ParseError { parse_error, raw } => {
                 if cli.debug {
@@ -540,6 +594,7 @@ fn build_agent_system_prompt(
     tool_exec: &ToolExecutor,
     tool_prompt_specs: &[ToolPromptSpec],
     shell_command_description_specs: &[ShellCommandDescriptionSpec],
+    has_rag: bool,
 ) -> String {
     let _metadata_bytes: usize = tool_prompt_specs
         .iter()
@@ -554,7 +609,10 @@ fn build_agent_system_prompt(
     } else {
         "disabled"
     };
-    let enabled_tools = tool_exec.enabled_tool_names();
+    let mut enabled_tools = tool_exec.enabled_tool_names();
+    if has_rag {
+        enabled_tools.push(SEARCH_KNOWLEDGE);
+    }
     let allowed_tool_names = if enabled_tools.is_empty() {
         "<none>".to_string()
     } else {
@@ -565,7 +623,7 @@ fn build_agent_system_prompt(
     } else {
         tool_exec.shell_allowed_commands().join(", ")
     };
-    let tool_rules = render_tool_rules(tool_exec);
+    let tool_rules = render_tool_rules(tool_exec, has_rag);
     format!(
         "{base_system_prompt}\n\n\
 You are running with host tools.\n\
@@ -622,7 +680,7 @@ fn looks_like_reasonable_fallback_text(text: &str) -> bool {
     humanish_ratio > 0.92 && alpha_ratio > 0.08
 }
 
-fn render_tool_rules(tool_exec: &ToolExecutor) -> String {
+fn render_tool_rules(tool_exec: &ToolExecutor, has_rag: bool) -> String {
     let mut rules = vec![
         "- Use tools when you need filesystem state.".to_string(),
         "- If the user asks about files, code, directories, or repository contents, call a filesystem tool before answering when such tools are enabled.".to_string(),
@@ -630,6 +688,11 @@ fn render_tool_rules(tool_exec: &ToolExecutor) -> String {
         "- If a tool fails, adjust and retry.".to_string(),
         "- Return `type=final` when done.".to_string(),
     ];
+    if has_rag {
+        rules.push(
+            "- `search_knowledge` queries the loaded knowledge base. Args: {\"query\":\"<search terms>\",\"top_k\":5}. Call it when the user asks about domain-specific topics not in your training data.".to_string(),
+        );
+    }
     if tool_exec.shell_exec_enabled() {
         rules.push(
             "- `shell_exec` can only execute commands already in the shell allowed list."
