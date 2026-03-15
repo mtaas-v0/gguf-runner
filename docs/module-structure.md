@@ -186,7 +186,7 @@ src/
 - RAG module entrypoint and shared index types.
 - Owns:
   - index build orchestration from chunked source documents
-  - chunk embedding scheduling/progress reporting
+  - dynamically scheduled chunk embedding/progress reporting
   - in-memory embedding matrix assembly for retrieval
   - cosine-similarity retrieval plus keyword rescue
   - prompt-context injection helpers
@@ -200,7 +200,7 @@ src/
 ### `src/rag/encoder.rs`
 
 - Embedding sidecar GGUF loader and document/query embedding runtime.
-- Owns tokenizer use for the sidecar model, pooling policy, reusable BERT prefill scratch buffers, head-major attention staging, cached RoPE tables, and the embedding fast path used during index builds and retrieval.
+- Owns tokenizer use for the sidecar model, pooling policy, reusable BERT prefill scratch buffers, fused-QKV staging, head-major attention staging, cached RoPE tables, and the embedding fast path used during index builds and retrieval.
 
 ### `src/rag/index_io.rs`
 

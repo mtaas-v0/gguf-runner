@@ -172,7 +172,12 @@ impl RagIndex {
         let start = Instant::now();
         let num_threads = rayon::current_num_threads().min(total).max(1);
         let scheduling_secs = 0.0;
-        let chunk_size = total.div_ceil(num_threads);
+        let work_grain = if ctx.config.is_bert_family {
+            1usize
+        } else {
+            4usize
+        };
+        let next_chunk = AtomicUsize::new(0);
 
         // ── Phase 2: embed chunks in parallel ──────────────────────────────
         // Each rayon worker gets its own RunState and BertPrefillState so there
@@ -185,29 +190,36 @@ impl RagIndex {
         // loop is essential — it is what puts those serial sections on different
         // cores concurrently.
         let state_alloc_t0 = Instant::now();
-        let mut workers: Vec<(RunState, BertPrefillState)> = (0..num_threads)
+        let workers: Vec<(RunState, BertPrefillState)> = (0..num_threads)
             .map(|_| malloc_run_state(ctx.config).map(|rs| (rs, BertPrefillState::new())))
             .collect::<Result<Vec<_>, _>>()?;
         let state_alloc_secs = state_alloc_t0.elapsed().as_secs_f64();
 
         let embed_t0 = Instant::now();
         let batches: Vec<EmbedBatchWithStatsResult> = workers
-            .par_iter_mut()
+            .into_par_iter()
             .enumerate()
-            .map(|(worker_idx, (rs, bs))| {
+            .map(|(worker_idx, (mut rs, mut bs))| {
                 let worker_started = Instant::now();
-                let lo = worker_idx * chunk_size;
-                let hi = (lo + chunk_size).min(total);
-                let batch = all_token_ids.get(lo..hi).unwrap_or(&[]);
-                let batch_chunks = batch.len();
-                let batch_tokens: usize = batch.iter().map(Vec::len).sum();
-                let batch_max_tokens = batch.iter().map(Vec::len).max().unwrap_or(0);
-                batch
-                    .into_iter()
-                    .enumerate()
-                    .map(|(offset, ids)| {
+                let mut results = Vec::new();
+                let mut batch_chunks = 0usize;
+                let mut batch_tokens = 0usize;
+                let mut batch_max_tokens = 0usize;
+                let mut batch_est_cost = 0usize;
+
+                loop {
+                    let lo = next_chunk.fetch_add(work_grain, Ordering::Relaxed);
+                    if lo >= total {
+                        break;
+                    }
+                    let hi = (lo + work_grain).min(total);
+                    for (offset, ids) in all_token_ids[lo..hi].iter().enumerate() {
                         let idx = lo + offset;
-                        let emb = embed_raw(ids, &ctx, rs, bs)?;
+                        batch_chunks += 1;
+                        batch_tokens += ids.len();
+                        batch_max_tokens = batch_max_tokens.max(ids.len());
+                        batch_est_cost += ids.len().saturating_mul(ids.len());
+                        let emb = embed_raw(ids, &ctx, &mut rs, &mut bs)?;
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                         if n.is_multiple_of(10) || n == total {
                             let elapsed = start.elapsed().as_secs_f64();
@@ -220,22 +232,21 @@ impl RagIndex {
                                 eprint!("\r\x1b[2K  {msg}");
                             }
                         }
-                        Ok((idx, emb))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|results| {
-                        (
-                            results,
-                            RagBuildWorkerStats {
-                                worker_idx,
-                                chunks: batch_chunks,
-                                tokens: batch_tokens,
-                                max_tokens: batch_max_tokens,
-                                est_cost: 0,
-                                elapsed_secs: worker_started.elapsed().as_secs_f64(),
-                            },
-                        )
-                    })
+                        results.push((idx, emb));
+                    }
+                }
+
+                Ok((
+                    results,
+                    RagBuildWorkerStats {
+                        worker_idx,
+                        chunks: batch_chunks,
+                        tokens: batch_tokens,
+                        max_tokens: batch_max_tokens,
+                        est_cost: batch_est_cost,
+                        elapsed_secs: worker_started.elapsed().as_secs_f64(),
+                    },
+                ))
             })
             .collect();
         let embedding_secs = embed_t0.elapsed().as_secs_f64();

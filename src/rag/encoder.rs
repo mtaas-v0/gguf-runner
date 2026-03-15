@@ -164,6 +164,7 @@ pub(crate) struct BertPrefillState {
     pub(crate) rope_cached_dim: usize,
     pub(crate) rope_cached_theta_bits: u32,
     pub(crate) x: Vec<f32>,
+    pub(crate) qkv_buf: Vec<f32>,
     pub(crate) q_buf: Vec<f32>,
     pub(crate) k_buf: Vec<f32>,
     pub(crate) v_buf: Vec<f32>,
@@ -188,6 +189,7 @@ impl BertPrefillState {
             rope_cached_dim: 0,
             rope_cached_theta_bits: 0,
             x: Vec::new(),
+            qkv_buf: Vec::new(),
             q_buf: Vec::new(),
             k_buf: Vec::new(),
             v_buf: Vec::new(),
@@ -204,11 +206,13 @@ impl BertPrefillState {
 
     /// Ensure all buffers can hold at least `m` tokens.  Only reallocates when `m`
     /// exceeds the previous maximum — O(1) on the steady-state hot path.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ensure(
         &mut self,
         m: usize,
         rope_half: usize,
         dim: usize,
+        total_qkv: usize,
         q_dim: usize,
         kv_dim: usize,
         hidden_dim: usize,
@@ -216,6 +220,7 @@ impl BertPrefillState {
         grow(&mut self.all_cos, m * rope_half);
         grow(&mut self.all_sin, m * rope_half);
         grow(&mut self.x, m * dim);
+        grow(&mut self.qkv_buf, m * total_qkv);
         grow(&mut self.q_buf, m * q_dim);
         grow(&mut self.k_buf, m * kv_dim);
         grow(&mut self.v_buf, m * kv_dim);
@@ -302,6 +307,7 @@ fn embed_prefill_bert(
     };
     let kv_dim = p.n_kv_heads * head_size;
     let q_dim = p.n_heads * head_size;
+    let total_qkv = q_dim + 2 * kv_dim;
     let hidden_dim = p.hidden_dim;
     let kv_mul = p.n_heads / p.n_kv_heads;
     let attn_scale = 1.0_f32 / (head_size as f32).sqrt();
@@ -320,7 +326,7 @@ fn embed_prefill_bert(
     let rope_half = rope_dim / 2;
 
     // Ensure all scratch buffers are large enough for m tokens.
-    state.ensure(m, rope_half, dim, q_dim, kv_dim, hidden_dim);
+    state.ensure(m, rope_half, dim, total_qkv, q_dim, kv_dim, hidden_dim);
     state.ensure_rope_tables(m, rope_half, rope_dim, p.rope_theta);
 
     // Bind named slice views — these are the exact same names as before, now pointing
@@ -328,6 +334,7 @@ fn embed_prefill_bert(
     let all_cos = &mut state.all_cos[..m * rope_half];
     let all_sin = &mut state.all_sin[..m * rope_half];
     let x = &mut state.x[..m * dim];
+    let qkv_buf = &mut state.qkv_buf[..m * total_qkv];
     let q_buf = &mut state.q_buf[..m * q_dim];
     let k_buf = &mut state.k_buf[..m * kv_dim];
     let v_buf = &mut state.v_buf[..m * kv_dim];
@@ -354,33 +361,13 @@ fn embed_prefill_bert(
         let fused_qkv = !w.wq.is_empty() && w.wq[l].rows == q_dim + 2 * kv_dim;
         if fused_qkv {
             matmul_quantized_batch_with_scratch(
-                q_buf,
+                qkv_buf,
                 x,
                 &w.wq[l],
                 mapped,
                 m,
                 0,
-                q_dim,
-                dequant_row,
-            )?;
-            matmul_quantized_batch_with_scratch(
-                k_buf,
-                x,
-                &w.wq[l],
-                mapped,
-                m,
-                q_dim,
-                kv_dim,
-                dequant_row,
-            )?;
-            matmul_quantized_batch_with_scratch(
-                v_buf,
-                x,
-                &w.wq[l],
-                mapped,
-                m,
-                q_dim + kv_dim,
-                kv_dim,
+                total_qkv,
                 dequant_row,
             )?;
         } else {
@@ -417,46 +404,93 @@ fn embed_prefill_bert(
         }
 
         // ── RoPE: adjacent-pair rotation per position ──────────────────────
-        for pos in 0..m {
-            let rope_cos = &all_cos[pos * rope_half..(pos + 1) * rope_half];
-            let rope_sin = &all_sin[pos * rope_half..(pos + 1) * rope_half];
-            let q_base = pos * q_dim;
-            let k_base = pos * kv_dim;
-            let mut qi = 0;
-            while qi < q_dim {
-                let hd = ((qi % head_size) / 2).min(rope_half.saturating_sub(1));
-                let fcr = rope_cos[hd];
-                let fci = rope_sin[hd];
-                let v0 = q_buf[q_base + qi];
-                let v1 = q_buf[q_base + qi + 1];
-                q_buf[q_base + qi] = v0 * fcr - v1 * fci;
-                q_buf[q_base + qi + 1] = v0 * fci + v1 * fcr;
-                qi += 2;
-            }
-            let mut ki = 0;
-            while ki < kv_dim {
-                let hd = ((ki % head_size) / 2).min(rope_half.saturating_sub(1));
-                let fcr = rope_cos[hd];
-                let fci = rope_sin[hd];
-                let v0 = k_buf[k_base + ki];
-                let v1 = k_buf[k_base + ki + 1];
-                k_buf[k_base + ki] = v0 * fcr - v1 * fci;
-                k_buf[k_base + ki + 1] = v0 * fci + v1 * fcr;
-                ki += 2;
-            }
-        }
-
-        // Stage K/V in head-major order so the attention inner loops can stream
-        // contiguous position slices instead of hopping by kv_dim every step.
-        for kv_head in 0..p.n_kv_heads {
-            let head_base = kv_head * m * head_size;
+        if fused_qkv {
             for pos in 0..m {
-                let src_base = pos * kv_dim + kv_head * head_size;
-                let dst_base = head_base + pos * head_size;
-                k_head_buf[dst_base..dst_base + head_size]
-                    .copy_from_slice(&k_buf[src_base..src_base + head_size]);
-                v_head_buf[dst_base..dst_base + head_size]
-                    .copy_from_slice(&v_buf[src_base..src_base + head_size]);
+                let rope_cos = &all_cos[pos * rope_half..(pos + 1) * rope_half];
+                let rope_sin = &all_sin[pos * rope_half..(pos + 1) * rope_half];
+                let fused_base = pos * total_qkv;
+                let q_base = pos * q_dim;
+                let q_src = &qkv_buf[fused_base..fused_base + q_dim];
+                q_buf[q_base..q_base + q_dim].copy_from_slice(q_src);
+
+                let mut qi = 0;
+                while qi < q_dim {
+                    let hd = ((qi % head_size) / 2).min(rope_half.saturating_sub(1));
+                    let fcr = rope_cos[hd];
+                    let fci = rope_sin[hd];
+                    let v0 = q_buf[q_base + qi];
+                    let v1 = q_buf[q_base + qi + 1];
+                    q_buf[q_base + qi] = v0 * fcr - v1 * fci;
+                    q_buf[q_base + qi + 1] = v0 * fci + v1 * fcr;
+                    qi += 2;
+                }
+
+                let k_src_base = fused_base + q_dim;
+                let v_src_base = k_src_base + kv_dim;
+                for kv_head in 0..p.n_kv_heads {
+                    let head_base = kv_head * m * head_size + pos * head_size;
+                    let k_src = &qkv_buf
+                        [k_src_base + kv_head * head_size..k_src_base + (kv_head + 1) * head_size];
+                    let v_src = &qkv_buf
+                        [v_src_base + kv_head * head_size..v_src_base + (kv_head + 1) * head_size];
+                    k_head_buf[head_base..head_base + head_size].copy_from_slice(k_src);
+                    v_head_buf[head_base..head_base + head_size].copy_from_slice(v_src);
+
+                    let mut ki = 0;
+                    while ki < head_size {
+                        let hd = (ki / 2).min(rope_half.saturating_sub(1));
+                        let fcr = rope_cos[hd];
+                        let fci = rope_sin[hd];
+                        let v0 = k_head_buf[head_base + ki];
+                        let v1 = k_head_buf[head_base + ki + 1];
+                        k_head_buf[head_base + ki] = v0 * fcr - v1 * fci;
+                        k_head_buf[head_base + ki + 1] = v0 * fci + v1 * fcr;
+                        ki += 2;
+                    }
+                }
+            }
+        } else {
+            for pos in 0..m {
+                let rope_cos = &all_cos[pos * rope_half..(pos + 1) * rope_half];
+                let rope_sin = &all_sin[pos * rope_half..(pos + 1) * rope_half];
+                let q_base = pos * q_dim;
+                let k_base = pos * kv_dim;
+                let mut qi = 0;
+                while qi < q_dim {
+                    let hd = ((qi % head_size) / 2).min(rope_half.saturating_sub(1));
+                    let fcr = rope_cos[hd];
+                    let fci = rope_sin[hd];
+                    let v0 = q_buf[q_base + qi];
+                    let v1 = q_buf[q_base + qi + 1];
+                    q_buf[q_base + qi] = v0 * fcr - v1 * fci;
+                    q_buf[q_base + qi + 1] = v0 * fci + v1 * fcr;
+                    qi += 2;
+                }
+                let mut ki = 0;
+                while ki < kv_dim {
+                    let hd = ((ki % head_size) / 2).min(rope_half.saturating_sub(1));
+                    let fcr = rope_cos[hd];
+                    let fci = rope_sin[hd];
+                    let v0 = k_buf[k_base + ki];
+                    let v1 = k_buf[k_base + ki + 1];
+                    k_buf[k_base + ki] = v0 * fcr - v1 * fci;
+                    k_buf[k_base + ki + 1] = v0 * fci + v1 * fcr;
+                    ki += 2;
+                }
+            }
+
+            // Stage K/V in head-major order so the attention inner loops can stream
+            // contiguous position slices instead of hopping by kv_dim every step.
+            for kv_head in 0..p.n_kv_heads {
+                let head_base = kv_head * m * head_size;
+                for pos in 0..m {
+                    let src_base = pos * kv_dim + kv_head * head_size;
+                    let dst_base = head_base + pos * head_size;
+                    k_head_buf[dst_base..dst_base + head_size]
+                        .copy_from_slice(&k_buf[src_base..src_base + head_size]);
+                    v_head_buf[dst_base..dst_base + head_size]
+                        .copy_from_slice(&v_buf[src_base..src_base + head_size]);
+                }
             }
         }
 
