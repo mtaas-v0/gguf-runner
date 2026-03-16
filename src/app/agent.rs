@@ -623,6 +623,12 @@ fn build_agent_system_prompt(
     } else {
         tool_exec.shell_allowed_commands().join(", ")
     };
+    let tool_catalog = render_tool_catalog(
+        tool_exec,
+        tool_prompt_specs,
+        shell_command_description_specs,
+        has_rag,
+    );
     let tool_rules = render_tool_rules(tool_exec, has_rag);
     format!(
         "{base_system_prompt}\n\n\
@@ -634,6 +640,8 @@ Allowed response schemas:\n\
 {{\"type\":\"tool_call\",\"tool\":\"{}\",\"args\":{{...}}}}\n\
 2) Final decision:\n\
 {{\"type\":\"final\"}}\n\
+Available tools:\n\
+{}\n\
 Rules:\n\
 {}\n\
 Runtime constraints:\n\
@@ -647,6 +655,7 @@ Output rules:\n\
 - If a tool call fails due args shape, fix the args and retry.\n\
 - Avoid prose outside the single JSON object.\n",
         allowed_tool_names,
+        tool_catalog,
         tool_rules,
         tool_exec.root().display(),
         write_state,
@@ -684,6 +693,7 @@ fn render_tool_rules(tool_exec: &ToolExecutor, has_rag: bool) -> String {
     let mut rules = vec![
         "- Use tools when you need filesystem state.".to_string(),
         "- If the user asks about files, code, directories, or repository contents, call a filesystem tool before answering when such tools are enabled.".to_string(),
+        "- If the user asks you to create or modify files, call `write_file` with the full replacement content instead of only describing the change.".to_string(),
         "- Keep tool arguments minimal and valid JSON.".to_string(),
         "- If a tool fails, adjust and retry.".to_string(),
         "- Return `type=final` when done.".to_string(),
@@ -712,6 +722,64 @@ fn render_tool_rules(tool_exec: &ToolExecutor, has_rag: bool) -> String {
         rules.push("- If a needed command is missing from the shell allowed list, call `shell_request_allowed` with command + reason.".to_string());
     }
     rules.join("\n")
+}
+
+fn render_tool_catalog(
+    tool_exec: &ToolExecutor,
+    tool_prompt_specs: &[ToolPromptSpec],
+    shell_command_description_specs: &[ShellCommandDescriptionSpec],
+    has_rag: bool,
+) -> String {
+    let enabled_tools = tool_exec.enabled_tool_names();
+    let mut lines = Vec::new();
+    for spec in tool_prompt_specs {
+        if !enabled_tools.contains(&spec.name.as_str()) {
+            continue;
+        }
+        let mut line = format!(
+            "- {}: {} When to use: {}",
+            spec.name, spec.description, spec.when_to_use
+        );
+        if let Some(args_hint) = tool_args_hint(&spec.name) {
+            line.push_str(" Args: ");
+            line.push_str(args_hint);
+        }
+        lines.push(line);
+    }
+    if has_rag {
+        lines.push("- search_knowledge: Search the loaded knowledge base. When to use: Query the attached RAG corpus for facts not in the current conversation. Args: {\"query\":\"terms\",\"top_k\":5}".to_string());
+    }
+    if tool_exec.shell_exec_enabled() && !shell_command_description_specs.is_empty() {
+        let command_lines = shell_command_description_specs
+            .iter()
+            .map(|spec| format!("{}={}", spec.command, spec.description))
+            .collect::<Vec<_>>()
+            .join("; ");
+        lines.push(format!("- shell command descriptions: {}", command_lines));
+    }
+    if lines.is_empty() {
+        "- <none>".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn tool_args_hint(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "read_file" => Some("{\"path\":\"relative/or/absolute/path\",\"max_bytes\":262144}"),
+        "list_dir" => Some("{\"path\":\"dir-or-.\",\"max_entries\":200}"),
+        "write_file" => Some(
+            "{\"path\":\"relative/or/absolute/path\",\"content\":\"full utf8 file text\",\"append\":false}",
+        ),
+        "mkdir" => Some("{\"path\":\"dir/path\"}"),
+        "rmdir" => Some("{\"path\":\"dir/path\"}"),
+        "shell_list_allowed" => Some("{}"),
+        "shell_exec" => Some(
+            "{\"command\":\"<allowed>\",\"args\":[...],\"cwd\":\".\",\"max_output_bytes\":131072}",
+        ),
+        "shell_request_allowed" => Some("{\"command\":\"<needed>\",\"reason\":\"why needed\"}"),
+        _ => None,
+    }
 }
 
 fn build_turn_prompt(transcript: &[AgentMessage]) -> String {
@@ -856,6 +924,8 @@ fn prompt_requires_filesystem(prompt: &str) -> bool {
         "file",
         "directory",
         "folder",
+        "project",
+        "workspace",
         "src/",
         ".rs",
         ".toml",
@@ -865,6 +935,27 @@ fn prompt_requires_filesystem(prompt: &str) -> bool {
         "repo",
         "repository",
         "codebase",
+    ];
+    hints.iter().any(|h| p.contains(h))
+}
+
+fn prompt_requests_filesystem_edit(prompt: &str) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    let hints = [
+        "edit ",
+        "edit the",
+        "modify",
+        "change",
+        "update",
+        "replace",
+        "rename",
+        "rewrite",
+        "patch",
+        "fix",
+        "create file",
+        "write file",
+        "save",
+        "append",
     ];
     hints.iter().any(|h| p.contains(h))
 }
@@ -890,12 +981,35 @@ pub(crate) fn prompt_likely_requires_tools(
     false
 }
 
+pub(crate) fn conversation_likely_requires_tools(
+    prompt: &str,
+    prior_chat_history: &[ChatMessage],
+    filesystem_tools_enabled: bool,
+    shell_tools_enabled: bool,
+) -> bool {
+    if prompt_likely_requires_tools(prompt, filesystem_tools_enabled, shell_tools_enabled) {
+        return true;
+    }
+    if !filesystem_tools_enabled || !prompt_requests_filesystem_edit(prompt) {
+        return false;
+    }
+    prior_chat_history
+        .iter()
+        .rev()
+        .take(8)
+        .any(|message| prompt_requires_filesystem(&message.content))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentResponse, extract_agent_final_content, looks_like_reasonable_fallback_text,
-        parse_agent_response, prompt_likely_requires_tools,
+        AgentResponse, build_agent_system_prompt, conversation_likely_requires_tools,
+        extract_agent_final_content, looks_like_reasonable_fallback_text, parse_agent_response,
+        prompt_likely_requires_tools,
     };
+    use crate::cli::{AgentToolEnablement, ToolPromptSpec};
+    use crate::tools::ToolExecutor;
+    use crate::vendors::{ChatMessage, ChatRole};
 
     #[test]
     fn fallback_text_guard_rejects_numeric_gibberish() {
@@ -937,5 +1051,45 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn prompt_tool_routing_keeps_edit_followups_in_agent_mode() {
+        let history = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: "Inspect this repository and summarize the config files.".to_string(),
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "I found Cargo.toml and docs/agent-config.example.toml.".to_string(),
+            },
+        ];
+        assert!(conversation_likely_requires_tools(
+            "Now update the config values to match that behavior.",
+            &history,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn agent_system_prompt_lists_write_file_args() {
+        let tool_exec =
+            ToolExecutor::new(None, AgentToolEnablement::default(), &[]).expect("tool executor");
+        let prompt = build_agent_system_prompt(
+            "base system",
+            &tool_exec,
+            &[ToolPromptSpec {
+                name: "write_file".to_string(),
+                description: "Write UTF-8 file content.".to_string(),
+                when_to_use: "Use for explicit file edits.".to_string(),
+            }],
+            &[],
+            false,
+        );
+        assert!(prompt.contains("write_file"));
+        assert!(prompt.contains("{\"path\":\"relative/or/absolute/path\",\"content\":\"full utf8 file text\",\"append\":false}"));
+        assert!(prompt.contains("call `write_file`"));
     }
 }

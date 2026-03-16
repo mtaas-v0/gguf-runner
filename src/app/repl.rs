@@ -687,8 +687,9 @@ fn run_worker_turn(
 
     if cli.tools_enabled
         && (runtime.has_rag_index()
-            || agent::prompt_likely_requires_tools(
+            || agent::conversation_likely_requires_tools(
                 prompt,
+                chat_history,
                 filesystem_tools_enabled,
                 shell_tools_enabled,
             ))
