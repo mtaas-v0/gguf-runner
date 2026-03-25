@@ -130,6 +130,7 @@ pub(crate) enum KvCacheMode {
     Auto,
     Q8,
     Q4,
+    Turbo,
 }
 
 pub(crate) struct RuntimeSwitchConfig {

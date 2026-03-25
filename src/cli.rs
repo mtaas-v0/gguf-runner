@@ -115,8 +115,12 @@ fn parse_kv_cache_mode(raw: &str) -> Result<CliKvCacheMode, String> {
         Ok(CliKvCacheMode::Q8)
     } else if v.eq_ignore_ascii_case("q4") {
         Ok(CliKvCacheMode::Q4)
+    } else if v.eq_ignore_ascii_case("turbo") || v.eq_ignore_ascii_case("tq") {
+        Ok(CliKvCacheMode::Turbo)
     } else {
-        Err(format!("invalid value '{raw}': expected one of auto/q8/q4"))
+        Err(format!(
+            "invalid value '{raw}': expected one of auto/q8/q4/turbo"
+        ))
     }
 }
 
@@ -141,6 +145,7 @@ pub(crate) enum CliKvCacheMode {
     Auto,
     Q8,
     Q4,
+    Turbo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3492,23 +3492,35 @@ impl ModelRuntime {
         }
 
         if hidden_retry_enabled && output.trim().is_empty() {
+            const HIDDEN_EMPTY_OUTPUT_RETRY_MAX_TOKENS: usize = 512;
             if debug_mode {
                 emit_debug_line(
                     event_callback.as_ref(),
-                    "Note: hidden think mode produced no visible output; retrying with think=no",
+                    format!(
+                        "Note: hidden think mode produced no visible output; retrying with think=no and max_tokens={}",
+                        self.settings
+                            .max_tokens
+                            .min(HIDDEN_EMPTY_OUTPUT_RETRY_MAX_TOKENS)
+                    ),
                 );
             }
             if let (Some(retry_prompt_tokens), Some(retry_prefill_embeddings)) =
                 (retry_prompt_tokens, retry_prefill_embeddings)
             {
                 let original_think_mode = self.settings.think_mode;
+                let original_max_tokens = self.settings.max_tokens;
                 self.settings.think_mode = ThinkMode::No;
+                self.settings.max_tokens = self
+                    .settings
+                    .max_tokens
+                    .min(HIDDEN_EMPTY_OUTPUT_RETRY_MAX_TOKENS);
                 let retry_result = self.generate_from_prefill(
                     retry_prompt_tokens,
                     retry_prefill_embeddings,
                     stream_stdout,
                 );
                 self.settings.think_mode = original_think_mode;
+                self.settings.max_tokens = original_max_tokens;
                 return retry_result;
             }
         }

@@ -481,8 +481,17 @@ pub(crate) struct RunState {
     pub(crate) value_cache_q8: Vec<i8>,
     pub(crate) key_cache_q4: Vec<u8>,
     pub(crate) value_cache_q4: Vec<u8>,
+    pub(crate) key_cache_turbo_base: Vec<u8>,
+    pub(crate) value_cache_turbo_base: Vec<u8>,
+    pub(crate) key_cache_turbo_sign: Vec<u8>,
+    pub(crate) value_cache_turbo_sign: Vec<u8>,
     pub(crate) key_cache_scale: Vec<f32>,
     pub(crate) value_cache_scale: Vec<f32>,
+    pub(crate) key_cache_residual_norm: Vec<f32>,
+    pub(crate) value_cache_residual_norm: Vec<f32>,
+    pub(crate) turbo_scratch0: Vec<f32>,
+    pub(crate) turbo_scratch1: Vec<f32>,
+    pub(crate) turbo_scratch2: Vec<f32>,
     pub(crate) rope_freqs: Vec<f32>,
     pub(crate) rope_freqs_swa: Vec<f32>,
     pub(crate) rope_cos: Vec<f32>,
@@ -501,6 +510,7 @@ pub(crate) struct RunState {
 pub(crate) enum KvCacheFormat {
     Q8,
     Q4,
+    Turbo,
 }
 
 #[derive(Default)]

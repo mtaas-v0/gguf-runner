@@ -66,6 +66,10 @@ Supported tensor data paths include:
 - quantized KV cache for attention state:
   - default `Q8` KV cache
   - automatic `Q4` KV cache fallback if `Q8` allocation fails
+  - optional TurboQuant-style `turbo` KV cache mode:
+    - head-wise signed-Hadamard rotation before scalar quantization
+    - 2-bit rotated-domain base codebook plus 1-bit residual sketch per channel
+    - per-head scale and residual-norm metadata used during cached key/value reads
 - optional tool-agent loop (`--agent`) with host-side file tools:
   - `read_file`
   - `list_dir`
@@ -122,7 +126,7 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_PAR_MATMUL_CHUNK_ROWS`
 - `GGUF_PAR_ATTN_MIN_HEADS`
 - `GGUF_PAR_QWEN3NEXT_MIN_HEADS`
-- `GGUF_KV_CACHE_MODE` (`auto`, `q8`, `q4`)
+- `GGUF_KV_CACHE_MODE` (`auto`, `q8`, `q4`, `turbo`)
 - `GGUF_LAYER_DEBUG`
 - `GGUF_LAYER_DEBUG_POS`
 - `GGUF_AARCH64_DOTPROD_Q8` (aarch64 only)

@@ -387,6 +387,7 @@ src/
   - quantized KV cache storage for attention state:
     - default Q8 cache
     - automatic Q4 fallback when Q8 allocation fails
+    - optional TurboQuant-style cache mode with head-wise signed-Hadamard rotation, packed 2-bit base codes, and packed 1-bit residual sketches
   - aarch64 attention helpers include NEON-accelerated block-scale Q8/Q4 KV dot+axpy paths for per-head cached key/value reads
 - `runtime/parallel.rs`:
   - `configure_rayon_threads(...)`
@@ -403,7 +404,7 @@ src/
   - Parallel thresholds (`par_matmul_min_rows`, `par_matmul_chunk_rows`, `par_attn_min_heads`, `par_qwen3next_min_heads`)
   - AArch64 matmul row prefetch distance switch (`aarch64_matmul_prefetch_rows`)
     - default values for non-x86 matmul thresholds and aarch64 prefetch distance are now derived from `available_parallelism()` heuristics (with CLI/env overrides preserved)
-  - KV cache selection switch (`kv_cache_mode`: `auto` / `q8` / `q4`)
+  - KV cache selection switch (`kv_cache_mode`: `auto` / `q8` / `q4` / `turbo`)
   - Arch feature toggles (`use_x86_*`, `use_aarch64_*`, including x86 AVX2/F16C/QK-MR4/AVX-VNNI/AVX512VNNI-Q8 switches)
     - default behavior uses runtime CPU feature detection for architecture fast paths (for example aarch64 `dotprod` Q8 and x86 `AVX512VNNI` Q8), while `RuntimeSwitchConfig`/CLI/env can still force-disable paths
     - x86 includes a lightweight CPUID vendor probe (`AuthenticAMD`) used to steer selected kernel dispatch choices
