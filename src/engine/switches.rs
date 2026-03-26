@@ -199,7 +199,7 @@ pub(crate) fn par_qwen3next_min_heads() -> usize {
 
 #[inline]
 pub(crate) fn kv_cache_mode() -> KvCacheMode {
-    *KV_CACHE_MODE_CFG.get_or_init(|| KvCacheMode::Auto)
+    *KV_CACHE_MODE_CFG.get_or_init(|| KvCacheMode::Turbo)
 }
 
 #[cfg(target_arch = "aarch64")]

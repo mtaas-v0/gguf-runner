@@ -1949,34 +1949,36 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
             )
         }
         SwitchKvCacheMode::Auto => {
-            let q8_try = (|| -> Result<(Vec<i8>, Vec<i8>), String> {
-                let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
-                let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
-                Ok((key, value))
+            let turbo_try = (|| -> Result<_, String> {
+                let base_key = alloc_u8(kv_cache_turbo_base_len, "Turbo key base cache")?;
+                let base_value = alloc_u8(kv_cache_turbo_base_len, "Turbo value base cache")?;
+                let sign_key = alloc_u8(kv_cache_turbo_sign_len, "Turbo key sign cache")?;
+                let sign_value = alloc_u8(kv_cache_turbo_sign_len, "Turbo value sign cache")?;
+                Ok((base_key, base_value, sign_key, sign_value))
             })();
-            match q8_try {
-                Ok((key, value)) => (
-                    KvCacheFormat::Q8,
-                    key,
-                    value,
+            match turbo_try {
+                Ok((base_key, base_value, sign_key, sign_value)) => (
+                    KvCacheFormat::Turbo,
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
+                    base_key,
+                    base_value,
+                    sign_key,
+                    sign_value,
                 ),
-                Err(q8_err) => {
-                    eprintln!("KV cache Q8 allocation failed: {q8_err}");
-                    eprintln!("Falling back to KV cache Q4 format.");
-                    let key = alloc_u8(kv_cache_q4_len, "Q4 key cache")?;
-                    let value = alloc_u8(kv_cache_q4_len, "Q4 value cache")?;
+                Err(turbo_err) => {
+                    eprintln!("KV cache Turbo allocation failed: {turbo_err}");
+                    eprintln!("Falling back to KV cache Q8 format.");
+                    let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
+                    let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
                     (
-                        KvCacheFormat::Q4,
-                        Vec::new(),
-                        Vec::new(),
+                        KvCacheFormat::Q8,
                         key,
                         value,
+                        Vec::new(),
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
