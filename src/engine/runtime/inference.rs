@@ -472,8 +472,16 @@ unsafe fn turboquant_transform_fused_neon(
         }
         // Scalar tail: apply sign1 then butterfly
         while i + 2 <= n {
-            let s0 = if ((first_bits[i / 8] >> (i & 7)) & 1) != 0 { -1.0f32 } else { 1.0 };
-            let s1 = if ((first_bits[(i + 1) / 8] >> ((i + 1) & 7)) & 1) != 0 { -1.0f32 } else { 1.0 };
+            let s0 = if ((first_bits[i / 8] >> (i & 7)) & 1) != 0 {
+                -1.0f32
+            } else {
+                1.0
+            };
+            let s1 = if ((first_bits[(i + 1) / 8] >> ((i + 1) & 7)) & 1) != 0 {
+                -1.0f32
+            } else {
+                1.0
+            };
             let a = *ptr.add(i) * s0;
             let b = *ptr.add(i + 1) * s1;
             *ptr.add(i) = a + b;
@@ -492,8 +500,14 @@ unsafe fn turboquant_transform_fused_neon(
             let hi = vcombine_f32(vget_high_f32(v0), vget_high_f32(v1));
             let sum = vaddq_f32(lo, hi);
             let diff = vsubq_f32(lo, hi);
-            vst1q_f32(ptr.add(i), vcombine_f32(vget_low_f32(sum), vget_low_f32(diff)));
-            vst1q_f32(ptr.add(i + 4), vcombine_f32(vget_high_f32(sum), vget_high_f32(diff)));
+            vst1q_f32(
+                ptr.add(i),
+                vcombine_f32(vget_low_f32(sum), vget_low_f32(diff)),
+            );
+            vst1q_f32(
+                ptr.add(i + 4),
+                vcombine_f32(vget_high_f32(sum), vget_high_f32(diff)),
+            );
             i += 8;
         }
         while i + 4 <= n {
@@ -550,7 +564,11 @@ unsafe fn turboquant_transform_fused_neon(
             i += 8;
         }
         while i < n {
-            let s = if ((second_bits[i / 8] >> (i & 7)) & 1) != 0 { -scale } else { scale };
+            let s = if ((second_bits[i / 8] >> (i & 7)) & 1) != 0 {
+                -scale
+            } else {
+                scale
+            };
             *ptr.add(i) *= s;
             i += 1;
         }
@@ -621,8 +639,7 @@ const fn turboquant_build_neg_sign_decode_table() -> [[f32; 8]; 256] {
     table
 }
 
-static TURBOQUANT_NEG_SIGN_DECODE_TABLE: [[f32; 8]; 256] =
-    turboquant_build_neg_sign_decode_table();
+static TURBOQUANT_NEG_SIGN_DECODE_TABLE: [[f32; 8]; 256] = turboquant_build_neg_sign_decode_table();
 fn turboquant_q2_decode_table() -> &'static [[f32; 4]; 256] {
     &TURBOQUANT_Q2_DECODE_TABLE
 }
@@ -766,8 +783,14 @@ unsafe fn turboquant_fwht_inplace_neon(values: &mut [f32]) {
             let sum = vaddq_f32(lo, hi);
             let diff = vsubq_f32(lo, hi);
             // reassemble: each group gets [sum_lo, diff_lo]
-            vst1q_f32(ptr.add(i), vcombine_f32(vget_low_f32(sum), vget_low_f32(diff)));
-            vst1q_f32(ptr.add(i + 4), vcombine_f32(vget_high_f32(sum), vget_high_f32(diff)));
+            vst1q_f32(
+                ptr.add(i),
+                vcombine_f32(vget_low_f32(sum), vget_low_f32(diff)),
+            );
+            vst1q_f32(
+                ptr.add(i + 4),
+                vcombine_f32(vget_high_f32(sum), vget_high_f32(diff)),
+            );
             i += 8;
         }
         // scalar tail for groups of 4
@@ -1067,8 +1090,10 @@ unsafe fn dot_turboquant_head_neon(
         let vscale = vdupq_n_f32(cache.scale);
         let vresidual_scale = vdupq_n_f32(residual_scale);
         while i + 16 <= n {
-            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
-            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            let (c0, c1, c2, c3) =
+                unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            let (s0, s1, s2, s3) =
+                unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
             let q0 = vld1q_f32(q_rotated.as_ptr().add(i));
             let q1 = vld1q_f32(q_rotated.as_ptr().add(i + 4));
             let q2 = vld1q_f32(q_rotated.as_ptr().add(i + 8));
@@ -1090,7 +1115,8 @@ unsafe fn dot_turboquant_head_neon(
     } else if has_base {
         let vscale = vdupq_n_f32(cache.scale);
         while i + 16 <= n {
-            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            let (c0, c1, c2, c3) =
+                unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
             vacc0 = vfmaq_f32(vacc0, vld1q_f32(q_rotated.as_ptr().add(i)), c0);
             vacc1 = vfmaq_f32(vacc1, vld1q_f32(q_rotated.as_ptr().add(i + 4)), c1);
             vacc2 = vfmaq_f32(vacc2, vld1q_f32(q_rotated.as_ptr().add(i + 8)), c2);
@@ -1100,7 +1126,8 @@ unsafe fn dot_turboquant_head_neon(
     } else if has_residual {
         let vresidual_scale = vdupq_n_f32(residual_scale);
         while i + 16 <= n {
-            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            let (s0, s1, s2, s3) =
+                unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
             racc0 = vfmaq_f32(racc0, vld1q_f32(q_residual_proj.as_ptr().add(i)), s0);
             racc1 = vfmaq_f32(racc1, vld1q_f32(q_residual_proj.as_ptr().add(i + 4)), s1);
             racc2 = vfmaq_f32(racc2, vld1q_f32(q_residual_proj.as_ptr().add(i + 8)), s2);
@@ -1109,13 +1136,8 @@ unsafe fn dot_turboquant_head_neon(
         }
     }
 
-    let mut sum = vaddvq_f32(vaddq_f32(
-        vaddq_f32(vacc0, vacc1),
-        vaddq_f32(vacc2, vacc3),
-    )) + vaddvq_f32(vaddq_f32(
-        vaddq_f32(racc0, racc1),
-        vaddq_f32(racc2, racc3),
-    ));
+    let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(vacc0, vacc1), vaddq_f32(vacc2, vacc3)))
+        + vaddvq_f32(vaddq_f32(vaddq_f32(racc0, racc1), vaddq_f32(racc2, racc3)));
 
     // scalar tail
     while i < n {
@@ -1159,36 +1181,76 @@ unsafe fn axpy_turboquant_head_neon(
         let vscale = vdupq_n_f32(a * cache.scale);
         let vresidual_scale = vdupq_n_f32(residual_scale);
         while i + 16 <= n {
-            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
-            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            let (c0, c1, c2, c3) =
+                unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            let (s0, s1, s2, s3) =
+                unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
             vst1q_f32(base_ptr.add(i), vaddq_f32(vld1q_f32(base_ptr.add(i)), c0));
-            vst1q_f32(base_ptr.add(i + 4), vaddq_f32(vld1q_f32(base_ptr.add(i + 4)), c1));
-            vst1q_f32(base_ptr.add(i + 8), vaddq_f32(vld1q_f32(base_ptr.add(i + 8)), c2));
-            vst1q_f32(base_ptr.add(i + 12), vaddq_f32(vld1q_f32(base_ptr.add(i + 12)), c3));
+            vst1q_f32(
+                base_ptr.add(i + 4),
+                vaddq_f32(vld1q_f32(base_ptr.add(i + 4)), c1),
+            );
+            vst1q_f32(
+                base_ptr.add(i + 8),
+                vaddq_f32(vld1q_f32(base_ptr.add(i + 8)), c2),
+            );
+            vst1q_f32(
+                base_ptr.add(i + 12),
+                vaddq_f32(vld1q_f32(base_ptr.add(i + 12)), c3),
+            );
             vst1q_f32(res_ptr.add(i), vaddq_f32(vld1q_f32(res_ptr.add(i)), s0));
-            vst1q_f32(res_ptr.add(i + 4), vaddq_f32(vld1q_f32(res_ptr.add(i + 4)), s1));
-            vst1q_f32(res_ptr.add(i + 8), vaddq_f32(vld1q_f32(res_ptr.add(i + 8)), s2));
-            vst1q_f32(res_ptr.add(i + 12), vaddq_f32(vld1q_f32(res_ptr.add(i + 12)), s3));
+            vst1q_f32(
+                res_ptr.add(i + 4),
+                vaddq_f32(vld1q_f32(res_ptr.add(i + 4)), s1),
+            );
+            vst1q_f32(
+                res_ptr.add(i + 8),
+                vaddq_f32(vld1q_f32(res_ptr.add(i + 8)), s2),
+            );
+            vst1q_f32(
+                res_ptr.add(i + 12),
+                vaddq_f32(vld1q_f32(res_ptr.add(i + 12)), s3),
+            );
             i += 16;
         }
     } else if has_base {
         let vscale = vdupq_n_f32(a * cache.scale);
         while i + 16 <= n {
-            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            let (c0, c1, c2, c3) =
+                unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
             vst1q_f32(base_ptr.add(i), vaddq_f32(vld1q_f32(base_ptr.add(i)), c0));
-            vst1q_f32(base_ptr.add(i + 4), vaddq_f32(vld1q_f32(base_ptr.add(i + 4)), c1));
-            vst1q_f32(base_ptr.add(i + 8), vaddq_f32(vld1q_f32(base_ptr.add(i + 8)), c2));
-            vst1q_f32(base_ptr.add(i + 12), vaddq_f32(vld1q_f32(base_ptr.add(i + 12)), c3));
+            vst1q_f32(
+                base_ptr.add(i + 4),
+                vaddq_f32(vld1q_f32(base_ptr.add(i + 4)), c1),
+            );
+            vst1q_f32(
+                base_ptr.add(i + 8),
+                vaddq_f32(vld1q_f32(base_ptr.add(i + 8)), c2),
+            );
+            vst1q_f32(
+                base_ptr.add(i + 12),
+                vaddq_f32(vld1q_f32(base_ptr.add(i + 12)), c3),
+            );
             i += 16;
         }
     } else if has_residual {
         let vresidual_scale = vdupq_n_f32(residual_scale);
         while i + 16 <= n {
-            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            let (s0, s1, s2, s3) =
+                unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
             vst1q_f32(res_ptr.add(i), vaddq_f32(vld1q_f32(res_ptr.add(i)), s0));
-            vst1q_f32(res_ptr.add(i + 4), vaddq_f32(vld1q_f32(res_ptr.add(i + 4)), s1));
-            vst1q_f32(res_ptr.add(i + 8), vaddq_f32(vld1q_f32(res_ptr.add(i + 8)), s2));
-            vst1q_f32(res_ptr.add(i + 12), vaddq_f32(vld1q_f32(res_ptr.add(i + 12)), s3));
+            vst1q_f32(
+                res_ptr.add(i + 4),
+                vaddq_f32(vld1q_f32(res_ptr.add(i + 4)), s1),
+            );
+            vst1q_f32(
+                res_ptr.add(i + 8),
+                vaddq_f32(vld1q_f32(res_ptr.add(i + 8)), s2),
+            );
+            vst1q_f32(
+                res_ptr.add(i + 12),
+                vaddq_f32(vld1q_f32(res_ptr.add(i + 12)), s3),
+            );
             i += 16;
         }
     }
@@ -2368,7 +2430,12 @@ fn transformer_inner(
                         let head_end = head_start + head_size;
                         let aux_idx = turboquant_aux_index(row_index, kv_head, p.n_kv_heads);
                         let signs = TurboSignRef::from_table(
-                            sign_table_slice, l, kv_head, p.n_layers, p.n_kv_heads, sign_bytes,
+                            sign_table_slice,
+                            l,
+                            kv_head,
+                            p.n_layers,
+                            p.n_kv_heads,
+                            sign_bytes,
                         );
                         quantize_turboquant_head(
                             &s.k[head_start..head_end],
@@ -2453,11 +2520,18 @@ fn transformer_inner(
                                 unsafe { value_scales.as_ptr().add(head_block_off) };
                             let turbo_signs = if kv_format == KvCacheFormat::Turbo {
                                 let s = TurboSignRef::from_table(
-                                    turbo_sign_table, l, kv_head,
-                                    p.n_layers, p.n_kv_heads, turbo_sign_bytes,
+                                    turbo_sign_table,
+                                    l,
+                                    kv_head,
+                                    p.n_layers,
+                                    p.n_kv_heads,
+                                    turbo_sign_bytes,
                                 );
                                 turboquant_prepare_query(
-                                    q_head, &s, turbo_query_rotated, turbo_query_residual_proj,
+                                    q_head,
+                                    &s,
+                                    turbo_query_rotated,
+                                    turbo_query_residual_proj,
                                 );
                                 Some(s)
                             } else {
@@ -2773,10 +2847,19 @@ fn transformer_inner(
                     let xb_head = &mut xb_all[hs..hs + head_size];
                     let turbo_signs = if kv_format == KvCacheFormat::Turbo {
                         let s = TurboSignRef::from_table(
-                            turbo_sign_table, l, kv_head,
-                            p.n_layers, p.n_kv_heads, turbo_sign_bytes,
+                            turbo_sign_table,
+                            l,
+                            kv_head,
+                            p.n_layers,
+                            p.n_kv_heads,
+                            turbo_sign_bytes,
                         );
-                        turboquant_prepare_query(q_head, &s, turbo_query_rotated, turbo_query_residual_proj);
+                        turboquant_prepare_query(
+                            q_head,
+                            &s,
+                            turbo_query_rotated,
+                            turbo_query_residual_proj,
+                        );
                         Some(s)
                     } else {
                         None
@@ -3386,10 +3469,9 @@ fn transformer_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        TurboquantHeadRead, axpy_turboquant_head_scalar, dot_turboquant_head_scalar, get_q2_at,
-        set_sign_bit, splitmix64, turboquant_fwht_inplace,
-        TURBOQUANT_RESIDUAL_PRE_SALT, TURBOQUANT_RESIDUAL_POST_SALT,
-        TURBOQUANT_ROTATE_PRE_SALT, TURBOQUANT_ROTATE_POST_SALT,
+        TURBOQUANT_RESIDUAL_POST_SALT, TURBOQUANT_RESIDUAL_PRE_SALT, TURBOQUANT_ROTATE_POST_SALT,
+        TURBOQUANT_ROTATE_PRE_SALT, TurboquantHeadRead, axpy_turboquant_head_scalar,
+        dot_turboquant_head_scalar, get_q2_at, set_sign_bit, splitmix64, turboquant_fwht_inplace,
     };
     #[cfg(target_arch = "aarch64")]
     use super::{axpy_turboquant_head_neon, dot_turboquant_head_neon};

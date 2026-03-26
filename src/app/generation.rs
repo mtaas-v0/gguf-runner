@@ -2135,25 +2135,22 @@ impl ModelRuntime {
 
         // RAG: augment system_prompt with retrieved context, using the last user message as query.
         let rag_system: String;
-        let system_prompt = if self.rag_index.is_some() && self.document_encoder.is_some() {
+        let system_prompt = if let (Some(enc), Some(rag_index)) =
+            (self.document_encoder.as_mut(), self.rag_index.as_ref())
+        {
             let query_text = messages
                 .iter()
                 .rev()
                 .find(|m| m.role == crate::vendors::ChatRole::User)
                 .map(|m| m.content.as_str())
                 .unwrap_or("");
-            let enc = self.document_encoder.as_mut().unwrap();
             let prefixed = if enc.query_prefix().is_empty() {
                 query_text.to_string()
             } else {
                 format!("{}{query_text}", enc.query_prefix())
             };
             let query_emb = enc.embed(&prefixed)?;
-            let chunks = self.rag_index.as_ref().unwrap().query(
-                &query_emb,
-                query_text,
-                self.settings.rag_top_k,
-            );
+            let chunks = rag_index.query(&query_emb, query_text, self.settings.rag_top_k);
             rag_system = prepend_rag_context(&chunks, system_prompt);
             &rag_system
         } else {
@@ -2343,7 +2340,9 @@ impl ModelRuntime {
     ) -> Result<String, String> {
         // RAG: augment system_prompt with retrieved context if an index is loaded.
         let rag_augmented: Option<GenerationRequest>;
-        let request = if self.rag_index.is_some() && self.document_encoder.is_some() {
+        let request = if let (Some(enc), Some(idx)) =
+            (self.document_encoder.as_mut(), self.rag_index.as_ref())
+        {
             let user_text: String = request
                 .parts
                 .iter()
@@ -2357,14 +2356,12 @@ impl ModelRuntime {
                 .collect::<Vec<_>>()
                 .join(" ");
             let top_k = self.settings.rag_top_k;
-            let enc = self.document_encoder.as_mut().unwrap();
             let prefixed = if enc.query_prefix().is_empty() {
                 user_text.clone()
             } else {
                 format!("{}{user_text}", enc.query_prefix())
             };
             let query_emb = enc.embed(&prefixed)?;
-            let idx = self.rag_index.as_ref().unwrap();
             let chunks = idx.query(&query_emb, &user_text, top_k);
             let new_system = prepend_rag_context(&chunks, &request.system_prompt);
             rag_augmented = Some(GenerationRequest {

@@ -511,7 +511,7 @@ pub(crate) fn run(cli: &CliOptions) -> Result<(), String> {
             MoveTo(0, u16::MAX), // move to bottom so output doesn't clobber history
         );
         // Reset scroll region and emit a newline so the shell prompt appears cleanly.
-        let _ = write!(io::stdout(), "\x1b[r\n");
+        let _ = writeln!(io::stdout(), "\x1b[r");
         let _ = io::stdout().flush();
         prev_hook(info);
     }));

@@ -1,11 +1,11 @@
-/// Markdown → overlapping chunk splitter.
-///
-/// Strategy:
-///  1. Split on heading lines (`#`, `##`, `###`, …) — each section is a base chunk.
-///  2. Carry the heading breadcrumb into the chunk text so retrieved chunks are self-contained.
-///  3. If a section body exceeds `max_chars`, slide a window with ~20 % overlap at paragraph
-///     boundaries.
-///  4. Drop stubs shorter than `MIN_CHUNK_CHARS`.
+//! Markdown → overlapping chunk splitter.
+//!
+//! Strategy:
+//!  1. Split on heading lines (`#`, `##`, `###`, …) — each section is a base chunk.
+//!  2. Carry the heading breadcrumb into the chunk text so retrieved chunks are self-contained.
+//!  3. If a section body exceeds `max_chars`, slide a window with ~20 % overlap at paragraph
+//!     boundaries.
+//!  4. Drop stubs shorter than `MIN_CHUNK_CHARS`.
 
 const MIN_CHUNK_CHARS: usize = 20;
 
