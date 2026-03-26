@@ -17,7 +17,6 @@ use crate::engine::types::{
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -624,63 +623,12 @@ const fn turboquant_build_neg_sign_decode_table() -> [[f32; 8]; 256] {
 
 static TURBOQUANT_NEG_SIGN_DECODE_TABLE: [[f32; 8]; 256] =
     turboquant_build_neg_sign_decode_table();
-static TURBOQUANT_NEON_VALIDATE_COUNT: AtomicUsize = AtomicUsize::new(0);
-#[cfg(target_arch = "aarch64")]
-static TURBOQUANT_NEON_VALIDATE_ENABLED: AtomicU8 = AtomicU8::new(0);
-
 fn turboquant_q2_decode_table() -> &'static [[f32; 4]; 256] {
     &TURBOQUANT_Q2_DECODE_TABLE
 }
 
 fn turboquant_sign_decode_table() -> &'static [[f32; 8]; 256] {
     &TURBOQUANT_SIGN_DECODE_TABLE
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn turboquant_validate_neon_enabled() -> bool {
-    loop {
-        match TURBOQUANT_NEON_VALIDATE_ENABLED.load(Ordering::Relaxed) {
-            1 => return false,
-            2 => return true,
-            3 => std::hint::spin_loop(),
-            0 => {
-                if TURBOQUANT_NEON_VALIDATE_ENABLED
-                    .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    let enabled = env_flag("GGUF_VALIDATE_TURBO_NEON");
-                    TURBOQUANT_NEON_VALIDATE_ENABLED
-                        .store(if enabled { 2 } else { 1 }, Ordering::Release);
-                    return enabled;
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline]
-fn turboquant_validate_neon_enabled() -> bool {
-    false
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn turboquant_log_neon_mismatch(kind: &str, elem_offset: usize, lane: usize, got: f32, want: f32) {
-    let seen = TURBOQUANT_NEON_VALIDATE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if seen < 16 {
-        eprintln!(
-            "[TURBO-NEON-MISMATCH] kind={} elem_offset={} lane={} got={:.8e} want={:.8e} diff={:.8e}",
-            kind,
-            elem_offset,
-            lane,
-            got,
-            want,
-            (got - want).abs()
-        );
-    }
 }
 
 fn quantize_q4_block(src: &[f32], dst: &mut [u8], base_elem: usize, scale_out: &mut f32) {
@@ -1039,11 +987,14 @@ fn turboquant_residual_scale(head_size: usize, residual_norm: f32) -> f32 {
     }
 }
 
+/// Unpack 16 Q2 elements from packed bytes into 4 NEON registers,
+/// pre-scaled by `scale`. Eliminates per-iteration vmulq_f32 in the inner loop.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn unpack_q2x16_neon(
+unsafe fn unpack_q2x16_scaled_neon(
     base: &[u8],
     elem_offset: usize,
+    vscale: std::arch::aarch64::float32x4_t,
 ) -> (
     std::arch::aarch64::float32x4_t,
     std::arch::aarch64::float32x4_t,
@@ -1055,18 +1006,19 @@ unsafe fn unpack_q2x16_neon(
     let packed = &base[elem_offset / 4..elem_offset / 4 + 4];
     let table = turboquant_q2_decode_table();
     (
-        vld1q_f32(table[packed[0] as usize].as_ptr()),
-        vld1q_f32(table[packed[1] as usize].as_ptr()),
-        vld1q_f32(table[packed[2] as usize].as_ptr()),
-        vld1q_f32(table[packed[3] as usize].as_ptr()),
+        vmulq_f32(vld1q_f32(table[packed[0] as usize].as_ptr()), vscale),
+        vmulq_f32(vld1q_f32(table[packed[1] as usize].as_ptr()), vscale),
+        vmulq_f32(vld1q_f32(table[packed[2] as usize].as_ptr()), vscale),
+        vmulq_f32(vld1q_f32(table[packed[3] as usize].as_ptr()), vscale),
     )
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn unpack_sign16_neon(
+unsafe fn unpack_sign16_scaled_neon(
     sign: &[u8],
     elem_offset: usize,
+    vscale: std::arch::aarch64::float32x4_t,
 ) -> (
     std::arch::aarch64::float32x4_t,
     std::arch::aarch64::float32x4_t,
@@ -1080,10 +1032,10 @@ unsafe fn unpack_sign16_neon(
     let p0 = table[packed[0] as usize].as_ptr();
     let p1 = table[packed[1] as usize].as_ptr();
     (
-        vld1q_f32(p0),
-        vld1q_f32(p0.add(4)),
-        vld1q_f32(p1),
-        vld1q_f32(p1.add(4)),
+        vmulq_f32(vld1q_f32(p0), vscale),
+        vmulq_f32(vld1q_f32(p0.add(4)), vscale),
+        vmulq_f32(vld1q_f32(p1), vscale),
+        vmulq_f32(vld1q_f32(p1.add(4)), vscale),
     )
 }
 
@@ -1097,56 +1049,88 @@ unsafe fn dot_turboquant_head_neon(
     use std::arch::aarch64::*;
 
     let n = q_rotated.len();
-    let mut i = 0usize;
-    let mut sum = 0.0f32;
+    let has_base = cache.scale != 0.0;
+    let residual_scale = turboquant_residual_scale(n, cache.residual_norm);
+    let has_residual = residual_scale != 0.0;
 
-    if cache.scale != 0.0 {
+    let mut vacc0 = vdupq_n_f32(0.0);
+    let mut vacc1 = vdupq_n_f32(0.0);
+    let mut vacc2 = vdupq_n_f32(0.0);
+    let mut vacc3 = vdupq_n_f32(0.0);
+    let mut racc0 = vdupq_n_f32(0.0);
+    let mut racc1 = vdupq_n_f32(0.0);
+    let mut racc2 = vdupq_n_f32(0.0);
+    let mut racc3 = vdupq_n_f32(0.0);
+    let mut i = 0usize;
+
+    if has_base && has_residual {
         let vscale = vdupq_n_f32(cache.scale);
-        let mut vacc0 = vdupq_n_f32(0.0);
-        let mut vacc1 = vdupq_n_f32(0.0);
-        let mut vacc2 = vdupq_n_f32(0.0);
-        let mut vacc3 = vdupq_n_f32(0.0);
+        let vresidual_scale = vdupq_n_f32(residual_scale);
         while i + 16 <= n {
-            let (c0, c1, c2, c3) = unpack_q2x16_neon(cache.base, cache.elem_offset + i);
-            vacc0 = vfmaq_f32(vacc0, vld1q_f32(q_rotated.as_ptr().add(i)), vmulq_f32(c0, vscale));
-            vacc1 = vfmaq_f32(vacc1, vld1q_f32(q_rotated.as_ptr().add(i + 4)), vmulq_f32(c1, vscale));
-            vacc2 = vfmaq_f32(vacc2, vld1q_f32(q_rotated.as_ptr().add(i + 8)), vmulq_f32(c2, vscale));
-            vacc3 = vfmaq_f32(vacc3, vld1q_f32(q_rotated.as_ptr().add(i + 12)), vmulq_f32(c3, vscale));
+            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            let q0 = vld1q_f32(q_rotated.as_ptr().add(i));
+            let q1 = vld1q_f32(q_rotated.as_ptr().add(i + 4));
+            let q2 = vld1q_f32(q_rotated.as_ptr().add(i + 8));
+            let q3 = vld1q_f32(q_rotated.as_ptr().add(i + 12));
+            let r0 = vld1q_f32(q_residual_proj.as_ptr().add(i));
+            let r1 = vld1q_f32(q_residual_proj.as_ptr().add(i + 4));
+            let r2 = vld1q_f32(q_residual_proj.as_ptr().add(i + 8));
+            let r3 = vld1q_f32(q_residual_proj.as_ptr().add(i + 12));
+            vacc0 = vfmaq_f32(vacc0, q0, c0);
+            vacc1 = vfmaq_f32(vacc1, q1, c1);
+            vacc2 = vfmaq_f32(vacc2, q2, c2);
+            vacc3 = vfmaq_f32(vacc3, q3, c3);
+            racc0 = vfmaq_f32(racc0, r0, s0);
+            racc1 = vfmaq_f32(racc1, r1, s1);
+            racc2 = vfmaq_f32(racc2, r2, s2);
+            racc3 = vfmaq_f32(racc3, r3, s3);
             i += 16;
         }
-        sum += vaddvq_f32(vaddq_f32(vaddq_f32(vacc0, vacc1), vaddq_f32(vacc2, vacc3)));
-        while i < n {
-            let code = get_q2_at(cache.base, cache.elem_offset + i) as usize;
-            sum += q_rotated[i] * TURBOQUANT_CENTROIDS[code] * cache.scale;
-            i += 1;
+    } else if has_base {
+        let vscale = vdupq_n_f32(cache.scale);
+        while i + 16 <= n {
+            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            vacc0 = vfmaq_f32(vacc0, vld1q_f32(q_rotated.as_ptr().add(i)), c0);
+            vacc1 = vfmaq_f32(vacc1, vld1q_f32(q_rotated.as_ptr().add(i + 4)), c1);
+            vacc2 = vfmaq_f32(vacc2, vld1q_f32(q_rotated.as_ptr().add(i + 8)), c2);
+            vacc3 = vfmaq_f32(vacc3, vld1q_f32(q_rotated.as_ptr().add(i + 12)), c3);
+            i += 16;
+        }
+    } else if has_residual {
+        let vresidual_scale = vdupq_n_f32(residual_scale);
+        while i + 16 <= n {
+            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            racc0 = vfmaq_f32(racc0, vld1q_f32(q_residual_proj.as_ptr().add(i)), s0);
+            racc1 = vfmaq_f32(racc1, vld1q_f32(q_residual_proj.as_ptr().add(i + 4)), s1);
+            racc2 = vfmaq_f32(racc2, vld1q_f32(q_residual_proj.as_ptr().add(i + 8)), s2);
+            racc3 = vfmaq_f32(racc3, vld1q_f32(q_residual_proj.as_ptr().add(i + 12)), s3);
+            i += 16;
         }
     }
 
-    let residual_scale = turboquant_residual_scale(n, cache.residual_norm);
-    if residual_scale != 0.0 {
-        let vresidual_scale = vdupq_n_f32(residual_scale);
-        let mut vacc0 = vdupq_n_f32(0.0);
-        let mut vacc1 = vdupq_n_f32(0.0);
-        let mut vacc2 = vdupq_n_f32(0.0);
-        let mut vacc3 = vdupq_n_f32(0.0);
-        let mut j = 0usize;
-        while j + 16 <= n {
-            let (s0, s1, s2, s3) = unpack_sign16_neon(cache.sign, cache.elem_offset + j);
-            vacc0 = vfmaq_f32(vacc0, vld1q_f32(q_residual_proj.as_ptr().add(j)), vmulq_f32(s0, vresidual_scale));
-            vacc1 = vfmaq_f32(vacc1, vld1q_f32(q_residual_proj.as_ptr().add(j + 4)), vmulq_f32(s1, vresidual_scale));
-            vacc2 = vfmaq_f32(vacc2, vld1q_f32(q_residual_proj.as_ptr().add(j + 8)), vmulq_f32(s2, vresidual_scale));
-            vacc3 = vfmaq_f32(vacc3, vld1q_f32(q_residual_proj.as_ptr().add(j + 12)), vmulq_f32(s3, vresidual_scale));
-            j += 16;
+    let mut sum = vaddvq_f32(vaddq_f32(
+        vaddq_f32(vacc0, vacc1),
+        vaddq_f32(vacc2, vacc3),
+    )) + vaddvq_f32(vaddq_f32(
+        vaddq_f32(racc0, racc1),
+        vaddq_f32(racc2, racc3),
+    ));
+
+    // scalar tail
+    while i < n {
+        if has_base {
+            let code = get_q2_at(cache.base, cache.elem_offset + i) as usize;
+            sum += q_rotated[i] * TURBOQUANT_CENTROIDS[code] * cache.scale;
         }
-        sum += vaddvq_f32(vaddq_f32(vaddq_f32(vacc0, vacc1), vaddq_f32(vacc2, vacc3)));
-        while j < n {
-            sum += if get_sign_bit(cache.sign, cache.elem_offset + j) {
-                residual_scale * q_residual_proj[j]
+        if has_residual {
+            sum += if get_sign_bit(cache.sign, cache.elem_offset + i) {
+                residual_scale * q_residual_proj[i]
             } else {
-                -residual_scale * q_residual_proj[j]
+                -residual_scale * q_residual_proj[i]
             };
-            j += 1;
         }
+        i += 1;
     }
 
     sum
@@ -1163,47 +1147,66 @@ unsafe fn axpy_turboquant_head_neon(
     use std::arch::aarch64::*;
 
     let n = base_accum.len();
-    let dst_ptr = base_accum.as_mut_ptr();
+    let has_base = cache.scale != 0.0;
+    let residual_scale = a * turboquant_residual_scale(n, cache.residual_norm);
+    let has_residual = residual_scale != 0.0;
+
+    let base_ptr = base_accum.as_mut_ptr();
+    let res_ptr = residual_accum.as_mut_ptr();
     let mut i = 0usize;
 
-    if cache.scale != 0.0 {
+    if has_base && has_residual {
         let vscale = vdupq_n_f32(a * cache.scale);
+        let vresidual_scale = vdupq_n_f32(residual_scale);
         while i + 16 <= n {
-            let (c0, c1, c2, c3) = unpack_q2x16_neon(cache.base, cache.elem_offset + i);
-            vst1q_f32(dst_ptr.add(i), vaddq_f32(vld1q_f32(dst_ptr.add(i)), vmulq_f32(c0, vscale)));
-            vst1q_f32(dst_ptr.add(i + 4), vaddq_f32(vld1q_f32(dst_ptr.add(i + 4)), vmulq_f32(c1, vscale)));
-            vst1q_f32(dst_ptr.add(i + 8), vaddq_f32(vld1q_f32(dst_ptr.add(i + 8)), vmulq_f32(c2, vscale)));
-            vst1q_f32(dst_ptr.add(i + 12), vaddq_f32(vld1q_f32(dst_ptr.add(i + 12)), vmulq_f32(c3, vscale)));
+            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            vst1q_f32(base_ptr.add(i), vaddq_f32(vld1q_f32(base_ptr.add(i)), c0));
+            vst1q_f32(base_ptr.add(i + 4), vaddq_f32(vld1q_f32(base_ptr.add(i + 4)), c1));
+            vst1q_f32(base_ptr.add(i + 8), vaddq_f32(vld1q_f32(base_ptr.add(i + 8)), c2));
+            vst1q_f32(base_ptr.add(i + 12), vaddq_f32(vld1q_f32(base_ptr.add(i + 12)), c3));
+            vst1q_f32(res_ptr.add(i), vaddq_f32(vld1q_f32(res_ptr.add(i)), s0));
+            vst1q_f32(res_ptr.add(i + 4), vaddq_f32(vld1q_f32(res_ptr.add(i + 4)), s1));
+            vst1q_f32(res_ptr.add(i + 8), vaddq_f32(vld1q_f32(res_ptr.add(i + 8)), s2));
+            vst1q_f32(res_ptr.add(i + 12), vaddq_f32(vld1q_f32(res_ptr.add(i + 12)), s3));
             i += 16;
         }
-        while i < n {
-            let code = get_q2_at(cache.base, cache.elem_offset + i) as usize;
-            base_accum[i] += a * TURBOQUANT_CENTROIDS[code] * cache.scale;
-            i += 1;
+    } else if has_base {
+        let vscale = vdupq_n_f32(a * cache.scale);
+        while i + 16 <= n {
+            let (c0, c1, c2, c3) = unpack_q2x16_scaled_neon(cache.base, cache.elem_offset + i, vscale);
+            vst1q_f32(base_ptr.add(i), vaddq_f32(vld1q_f32(base_ptr.add(i)), c0));
+            vst1q_f32(base_ptr.add(i + 4), vaddq_f32(vld1q_f32(base_ptr.add(i + 4)), c1));
+            vst1q_f32(base_ptr.add(i + 8), vaddq_f32(vld1q_f32(base_ptr.add(i + 8)), c2));
+            vst1q_f32(base_ptr.add(i + 12), vaddq_f32(vld1q_f32(base_ptr.add(i + 12)), c3));
+            i += 16;
+        }
+    } else if has_residual {
+        let vresidual_scale = vdupq_n_f32(residual_scale);
+        while i + 16 <= n {
+            let (s0, s1, s2, s3) = unpack_sign16_scaled_neon(cache.sign, cache.elem_offset + i, vresidual_scale);
+            vst1q_f32(res_ptr.add(i), vaddq_f32(vld1q_f32(res_ptr.add(i)), s0));
+            vst1q_f32(res_ptr.add(i + 4), vaddq_f32(vld1q_f32(res_ptr.add(i + 4)), s1));
+            vst1q_f32(res_ptr.add(i + 8), vaddq_f32(vld1q_f32(res_ptr.add(i + 8)), s2));
+            vst1q_f32(res_ptr.add(i + 12), vaddq_f32(vld1q_f32(res_ptr.add(i + 12)), s3));
+            i += 16;
         }
     }
 
-    let residual_scale = a * turboquant_residual_scale(n, cache.residual_norm);
-    if residual_scale != 0.0 {
-        let vresidual_scale = vdupq_n_f32(residual_scale);
-        let dst_ptr = residual_accum.as_mut_ptr();
-        let mut j = 0usize;
-        while j + 16 <= n {
-            let (s0, s1, s2, s3) = unpack_sign16_neon(cache.sign, cache.elem_offset + j);
-            vst1q_f32(dst_ptr.add(j), vaddq_f32(vld1q_f32(dst_ptr.add(j)), vmulq_f32(s0, vresidual_scale)));
-            vst1q_f32(dst_ptr.add(j + 4), vaddq_f32(vld1q_f32(dst_ptr.add(j + 4)), vmulq_f32(s1, vresidual_scale)));
-            vst1q_f32(dst_ptr.add(j + 8), vaddq_f32(vld1q_f32(dst_ptr.add(j + 8)), vmulq_f32(s2, vresidual_scale)));
-            vst1q_f32(dst_ptr.add(j + 12), vaddq_f32(vld1q_f32(dst_ptr.add(j + 12)), vmulq_f32(s3, vresidual_scale)));
-            j += 16;
+    // scalar tail
+    while i < n {
+        if has_base {
+            let code = get_q2_at(cache.base, cache.elem_offset + i) as usize;
+            base_accum[i] += a * TURBOQUANT_CENTROIDS[code] * cache.scale;
         }
-        while j < n {
-            residual_accum[j] += if get_sign_bit(cache.sign, cache.elem_offset + j) {
+        if has_residual {
+            residual_accum[i] += if get_sign_bit(cache.sign, cache.elem_offset + i) {
                 residual_scale
             } else {
                 -residual_scale
             };
-            j += 1;
         }
+        i += 1;
     }
 }
 
@@ -1239,15 +1242,7 @@ fn dot_turboquant_head(
 ) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let validate_neon = turboquant_validate_neon_enabled();
-        let neon = dot_turboquant_head_neon(q_rotated, q_residual_proj, cache);
-        if validate_neon {
-            let scalar = dot_turboquant_head_scalar(q_rotated, q_residual_proj, cache);
-            if (neon - scalar).abs() > 1e-4 {
-                turboquant_log_neon_mismatch("dot", cache.elem_offset, 0, neon, scalar);
-            }
-        }
-        return neon;
+        return dot_turboquant_head_neon(q_rotated, q_residual_proj, cache);
     }
     #[allow(unreachable_code)]
     dot_turboquant_head_scalar(q_rotated, q_residual_proj, cache)
@@ -1285,29 +1280,6 @@ fn axpy_turboquant_head(
 ) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        let validate_neon = turboquant_validate_neon_enabled();
-        if validate_neon {
-            let mut scalar_base = base_accum.to_vec();
-            let mut scalar_residual = residual_accum.to_vec();
-            let mut neon_base = base_accum.to_vec();
-            let mut neon_residual = residual_accum.to_vec();
-            axpy_turboquant_head_scalar(&mut scalar_base, &mut scalar_residual, a, cache);
-            axpy_turboquant_head_neon(&mut neon_base, &mut neon_residual, a, cache);
-            for (i, (&got, &want)) in neon_base.iter().zip(scalar_base.iter()).enumerate() {
-                if (got - want).abs() > 1e-4 {
-                    turboquant_log_neon_mismatch("axpy-base", cache.elem_offset, i, got, want);
-                    break;
-                }
-            }
-            for (i, (&got, &want)) in neon_residual.iter().zip(scalar_residual.iter()).enumerate() {
-                if (got - want).abs() > 1e-4 {
-                    turboquant_log_neon_mismatch("axpy-residual", cache.elem_offset, i, got, want);
-                    break;
-                }
-            }
-            axpy_turboquant_head_neon(base_accum, residual_accum, a, cache);
-            return;
-        }
         axpy_turboquant_head_neon(base_accum, residual_accum, a, cache);
         return;
     }
