@@ -17,6 +17,7 @@ use crate::engine::types::{
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator, ParallelSliceMut,
 };
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -336,40 +337,182 @@ const TURBOQUANT_ROTATE_PRE_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 const TURBOQUANT_ROTATE_POST_SALT: u64 = 0xC2B2_AE3D_27D4_EB4F;
 const TURBOQUANT_RESIDUAL_PRE_SALT: u64 = 0x1656_67B1_9E37_79F9;
 const TURBOQUANT_RESIDUAL_POST_SALT: u64 = 0xD6E8_FEB8_6659_FD93;
-static TURBOQUANT_Q2_DECODE_TABLE: std::sync::OnceLock<[[f32; 4]; 256]> =
-    std::sync::OnceLock::new();
-static TURBOQUANT_SIGN_DECODE_TABLE: std::sync::OnceLock<[[f32; 8]; 256]> =
-    std::sync::OnceLock::new();
+
+const TURBO_SIGN_SLOT_ROT_PRE: usize = 0;
+const TURBO_SIGN_SLOT_ROT_POST: usize = 1;
+const TURBO_SIGN_SLOT_RES_PRE: usize = 2;
+const TURBO_SIGN_SLOT_RES_POST: usize = 3;
+const TURBO_SIGN_SLOTS: usize = 4;
+
+fn turboquant_sign_bytes_per_head(head_size: usize) -> usize {
+    head_size.div_ceil(8)
+}
+
+/// Precomputes all sign bit patterns for every (slot, layer, kv_head) combination.
+/// Layout: [slot * n_layers * n_kv_heads + layer * n_kv_heads + kv_head] * bytes_per_head
+/// bit=1 means multiply by -1 (matches turboquant_sign convention: splitmix64 & 1 == 1 → -1.0)
+fn turboquant_build_sign_table(n_layers: usize, n_kv_heads: usize, head_size: usize) -> Vec<u8> {
+    let bytes = turboquant_sign_bytes_per_head(head_size);
+    let mut table = vec![0u8; TURBO_SIGN_SLOTS * n_layers * n_kv_heads * bytes];
+    let salts = [
+        (TURBO_SIGN_SLOT_ROT_PRE, TURBOQUANT_ROTATE_PRE_SALT),
+        (TURBO_SIGN_SLOT_ROT_POST, TURBOQUANT_ROTATE_POST_SALT),
+        (TURBO_SIGN_SLOT_RES_PRE, TURBOQUANT_RESIDUAL_PRE_SALT),
+        (TURBO_SIGN_SLOT_RES_POST, TURBOQUANT_RESIDUAL_POST_SALT),
+    ];
+    let stride = n_layers * n_kv_heads * bytes;
+    for (slot, salt) in salts {
+        for layer in 0..n_layers {
+            for kv_head in 0..n_kv_heads {
+                let seed = splitmix64(((layer as u64) << 32) ^ kv_head as u64 ^ salt);
+                let base = slot * stride + (layer * n_kv_heads + kv_head) * bytes;
+                let bits = &mut table[base..base + bytes];
+                for i in 0..head_size {
+                    if (splitmix64(seed ^ i as u64) & 1) != 0 {
+                        bits[i / 8] |= 1 << (i & 7);
+                    }
+                }
+            }
+        }
+    }
+    table
+}
+
+/// Four precomputed sign-bit slices for one (layer, kv_head) pair.
+#[derive(Clone, Copy)]
+struct TurboSignRef<'a> {
+    rot_pre: &'a [u8],
+    rot_post: &'a [u8],
+    res_pre: &'a [u8],
+    res_post: &'a [u8],
+}
+
+impl<'a> TurboSignRef<'a> {
+    fn from_table(
+        table: &'a [u8],
+        layer: usize,
+        kv_head: usize,
+        n_layers: usize,
+        n_kv_heads: usize,
+        bytes_per_head: usize,
+    ) -> Self {
+        let stride = n_layers * n_kv_heads * bytes_per_head;
+        let off = (layer * n_kv_heads + kv_head) * bytes_per_head;
+        let slot = |s: usize| &table[s * stride + off..][..bytes_per_head];
+        TurboSignRef {
+            rot_pre: slot(TURBO_SIGN_SLOT_ROT_PRE),
+            rot_post: slot(TURBO_SIGN_SLOT_ROT_POST),
+            res_pre: slot(TURBO_SIGN_SLOT_RES_PRE),
+            res_post: slot(TURBO_SIGN_SLOT_RES_POST),
+        }
+    }
+}
+
+fn turboquant_apply_signs_bits(values: &mut [f32], sign_bits: &[u8]) {
+    for (i, value) in values.iter_mut().enumerate() {
+        if ((sign_bits[i / 8] >> (i & 7)) & 1) != 0 {
+            *value = -*value;
+        }
+    }
+}
+
+#[inline]
+fn turboquant_transform_with_bits(values: &mut [f32], first_bits: &[u8], second_bits: &[u8]) {
+    turboquant_apply_signs_bits(values, first_bits);
+    turboquant_fwht_inplace(values);
+    turboquant_apply_signs_bits(values, second_bits);
+}
+
+const fn turboquant_build_q2_decode_table() -> [[f32; 4]; 256] {
+    let mut table = [[0.0f32; 4]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let b = byte as u8;
+        table[byte] = [
+            TURBOQUANT_CENTROIDS[(b & 0b11) as usize],
+            TURBOQUANT_CENTROIDS[((b >> 2) & 0b11) as usize],
+            TURBOQUANT_CENTROIDS[((b >> 4) & 0b11) as usize],
+            TURBOQUANT_CENTROIDS[((b >> 6) & 0b11) as usize],
+        ];
+        byte += 1;
+    }
+    table
+}
+
+const fn turboquant_build_sign_decode_table() -> [[f32; 8]; 256] {
+    let mut table = [[0.0f32; 8]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let b = byte as u8;
+        let mut bit = 0usize;
+        while bit < 8 {
+            table[byte][bit] = if ((b >> bit) & 1) != 0 { 1.0 } else { -1.0 };
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+static TURBOQUANT_Q2_DECODE_TABLE: [[f32; 4]; 256] = turboquant_build_q2_decode_table();
+static TURBOQUANT_SIGN_DECODE_TABLE: [[f32; 8]; 256] = turboquant_build_sign_decode_table();
+static TURBOQUANT_NEON_VALIDATE_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "aarch64")]
+static TURBOQUANT_NEON_VALIDATE_ENABLED: AtomicU8 = AtomicU8::new(0);
 
 fn turboquant_q2_decode_table() -> &'static [[f32; 4]; 256] {
-    TURBOQUANT_Q2_DECODE_TABLE.get_or_init(|| {
-        let mut table = [[0.0f32; 4]; 256];
-        for byte in 0u16..=255 {
-            let b = byte as u8;
-            table[byte as usize] = [
-                TURBOQUANT_CENTROIDS[(b & 0b11) as usize],
-                TURBOQUANT_CENTROIDS[((b >> 2) & 0b11) as usize],
-                TURBOQUANT_CENTROIDS[((b >> 4) & 0b11) as usize],
-                TURBOQUANT_CENTROIDS[((b >> 6) & 0b11) as usize],
-            ];
-        }
-        table
-    })
+    &TURBOQUANT_Q2_DECODE_TABLE
 }
 
 fn turboquant_sign_decode_table() -> &'static [[f32; 8]; 256] {
-    TURBOQUANT_SIGN_DECODE_TABLE.get_or_init(|| {
-        let mut table = [[0.0f32; 8]; 256];
-        for byte in 0u16..=255 {
-            let b = byte as u8;
-            let mut lanes = [0.0f32; 8];
-            for (bit, lane) in lanes.iter_mut().enumerate() {
-                *lane = if ((b >> bit) & 1) != 0 { 1.0 } else { -1.0 };
+    &TURBOQUANT_SIGN_DECODE_TABLE
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn turboquant_validate_neon_enabled() -> bool {
+    loop {
+        match TURBOQUANT_NEON_VALIDATE_ENABLED.load(Ordering::Relaxed) {
+            1 => return false,
+            2 => return true,
+            3 => std::hint::spin_loop(),
+            0 => {
+                if TURBOQUANT_NEON_VALIDATE_ENABLED
+                    .compare_exchange(0, 3, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let enabled = env_flag("GGUF_VALIDATE_TURBO_NEON");
+                    TURBOQUANT_NEON_VALIDATE_ENABLED
+                        .store(if enabled { 2 } else { 1 }, Ordering::Release);
+                    return enabled;
+                }
             }
-            table[byte as usize] = lanes;
+            _ => unreachable!(),
         }
-        table
-    })
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn turboquant_validate_neon_enabled() -> bool {
+    false
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn turboquant_log_neon_mismatch(kind: &str, elem_offset: usize, lane: usize, got: f32, want: f32) {
+    let seen = TURBOQUANT_NEON_VALIDATE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if seen < 16 {
+        eprintln!(
+            "[TURBO-NEON-MISMATCH] kind={} elem_offset={} lane={} got={:.8e} want={:.8e} diff={:.8e}",
+            kind,
+            elem_offset,
+            lane,
+            got,
+            want,
+            (got - want).abs()
+        );
+    }
 }
 
 fn quantize_q4_block(src: &[f32], dst: &mut [u8], base_elem: usize, scale_out: &mut f32) {
@@ -558,8 +701,7 @@ struct TurboquantHeadRead<'a> {
 
 fn quantize_turboquant_head(
     src: &[f32],
-    layer: usize,
-    kv_head: usize,
+    signs: &TurboSignRef<'_>,
     rotated: &mut [f32],
     residual: &mut [f32],
     dst: TurboquantHeadWrite<'_>,
@@ -569,7 +711,7 @@ fn quantize_turboquant_head(
     let rotated = &mut rotated[..src.len()];
     let residual = &mut residual[..src.len()];
     rotated.copy_from_slice(src);
-    turboquant_transform_in_place(rotated, layer, kv_head, false, false);
+    turboquant_transform_with_bits(rotated, signs.rot_pre, signs.rot_post);
 
     let sigma = l2_norm(rotated) / (rotated.len() as f32).sqrt();
     *dst.scale_out = sigma;
@@ -601,7 +743,7 @@ fn quantize_turboquant_head(
     for value in residual.iter_mut() {
         *value /= gamma;
     }
-    turboquant_transform_in_place(residual, layer, kv_head, true, false);
+    turboquant_transform_with_bits(residual, signs.res_pre, signs.res_post);
     for (i, &value) in residual.iter().enumerate() {
         set_sign_bit(dst.sign, dst.elem_offset + i, value >= 0.0);
     }
@@ -609,8 +751,7 @@ fn quantize_turboquant_head(
 
 fn turboquant_prepare_query(
     q_head: &[f32],
-    layer: usize,
-    kv_head: usize,
+    signs: &TurboSignRef<'_>,
     rotated: &mut [f32],
     projected: &mut [f32],
 ) {
@@ -619,9 +760,9 @@ fn turboquant_prepare_query(
     let rotated = &mut rotated[..q_head.len()];
     let projected = &mut projected[..q_head.len()];
     rotated.copy_from_slice(q_head);
-    turboquant_transform_in_place(rotated, layer, kv_head, false, false);
+    turboquant_transform_with_bits(rotated, signs.rot_pre, signs.rot_post);
     projected.copy_from_slice(rotated);
-    turboquant_transform_in_place(projected, layer, kv_head, true, false);
+    turboquant_transform_with_bits(projected, signs.res_pre, signs.res_post);
 }
 
 fn turboquant_reset_residual_accum(residual_accum: &mut [f32], len: usize) {
@@ -672,81 +813,81 @@ unsafe fn dot_turboquant_head_neon(
     use std::arch::aarch64::*;
 
     let n = q_rotated.len();
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
     let mut lanes = [0.0f32; 16];
     let mut i = 0usize;
-    let mut tail_sum = 0.0f32;
+    let mut sum = 0.0f32;
 
     if cache.scale != 0.0 {
         let vscale = vdupq_n_f32(cache.scale);
+        let mut vacc0 = vdupq_n_f32(0.0);
+        let mut vacc1 = vdupq_n_f32(0.0);
+        let mut vacc2 = vdupq_n_f32(0.0);
+        let mut vacc3 = vdupq_n_f32(0.0);
         while i + 16 <= n {
             unpack_turboquant_q2x16_scaled(cache.base, cache.elem_offset + i, &mut lanes);
-            acc0 = vfmaq_f32(
-                acc0,
+            vacc0 = vfmaq_f32(
+                vacc0,
                 vld1q_f32(q_rotated.as_ptr().add(i)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr()), vscale),
             );
-            acc1 = vfmaq_f32(
-                acc1,
+            vacc1 = vfmaq_f32(
+                vacc1,
                 vld1q_f32(q_rotated.as_ptr().add(i + 4)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr().add(4)), vscale),
             );
-            acc2 = vfmaq_f32(
-                acc2,
+            vacc2 = vfmaq_f32(
+                vacc2,
                 vld1q_f32(q_rotated.as_ptr().add(i + 8)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr().add(8)), vscale),
             );
-            acc3 = vfmaq_f32(
-                acc3,
+            vacc3 = vfmaq_f32(
+                vacc3,
                 vld1q_f32(q_rotated.as_ptr().add(i + 12)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr().add(12)), vscale),
             );
             i += 16;
         }
+        sum += vaddvq_f32(vaddq_f32(vaddq_f32(vacc0, vacc1), vaddq_f32(vacc2, vacc3)));
         while i < n {
             let code = get_q2_at(cache.base, cache.elem_offset + i) as usize;
-            tail_sum += q_rotated[i] * TURBOQUANT_CENTROIDS[code] * cache.scale;
+            sum += q_rotated[i] * TURBOQUANT_CENTROIDS[code] * cache.scale;
             i += 1;
         }
     }
 
-    let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3))) + tail_sum;
     let residual_scale = turboquant_residual_scale(n, cache.residual_norm);
     if residual_scale != 0.0 {
         let vresidual_scale = vdupq_n_f32(residual_scale);
-        let mut racc0 = vdupq_n_f32(0.0);
-        let mut racc1 = vdupq_n_f32(0.0);
-        let mut racc2 = vdupq_n_f32(0.0);
-        let mut racc3 = vdupq_n_f32(0.0);
+        let mut vacc0 = vdupq_n_f32(0.0);
+        let mut vacc1 = vdupq_n_f32(0.0);
+        let mut vacc2 = vdupq_n_f32(0.0);
+        let mut vacc3 = vdupq_n_f32(0.0);
         let mut j = 0usize;
         while j + 16 <= n {
             unpack_turboquant_signx16_scaled(cache.sign, cache.elem_offset + j, &mut lanes);
-            racc0 = vfmaq_f32(
-                racc0,
+            vacc0 = vfmaq_f32(
+                vacc0,
                 vld1q_f32(q_residual_proj.as_ptr().add(j)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr()), vresidual_scale),
             );
-            racc1 = vfmaq_f32(
-                racc1,
+            vacc1 = vfmaq_f32(
+                vacc1,
                 vld1q_f32(q_residual_proj.as_ptr().add(j + 4)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr().add(4)), vresidual_scale),
             );
-            racc2 = vfmaq_f32(
-                racc2,
+            vacc2 = vfmaq_f32(
+                vacc2,
                 vld1q_f32(q_residual_proj.as_ptr().add(j + 8)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr().add(8)), vresidual_scale),
             );
-            racc3 = vfmaq_f32(
-                racc3,
+            vacc3 = vfmaq_f32(
+                vacc3,
                 vld1q_f32(q_residual_proj.as_ptr().add(j + 12)),
                 vmulq_f32(vld1q_f32(lanes.as_ptr().add(12)), vresidual_scale),
             );
             j += 16;
         }
-        sum += vaddvq_f32(vaddq_f32(vaddq_f32(racc0, racc1), vaddq_f32(racc2, racc3)));
+        sum += vaddvq_f32(vaddq_f32(vaddq_f32(vacc0, vacc1), vaddq_f32(vacc2, vacc3)));
         while j < n {
             sum += if get_sign_bit(cache.sign, cache.elem_offset + j) {
                 residual_scale * q_residual_proj[j]
@@ -896,9 +1037,15 @@ fn dot_turboquant_head(
 ) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        if env_flag("GGUF_AARCH64_TURBO_NEON") {
-            return dot_turboquant_head_neon(q_rotated, q_residual_proj, cache);
+        let validate_neon = turboquant_validate_neon_enabled();
+        let neon = dot_turboquant_head_neon(q_rotated, q_residual_proj, cache);
+        if validate_neon {
+            let scalar = dot_turboquant_head_scalar(q_rotated, q_residual_proj, cache);
+            if (neon - scalar).abs() > 1e-4 {
+                turboquant_log_neon_mismatch("dot", cache.elem_offset, 0, neon, scalar);
+            }
         }
+        return neon;
     }
     #[allow(unreachable_code)]
     dot_turboquant_head_scalar(q_rotated, q_residual_proj, cache)
@@ -936,10 +1083,31 @@ fn axpy_turboquant_head(
 ) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        if env_flag("GGUF_AARCH64_TURBO_NEON") {
+        let validate_neon = turboquant_validate_neon_enabled();
+        if validate_neon {
+            let mut scalar_base = base_accum.to_vec();
+            let mut scalar_residual = residual_accum.to_vec();
+            let mut neon_base = base_accum.to_vec();
+            let mut neon_residual = residual_accum.to_vec();
+            axpy_turboquant_head_scalar(&mut scalar_base, &mut scalar_residual, a, cache);
+            axpy_turboquant_head_neon(&mut neon_base, &mut neon_residual, a, cache);
+            for (i, (&got, &want)) in neon_base.iter().zip(scalar_base.iter()).enumerate() {
+                if (got - want).abs() > 1e-4 {
+                    turboquant_log_neon_mismatch("axpy-base", cache.elem_offset, i, got, want);
+                    break;
+                }
+            }
+            for (i, (&got, &want)) in neon_residual.iter().zip(scalar_residual.iter()).enumerate() {
+                if (got - want).abs() > 1e-4 {
+                    turboquant_log_neon_mismatch("axpy-residual", cache.elem_offset, i, got, want);
+                    break;
+                }
+            }
             axpy_turboquant_head_neon(base_accum, residual_accum, a, cache);
             return;
         }
+        axpy_turboquant_head_neon(base_accum, residual_accum, a, cache);
+        return;
     }
     #[allow(unreachable_code)]
     axpy_turboquant_head_scalar(base_accum, residual_accum, a, cache)
@@ -948,13 +1116,14 @@ fn axpy_turboquant_head(
 fn finalize_turboquant_value_head(
     base_accum: &mut [f32],
     residual_accum: &mut [f32],
-    layer: usize,
-    kv_head: usize,
+    signs: &TurboSignRef<'_>,
 ) {
-    turboquant_transform_in_place(residual_accum, layer, kv_head, true, true);
+    // inverse residual transform: swap pre/post salts
+    turboquant_transform_with_bits(residual_accum, signs.res_post, signs.res_pre);
     let len = base_accum.len();
     accum(base_accum, residual_accum, len);
-    turboquant_transform_in_place(base_accum, layer, kv_head, false, true);
+    // inverse rotate transform: swap pre/post salts
+    turboquant_transform_with_bits(base_accum, signs.rot_post, signs.rot_pre);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1633,6 +1802,11 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
             kv_cache_head_aux_len,
             "KV value residual norm buffer",
         )?,
+        turbo_sign_table: if kv_cache_format == KvCacheFormat::Turbo {
+            turboquant_build_sign_table(p.n_layers, p.n_kv_heads.max(1), head_size)
+        } else {
+            Vec::new()
+        },
         turbo_scratch0: vec![0.0; head_size],
         turbo_scratch1: vec![0.0; head_size],
         turbo_scratch2: vec![0.0; head_size],
@@ -2011,16 +2185,20 @@ fn transformer_inner(
                     }
                 }
                 KvCacheFormat::Turbo => {
+                    let sign_table_slice = s.turbo_sign_table.as_slice();
+                    let sign_bytes = turboquant_sign_bytes_per_head(head_size);
                     let turbo_scratch0 = &mut s.turbo_scratch0[..head_size];
                     let turbo_scratch1 = &mut s.turbo_scratch1[..head_size];
                     for kv_head in 0..p.n_kv_heads {
                         let head_start = kv_head * head_size;
                         let head_end = head_start + head_size;
                         let aux_idx = turboquant_aux_index(row_index, kv_head, p.n_kv_heads);
+                        let signs = TurboSignRef::from_table(
+                            sign_table_slice, l, kv_head, p.n_layers, p.n_kv_heads, sign_bytes,
+                        );
                         quantize_turboquant_head(
                             &s.k[head_start..head_end],
-                            l,
-                            kv_head,
+                            &signs,
                             turbo_scratch0,
                             turbo_scratch1,
                             TurboquantHeadWrite {
@@ -2033,8 +2211,7 @@ fn transformer_inner(
                         );
                         quantize_turboquant_head(
                             &s.v[head_start..head_end],
-                            l,
-                            kv_head,
+                            &signs,
                             turbo_scratch0,
                             turbo_scratch1,
                             TurboquantHeadWrite {
@@ -2061,6 +2238,8 @@ fn transformer_inner(
             let value_cache_turbo_base = &s.value_cache_turbo_base;
             let key_cache_turbo_sign = &s.key_cache_turbo_sign;
             let value_cache_turbo_sign = &s.value_cache_turbo_sign;
+            let turbo_sign_table = &s.turbo_sign_table;
+            let turbo_sign_bytes = turboquant_sign_bytes_per_head(head_size);
             let key_scales = &s.key_cache_scale;
             let value_scales = &s.value_cache_scale;
             let key_residual_norms = &s.key_cache_residual_norm;
@@ -2098,15 +2277,18 @@ fn transformer_inner(
                                 unsafe { key_scales.as_ptr().add(head_block_off) };
                             let value_head_scales_ptr =
                                 unsafe { value_scales.as_ptr().add(head_block_off) };
-                            if kv_format == KvCacheFormat::Turbo {
-                                turboquant_prepare_query(
-                                    q_head,
-                                    l,
-                                    kv_head,
-                                    turbo_query_rotated,
-                                    turbo_query_residual_proj,
+                            let turbo_signs = if kv_format == KvCacheFormat::Turbo {
+                                let s = TurboSignRef::from_table(
+                                    turbo_sign_table, l, kv_head,
+                                    p.n_layers, p.n_kv_heads, turbo_sign_bytes,
                                 );
-                            }
+                                turboquant_prepare_query(
+                                    q_head, &s, turbo_query_rotated, turbo_query_residual_proj,
+                                );
+                                Some(s)
+                            } else {
+                                None
+                            };
                             if fuse_qwen35_online_attn {
                                 xb_head.fill(0.0);
                                 if kv_format == KvCacheFormat::Turbo {
@@ -2255,12 +2437,11 @@ fn transformer_inner(
                                         );
                                     }
                                 }
-                                if kv_format == KvCacheFormat::Turbo {
+                                if let Some(ref s) = turbo_signs {
                                     finalize_turboquant_value_head(
                                         xb_head,
                                         &mut turbo_residual_accum[..head_size],
-                                        l,
-                                        kv_head,
+                                        s,
                                     );
                                 }
                             } else {
@@ -2390,12 +2571,11 @@ fn transformer_inner(
                                         }
                                     }
                                 }
-                                if kv_format == KvCacheFormat::Turbo {
+                                if let Some(ref s) = turbo_signs {
                                     finalize_turboquant_value_head(
                                         xb_head,
                                         &mut turbo_residual_accum[..head_size],
-                                        l,
-                                        kv_head,
+                                        s,
                                     );
                                 }
                             }
@@ -2417,15 +2597,16 @@ fn transformer_inner(
                     let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
                     let att_head = &mut att_head_full[..=pos];
                     let xb_head = &mut xb_all[hs..hs + head_size];
-                    if kv_format == KvCacheFormat::Turbo {
-                        turboquant_prepare_query(
-                            q_head,
-                            l,
-                            kv_head,
-                            turbo_query_rotated,
-                            turbo_query_residual_proj,
+                    let turbo_signs = if kv_format == KvCacheFormat::Turbo {
+                        let s = TurboSignRef::from_table(
+                            turbo_sign_table, l, kv_head,
+                            p.n_layers, p.n_kv_heads, turbo_sign_bytes,
                         );
-                    }
+                        turboquant_prepare_query(q_head, &s, turbo_query_rotated, turbo_query_residual_proj);
+                        Some(s)
+                    } else {
+                        None
+                    };
                     if fuse_qwen35_online_attn {
                         xb_head.fill(0.0);
                         if kv_format == KvCacheFormat::Turbo {
@@ -2565,13 +2746,8 @@ fn transformer_inner(
                                 scale_slice_inplace(turbo_residual_accum, 1.0 / score_sum);
                             }
                         }
-                        if kv_format == KvCacheFormat::Turbo {
-                            finalize_turboquant_value_head(
-                                xb_head,
-                                turbo_residual_accum,
-                                l,
-                                kv_head,
-                            );
+                        if let Some(ref s) = turbo_signs {
+                            finalize_turboquant_value_head(xb_head, turbo_residual_accum, s);
                         }
                     } else {
                         for (t, slot) in att_head.iter_mut().enumerate() {
@@ -2697,13 +2873,8 @@ fn transformer_inner(
                                 }
                             }
                         }
-                        if kv_format == KvCacheFormat::Turbo {
-                            finalize_turboquant_value_head(
-                                xb_head,
-                                turbo_residual_accum,
-                                l,
-                                kv_head,
-                            );
+                        if let Some(ref s) = turbo_signs {
+                            finalize_turboquant_value_head(xb_head, turbo_residual_accum, s);
                         }
                     }
                 }

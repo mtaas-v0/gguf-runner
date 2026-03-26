@@ -3020,11 +3020,22 @@ impl ModelRuntime {
                 || stop_tokens
                     .iter()
                     .any(|(id, literal)| *id == next && *literal == "<|endoftext|>");
-            let should_recover_early_terminal = decode_policy.recover_early_endoftext_once
+            let should_recover_hidden_think_terminal = think_mode == ThinkMode::Hidden
+                && output.trim().is_empty()
+                && !early_terminal_recovery_used
+                && pos >= prompt_tokens.len().saturating_sub(1)
+                && hidden_mode_caps
+                    .map(|(_, total_cap)| generated_tokens.len() < total_cap)
+                    .unwrap_or(false)
+                && (is_vendor_stop_token
+                    || next == self.tokenizer.eos_token
+                    || next == self.tokenizer.eot_token);
+            let should_recover_early_terminal = (decode_policy.recover_early_endoftext_once
                 && !early_terminal_recovery_used
                 && pos >= prompt_tokens.len().saturating_sub(1)
                 && generated_tokens.len() < decode_policy.early_endoftext_recover_max_tokens
-                && is_endoftext_stop;
+                && is_endoftext_stop)
+                || should_recover_hidden_think_terminal;
             if should_recover_early_terminal {
                 if debug_mode {
                     let mut ranked: Vec<(usize, f32)> = state.logits[..self.config.vocab_size]
@@ -3036,9 +3047,14 @@ impl ModelRuntime {
                     emit_debug_line(
                         event_callback.as_ref(),
                         format!(
-                            "Note: early terminal token id={} at generated_tokens={}; top alternatives:",
+                            "Note: {} token id={} at generated_tokens={}; top alternatives:",
+                            if should_recover_hidden_think_terminal {
+                                "hidden-think terminal"
+                            } else {
+                                "early terminal"
+                            },
                             next,
-                            generated_tokens.len()
+                            generated_tokens.len(),
                         ),
                     );
                     let mut shown = 0usize;
@@ -3101,7 +3117,11 @@ impl ModelRuntime {
                         alt_token = Some(candidate);
                     }
                 }
-                if let Some(candidate) = alt_token.or(fallback_token) {
+                if let Some(candidate) = if should_recover_hidden_think_terminal {
+                    fallback_token.or(alt_token)
+                } else {
+                    alt_token.or(fallback_token)
+                } {
                     early_terminal_recovery_used = true;
                     if debug_mode {
                         emit_debug_line(

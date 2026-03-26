@@ -489,6 +489,7 @@ pub(crate) struct RunState {
     pub(crate) value_cache_scale: Vec<f32>,
     pub(crate) key_cache_residual_norm: Vec<f32>,
     pub(crate) value_cache_residual_norm: Vec<f32>,
+    pub(crate) turbo_sign_table: Vec<u8>,
     pub(crate) turbo_scratch0: Vec<f32>,
     pub(crate) turbo_scratch1: Vec<f32>,
     pub(crate) turbo_scratch2: Vec<f32>,
