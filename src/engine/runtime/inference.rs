@@ -409,15 +409,162 @@ impl<'a> TurboSignRef<'a> {
 }
 
 fn turboquant_apply_signs_bits(values: &mut [f32], sign_bits: &[u8]) {
-    for (i, value) in values.iter_mut().enumerate() {
+    let table = &TURBOQUANT_NEG_SIGN_DECODE_TABLE;
+    let mut i = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let ptr = values.as_mut_ptr();
+        // Process 8 elements at a time: one byte → 8 sign multipliers
+        while i + 8 <= values.len() {
+            let byte = sign_bits[i / 8];
+            let signs = &table[byte as usize];
+            unsafe {
+                let v0 = vld1q_f32(ptr.add(i));
+                let v1 = vld1q_f32(ptr.add(i + 4));
+                let s0 = vld1q_f32(signs.as_ptr());
+                let s1 = vld1q_f32(signs.as_ptr().add(4));
+                vst1q_f32(ptr.add(i), vmulq_f32(v0, s0));
+                vst1q_f32(ptr.add(i + 4), vmulq_f32(v1, s1));
+            }
+            i += 8;
+        }
+    }
+    // Scalar tail
+    while i < values.len() {
         if ((sign_bits[i / 8] >> (i & 7)) & 1) != 0 {
-            *value = -*value;
+            values[i] = -values[i];
+        }
+        i += 1;
+    }
+}
+
+/// Fused sign1 → FWHT → sign2 transform. On aarch64 with power-of-two n≥8,
+/// sign1 is folded into the first butterfly stage and sign2 into the final
+/// scaling pass, eliminating two full data passes.
+#[cfg(target_arch = "aarch64")]
+unsafe fn turboquant_transform_fused_neon(
+    values: &mut [f32],
+    first_bits: &[u8],
+    second_bits: &[u8],
+) {
+    use std::arch::aarch64::*;
+    let n = values.len();
+    let ptr = values.as_mut_ptr();
+    let neg_table = &TURBOQUANT_NEG_SIGN_DECODE_TABLE;
+
+    // Stage width=1 fused with sign1: apply sign1 then butterfly on adjacent pairs
+    {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let byte = first_bits[i / 8];
+            let sp = neg_table[byte as usize].as_ptr();
+            // Load values and apply sign1 in one step
+            let v0 = vmulq_f32(vld1q_f32(ptr.add(i)), vld1q_f32(sp));
+            let v1 = vmulq_f32(vld1q_f32(ptr.add(i + 4)), vld1q_f32(sp.add(4)));
+            // Butterfly width=1
+            let even = vuzp1q_f32(v0, v1);
+            let odd = vuzp2q_f32(v0, v1);
+            let sum = vaddq_f32(even, odd);
+            let diff = vsubq_f32(even, odd);
+            vst1q_f32(ptr.add(i), vzip1q_f32(sum, diff));
+            vst1q_f32(ptr.add(i + 4), vzip2q_f32(sum, diff));
+            i += 8;
+        }
+        // Scalar tail: apply sign1 then butterfly
+        while i + 2 <= n {
+            let s0 = if ((first_bits[i / 8] >> (i & 7)) & 1) != 0 { -1.0f32 } else { 1.0 };
+            let s1 = if ((first_bits[(i + 1) / 8] >> ((i + 1) & 7)) & 1) != 0 { -1.0f32 } else { 1.0 };
+            let a = *ptr.add(i) * s0;
+            let b = *ptr.add(i + 1) * s1;
+            *ptr.add(i) = a + b;
+            *ptr.add(i + 1) = a - b;
+            i += 2;
+        }
+    }
+
+    // Stage width=2: butterfly on (i, i+2) within groups of 4
+    {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let v0 = vld1q_f32(ptr.add(i));
+            let v1 = vld1q_f32(ptr.add(i + 4));
+            let lo = vcombine_f32(vget_low_f32(v0), vget_low_f32(v1));
+            let hi = vcombine_f32(vget_high_f32(v0), vget_high_f32(v1));
+            let sum = vaddq_f32(lo, hi);
+            let diff = vsubq_f32(lo, hi);
+            vst1q_f32(ptr.add(i), vcombine_f32(vget_low_f32(sum), vget_low_f32(diff)));
+            vst1q_f32(ptr.add(i + 4), vcombine_f32(vget_high_f32(sum), vget_high_f32(diff)));
+            i += 8;
+        }
+        while i + 4 <= n {
+            let a0 = *ptr.add(i);
+            let a1 = *ptr.add(i + 1);
+            let a2 = *ptr.add(i + 2);
+            let a3 = *ptr.add(i + 3);
+            *ptr.add(i) = a0 + a2;
+            *ptr.add(i + 1) = a1 + a3;
+            *ptr.add(i + 2) = a0 - a2;
+            *ptr.add(i + 3) = a1 - a3;
+            i += 4;
+        }
+    }
+
+    // Stages width=4,8,...: half-block butterfly
+    let mut width = 4usize;
+    while width < n {
+        let stride = width * 2;
+        let mut base = 0usize;
+        while base < n {
+            let mut i = 0usize;
+            while i + 4 <= width {
+                let lo = vld1q_f32(ptr.add(base + i));
+                let hi = vld1q_f32(ptr.add(base + width + i));
+                vst1q_f32(ptr.add(base + i), vaddq_f32(lo, hi));
+                vst1q_f32(ptr.add(base + width + i), vsubq_f32(lo, hi));
+                i += 4;
+            }
+            while i < width {
+                let a = *ptr.add(base + i);
+                let b = *ptr.add(base + width + i);
+                *ptr.add(base + i) = a + b;
+                *ptr.add(base + width + i) = a - b;
+                i += 1;
+            }
+            base += stride;
+        }
+        width = stride;
+    }
+
+    // Final scaling fused with sign2: multiply by (1/sqrt(n)) * sign2
+    let scale = 1.0 / (n as f32).sqrt();
+    let vscale = vdupq_n_f32(scale);
+    {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let byte = second_bits[i / 8];
+            let sp = neg_table[byte as usize].as_ptr();
+            let ss0 = vmulq_f32(vscale, vld1q_f32(sp));
+            let ss1 = vmulq_f32(vscale, vld1q_f32(sp.add(4)));
+            vst1q_f32(ptr.add(i), vmulq_f32(vld1q_f32(ptr.add(i)), ss0));
+            vst1q_f32(ptr.add(i + 4), vmulq_f32(vld1q_f32(ptr.add(i + 4)), ss1));
+            i += 8;
+        }
+        while i < n {
+            let s = if ((second_bits[i / 8] >> (i & 7)) & 1) != 0 { -scale } else { scale };
+            *ptr.add(i) *= s;
+            i += 1;
         }
     }
 }
 
 #[inline]
 fn turboquant_transform_with_bits(values: &mut [f32], first_bits: &[u8], second_bits: &[u8]) {
+    #[cfg(target_arch = "aarch64")]
+    if values.len().is_power_of_two() && values.len() >= 8 {
+        unsafe { turboquant_transform_fused_neon(values, first_bits, second_bits) };
+        return;
+    }
     turboquant_apply_signs_bits(values, first_bits);
     turboquant_fwht_inplace(values);
     turboquant_apply_signs_bits(values, second_bits);
@@ -456,6 +603,27 @@ const fn turboquant_build_sign_decode_table() -> [[f32; 8]; 256] {
 
 static TURBOQUANT_Q2_DECODE_TABLE: [[f32; 4]; 256] = turboquant_build_q2_decode_table();
 static TURBOQUANT_SIGN_DECODE_TABLE: [[f32; 8]; 256] = turboquant_build_sign_decode_table();
+
+/// Like TURBOQUANT_SIGN_DECODE_TABLE but with inverted convention:
+/// bit=1 → -1.0 (negate), bit=0 → +1.0 (keep).
+/// Used by turboquant_apply_signs_bits where bit=1 means "negate this element".
+const fn turboquant_build_neg_sign_decode_table() -> [[f32; 8]; 256] {
+    let mut table = [[0.0f32; 8]; 256];
+    let mut byte = 0usize;
+    while byte < 256 {
+        let b = byte as u8;
+        let mut bit = 0usize;
+        while bit < 8 {
+            table[byte][bit] = if ((b >> bit) & 1) != 0 { -1.0 } else { 1.0 };
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+
+static TURBOQUANT_NEG_SIGN_DECODE_TABLE: [[f32; 8]; 256] =
+    turboquant_build_neg_sign_decode_table();
 static TURBOQUANT_NEON_VALIDATE_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "aarch64")]
 static TURBOQUANT_NEON_VALIDATE_ENABLED: AtomicU8 = AtomicU8::new(0);
@@ -574,30 +742,7 @@ fn splitmix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-#[inline]
-fn turboquant_seed(layer: usize, kv_head: usize, salt: u64) -> u64 {
-    splitmix64(((layer as u64) << 32) ^ kv_head as u64 ^ salt)
-}
-
-#[inline]
-fn turboquant_sign(seed: u64, idx: usize) -> f32 {
-    if (splitmix64(seed ^ idx as u64) & 1) == 0 {
-        1.0
-    } else {
-        -1.0
-    }
-}
-
-fn turboquant_apply_signs(values: &mut [f32], seed: u64) {
-    for (idx, value) in values.iter_mut().enumerate() {
-        *value *= turboquant_sign(seed, idx);
-    }
-}
-
-fn turboquant_fwht_inplace(values: &mut [f32]) {
-    if !values.len().is_power_of_two() {
-        return;
-    }
+fn turboquant_fwht_inplace_scalar(values: &mut [f32]) {
     let mut width = 1usize;
     while width < values.len() {
         let stride = width * 2;
@@ -614,31 +759,134 @@ fn turboquant_fwht_inplace(values: &mut [f32]) {
         width = stride;
     }
     let scale = 1.0 / (values.len() as f32).sqrt();
-    for value in values {
+    for value in values.iter_mut() {
         *value *= scale;
     }
 }
 
-fn turboquant_transform_in_place(
-    values: &mut [f32],
-    layer: usize,
-    kv_head: usize,
-    residual: bool,
-    inverse: bool,
-) {
-    let (pre_salt, post_salt) = if residual {
-        (TURBOQUANT_RESIDUAL_PRE_SALT, TURBOQUANT_RESIDUAL_POST_SALT)
-    } else {
-        (TURBOQUANT_ROTATE_PRE_SALT, TURBOQUANT_ROTATE_POST_SALT)
-    };
-    let (first_salt, second_salt) = if inverse {
-        (post_salt, pre_salt)
-    } else {
-        (pre_salt, post_salt)
-    };
-    turboquant_apply_signs(values, turboquant_seed(layer, kv_head, first_salt));
-    turboquant_fwht_inplace(values);
-    turboquant_apply_signs(values, turboquant_seed(layer, kv_head, second_salt));
+/// NEON FWHT for power-of-two lengths ≥ 8.
+///
+/// Stage width=1 — adjacent pairs (i, i+1):
+///   [a,b,c,d, e,f,g,h] → vuzp deinterleaves even/odd, vadd/vsub, vzip re-interleaves.
+///
+/// Stage width=2 — pairs (i, i+2) within groups of 4:
+///   [a0,a1,a2,a3, b0,b1,b2,b3]: split each vec4 into low/high, add/sub, reassemble.
+///
+/// Stages width≥4 — half-block butterfly:
+///   lo = first half, hi = second half → sum/diff, straightforward 4-wide.
+#[cfg(target_arch = "aarch64")]
+unsafe fn turboquant_fwht_inplace_neon(values: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let n = values.len();
+    let ptr = values.as_mut_ptr();
+
+    // width=1: butterfly on adjacent pairs, 8 at a time
+    {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let v0 = vld1q_f32(ptr.add(i));
+            let v1 = vld1q_f32(ptr.add(i + 4));
+            // even = [v[0],v[2],v[4],v[6]], odd = [v[1],v[3],v[5],v[7]]
+            let even = vuzp1q_f32(v0, v1);
+            let odd = vuzp2q_f32(v0, v1);
+            let sum = vaddq_f32(even, odd);
+            let diff = vsubq_f32(even, odd);
+            // re-interleave: [sum0,diff0,sum1,diff1] and [sum2,diff2,sum3,diff3]
+            vst1q_f32(ptr.add(i), vzip1q_f32(sum, diff));
+            vst1q_f32(ptr.add(i + 4), vzip2q_f32(sum, diff));
+            i += 8;
+        }
+        // scalar tail (n < 8 or n not multiple of 8)
+        while i + 2 <= n {
+            let a = *ptr.add(i);
+            let b = *ptr.add(i + 1);
+            *ptr.add(i) = a + b;
+            *ptr.add(i + 1) = a - b;
+            i += 2;
+        }
+    }
+
+    // width=2: butterfly on pairs (i, i+2) within groups of 4, 8 at a time
+    {
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let v0 = vld1q_f32(ptr.add(i));
+            let v1 = vld1q_f32(ptr.add(i + 4));
+            // lo = [v0[0..2], v1[0..2]], hi = [v0[2..4], v1[2..4]]
+            let lo = vcombine_f32(vget_low_f32(v0), vget_low_f32(v1));
+            let hi = vcombine_f32(vget_high_f32(v0), vget_high_f32(v1));
+            let sum = vaddq_f32(lo, hi);
+            let diff = vsubq_f32(lo, hi);
+            // reassemble: each group gets [sum_lo, diff_lo]
+            vst1q_f32(ptr.add(i), vcombine_f32(vget_low_f32(sum), vget_low_f32(diff)));
+            vst1q_f32(ptr.add(i + 4), vcombine_f32(vget_high_f32(sum), vget_high_f32(diff)));
+            i += 8;
+        }
+        // scalar tail for groups of 4
+        while i + 4 <= n {
+            let a0 = *ptr.add(i);
+            let a1 = *ptr.add(i + 1);
+            let a2 = *ptr.add(i + 2);
+            let a3 = *ptr.add(i + 3);
+            *ptr.add(i) = a0 + a2;
+            *ptr.add(i + 1) = a1 + a3;
+            *ptr.add(i + 2) = a0 - a2;
+            *ptr.add(i + 3) = a1 - a3;
+            i += 4;
+        }
+    }
+
+    // width=4,8,...: half-block butterfly, 4-wide
+    let mut width = 4usize;
+    while width < n {
+        let stride = width * 2;
+        let mut base = 0usize;
+        while base < n {
+            let mut i = 0usize;
+            while i + 4 <= width {
+                let lo = vld1q_f32(ptr.add(base + i));
+                let hi = vld1q_f32(ptr.add(base + width + i));
+                vst1q_f32(ptr.add(base + i), vaddq_f32(lo, hi));
+                vst1q_f32(ptr.add(base + width + i), vsubq_f32(lo, hi));
+                i += 4;
+            }
+            // scalar tail (when width is not a multiple of 4)
+            while i < width {
+                let a = *ptr.add(base + i);
+                let b = *ptr.add(base + width + i);
+                *ptr.add(base + i) = a + b;
+                *ptr.add(base + width + i) = a - b;
+                i += 1;
+            }
+            base += stride;
+        }
+        width = stride;
+    }
+
+    // Final scaling: multiply all by 1/sqrt(n)
+    let vscale = vdupq_n_f32(1.0 / (n as f32).sqrt());
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let v = vld1q_f32(ptr.add(i));
+        vst1q_f32(ptr.add(i), vmulq_f32(v, vscale));
+        i += 4;
+    }
+    while i < n {
+        *ptr.add(i) *= 1.0 / (n as f32).sqrt();
+        i += 1;
+    }
+}
+
+fn turboquant_fwht_inplace(values: &mut [f32]) {
+    if !values.len().is_power_of_two() {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if values.len() >= 8 {
+        unsafe { turboquant_fwht_inplace_neon(values) };
+        return;
+    }
+    turboquant_fwht_inplace_scalar(values);
 }
 
 #[inline]
@@ -652,13 +900,6 @@ fn turboquant_quantize_code(x: f32) -> u8 {
     } else {
         3
     }
-}
-
-#[inline]
-fn set_q2_at(dst: &mut [u8], elem_idx: usize, code: u8) {
-    let shift = (elem_idx & 3) * 2;
-    let byte = &mut dst[elem_idx / 4];
-    *byte = (*byte & !(0b11 << shift)) | ((code & 0b11) << shift);
 }
 
 #[inline]
@@ -715,20 +956,39 @@ fn quantize_turboquant_head(
 
     let sigma = l2_norm(rotated) / (rotated.len() as f32).sqrt();
     *dst.scale_out = sigma;
+    let q2_base = dst.elem_offset / 4;
     if sigma == 0.0 {
         *dst.residual_norm_out = 0.0;
+        let byte_count = src.len().div_ceil(4);
+        dst.base[q2_base..q2_base + byte_count].fill(0);
         for i in 0..src.len() {
-            set_q2_at(dst.base, dst.elem_offset + i, 0);
             set_sign_bit(dst.sign, dst.elem_offset + i, true);
         }
         return;
     }
 
-    for (i, &value) in rotated.iter().enumerate() {
-        let code = turboquant_quantize_code(value / sigma);
-        let dequant = TURBOQUANT_CENTROIDS[code as usize] * sigma;
-        residual[i] = value - dequant;
-        set_q2_at(dst.base, dst.elem_offset + i, code);
+    let inv_sigma = 1.0 / sigma;
+    let mut i = 0usize;
+    while i + 4 <= rotated.len() {
+        let mut packed = 0u8;
+        for k in 0..4 {
+            let value = rotated[i + k];
+            let code = turboquant_quantize_code(value * inv_sigma);
+            residual[i + k] = value - TURBOQUANT_CENTROIDS[code as usize] * sigma;
+            packed |= code << (k * 2);
+        }
+        dst.base[q2_base + i / 4] = packed;
+        i += 4;
+    }
+    if i < rotated.len() {
+        let mut packed = 0u8;
+        for k in 0..(rotated.len() - i) {
+            let value = rotated[i + k];
+            let code = turboquant_quantize_code(value * inv_sigma);
+            residual[i + k] = value - TURBOQUANT_CENTROIDS[code as usize] * sigma;
+            packed |= code << (k * 2);
+        }
+        dst.base[q2_base + i / 4] = packed;
     }
 
     let gamma = l2_norm(residual);
@@ -780,27 +1040,51 @@ fn turboquant_residual_scale(head_size: usize, residual_norm: f32) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn unpack_turboquant_q2x16_scaled(base: &[u8], elem_offset: usize, out: &mut [f32; 16]) {
+#[inline(always)]
+unsafe fn unpack_q2x16_neon(
+    base: &[u8],
+    elem_offset: usize,
+) -> (
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+) {
+    use std::arch::aarch64::*;
     debug_assert_eq!(elem_offset & 3, 0);
     let packed = &base[elem_offset / 4..elem_offset / 4 + 4];
     let table = turboquant_q2_decode_table();
-    for (chunk_idx, &byte) in packed.iter().enumerate() {
-        let lane = chunk_idx * 4;
-        out[lane..lane + 4].copy_from_slice(&table[byte as usize]);
-    }
+    (
+        vld1q_f32(table[packed[0] as usize].as_ptr()),
+        vld1q_f32(table[packed[1] as usize].as_ptr()),
+        vld1q_f32(table[packed[2] as usize].as_ptr()),
+        vld1q_f32(table[packed[3] as usize].as_ptr()),
+    )
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn unpack_turboquant_signx16_scaled(sign: &[u8], elem_offset: usize, out: &mut [f32; 16]) {
+#[inline(always)]
+unsafe fn unpack_sign16_neon(
+    sign: &[u8],
+    elem_offset: usize,
+) -> (
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+    std::arch::aarch64::float32x4_t,
+) {
+    use std::arch::aarch64::*;
     debug_assert_eq!(elem_offset & 7, 0);
     let packed = &sign[elem_offset / 8..elem_offset / 8 + 2];
     let table = turboquant_sign_decode_table();
-    for (chunk_idx, &byte) in packed.iter().enumerate() {
-        let lane = chunk_idx * 8;
-        out[lane..lane + 8].copy_from_slice(&table[byte as usize]);
-    }
+    let p0 = table[packed[0] as usize].as_ptr();
+    let p1 = table[packed[1] as usize].as_ptr();
+    (
+        vld1q_f32(p0),
+        vld1q_f32(p0.add(4)),
+        vld1q_f32(p1),
+        vld1q_f32(p1.add(4)),
+    )
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -813,7 +1097,6 @@ unsafe fn dot_turboquant_head_neon(
     use std::arch::aarch64::*;
 
     let n = q_rotated.len();
-    let mut lanes = [0.0f32; 16];
     let mut i = 0usize;
     let mut sum = 0.0f32;
 
@@ -824,27 +1107,11 @@ unsafe fn dot_turboquant_head_neon(
         let mut vacc2 = vdupq_n_f32(0.0);
         let mut vacc3 = vdupq_n_f32(0.0);
         while i + 16 <= n {
-            unpack_turboquant_q2x16_scaled(cache.base, cache.elem_offset + i, &mut lanes);
-            vacc0 = vfmaq_f32(
-                vacc0,
-                vld1q_f32(q_rotated.as_ptr().add(i)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr()), vscale),
-            );
-            vacc1 = vfmaq_f32(
-                vacc1,
-                vld1q_f32(q_rotated.as_ptr().add(i + 4)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr().add(4)), vscale),
-            );
-            vacc2 = vfmaq_f32(
-                vacc2,
-                vld1q_f32(q_rotated.as_ptr().add(i + 8)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr().add(8)), vscale),
-            );
-            vacc3 = vfmaq_f32(
-                vacc3,
-                vld1q_f32(q_rotated.as_ptr().add(i + 12)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr().add(12)), vscale),
-            );
+            let (c0, c1, c2, c3) = unpack_q2x16_neon(cache.base, cache.elem_offset + i);
+            vacc0 = vfmaq_f32(vacc0, vld1q_f32(q_rotated.as_ptr().add(i)), vmulq_f32(c0, vscale));
+            vacc1 = vfmaq_f32(vacc1, vld1q_f32(q_rotated.as_ptr().add(i + 4)), vmulq_f32(c1, vscale));
+            vacc2 = vfmaq_f32(vacc2, vld1q_f32(q_rotated.as_ptr().add(i + 8)), vmulq_f32(c2, vscale));
+            vacc3 = vfmaq_f32(vacc3, vld1q_f32(q_rotated.as_ptr().add(i + 12)), vmulq_f32(c3, vscale));
             i += 16;
         }
         sum += vaddvq_f32(vaddq_f32(vaddq_f32(vacc0, vacc1), vaddq_f32(vacc2, vacc3)));
@@ -864,27 +1131,11 @@ unsafe fn dot_turboquant_head_neon(
         let mut vacc3 = vdupq_n_f32(0.0);
         let mut j = 0usize;
         while j + 16 <= n {
-            unpack_turboquant_signx16_scaled(cache.sign, cache.elem_offset + j, &mut lanes);
-            vacc0 = vfmaq_f32(
-                vacc0,
-                vld1q_f32(q_residual_proj.as_ptr().add(j)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr()), vresidual_scale),
-            );
-            vacc1 = vfmaq_f32(
-                vacc1,
-                vld1q_f32(q_residual_proj.as_ptr().add(j + 4)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr().add(4)), vresidual_scale),
-            );
-            vacc2 = vfmaq_f32(
-                vacc2,
-                vld1q_f32(q_residual_proj.as_ptr().add(j + 8)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr().add(8)), vresidual_scale),
-            );
-            vacc3 = vfmaq_f32(
-                vacc3,
-                vld1q_f32(q_residual_proj.as_ptr().add(j + 12)),
-                vmulq_f32(vld1q_f32(lanes.as_ptr().add(12)), vresidual_scale),
-            );
+            let (s0, s1, s2, s3) = unpack_sign16_neon(cache.sign, cache.elem_offset + j);
+            vacc0 = vfmaq_f32(vacc0, vld1q_f32(q_residual_proj.as_ptr().add(j)), vmulq_f32(s0, vresidual_scale));
+            vacc1 = vfmaq_f32(vacc1, vld1q_f32(q_residual_proj.as_ptr().add(j + 4)), vmulq_f32(s1, vresidual_scale));
+            vacc2 = vfmaq_f32(vacc2, vld1q_f32(q_residual_proj.as_ptr().add(j + 8)), vmulq_f32(s2, vresidual_scale));
+            vacc3 = vfmaq_f32(vacc3, vld1q_f32(q_residual_proj.as_ptr().add(j + 12)), vmulq_f32(s3, vresidual_scale));
             j += 16;
         }
         sum += vaddvq_f32(vaddq_f32(vaddq_f32(vacc0, vacc1), vaddq_f32(vacc2, vacc3)));
@@ -912,42 +1163,17 @@ unsafe fn axpy_turboquant_head_neon(
     use std::arch::aarch64::*;
 
     let n = base_accum.len();
-    let mut lanes = [0.0f32; 16];
     let dst_ptr = base_accum.as_mut_ptr();
     let mut i = 0usize;
 
     if cache.scale != 0.0 {
         let vscale = vdupq_n_f32(a * cache.scale);
         while i + 16 <= n {
-            unpack_turboquant_q2x16_scaled(cache.base, cache.elem_offset + i, &mut lanes);
-            vst1q_f32(
-                dst_ptr.add(i),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(i)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr()), vscale),
-                ),
-            );
-            vst1q_f32(
-                dst_ptr.add(i + 4),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(i + 4)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr().add(4)), vscale),
-                ),
-            );
-            vst1q_f32(
-                dst_ptr.add(i + 8),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(i + 8)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr().add(8)), vscale),
-                ),
-            );
-            vst1q_f32(
-                dst_ptr.add(i + 12),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(i + 12)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr().add(12)), vscale),
-                ),
-            );
+            let (c0, c1, c2, c3) = unpack_q2x16_neon(cache.base, cache.elem_offset + i);
+            vst1q_f32(dst_ptr.add(i), vaddq_f32(vld1q_f32(dst_ptr.add(i)), vmulq_f32(c0, vscale)));
+            vst1q_f32(dst_ptr.add(i + 4), vaddq_f32(vld1q_f32(dst_ptr.add(i + 4)), vmulq_f32(c1, vscale)));
+            vst1q_f32(dst_ptr.add(i + 8), vaddq_f32(vld1q_f32(dst_ptr.add(i + 8)), vmulq_f32(c2, vscale)));
+            vst1q_f32(dst_ptr.add(i + 12), vaddq_f32(vld1q_f32(dst_ptr.add(i + 12)), vmulq_f32(c3, vscale)));
             i += 16;
         }
         while i < n {
@@ -963,35 +1189,11 @@ unsafe fn axpy_turboquant_head_neon(
         let dst_ptr = residual_accum.as_mut_ptr();
         let mut j = 0usize;
         while j + 16 <= n {
-            unpack_turboquant_signx16_scaled(cache.sign, cache.elem_offset + j, &mut lanes);
-            vst1q_f32(
-                dst_ptr.add(j),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(j)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr()), vresidual_scale),
-                ),
-            );
-            vst1q_f32(
-                dst_ptr.add(j + 4),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(j + 4)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr().add(4)), vresidual_scale),
-                ),
-            );
-            vst1q_f32(
-                dst_ptr.add(j + 8),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(j + 8)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr().add(8)), vresidual_scale),
-                ),
-            );
-            vst1q_f32(
-                dst_ptr.add(j + 12),
-                vaddq_f32(
-                    vld1q_f32(dst_ptr.add(j + 12)),
-                    vmulq_f32(vld1q_f32(lanes.as_ptr().add(12)), vresidual_scale),
-                ),
-            );
+            let (s0, s1, s2, s3) = unpack_sign16_neon(cache.sign, cache.elem_offset + j);
+            vst1q_f32(dst_ptr.add(j), vaddq_f32(vld1q_f32(dst_ptr.add(j)), vmulq_f32(s0, vresidual_scale)));
+            vst1q_f32(dst_ptr.add(j + 4), vaddq_f32(vld1q_f32(dst_ptr.add(j + 4)), vmulq_f32(s1, vresidual_scale)));
+            vst1q_f32(dst_ptr.add(j + 8), vaddq_f32(vld1q_f32(dst_ptr.add(j + 8)), vmulq_f32(s2, vresidual_scale)));
+            vst1q_f32(dst_ptr.add(j + 12), vaddq_f32(vld1q_f32(dst_ptr.add(j + 12)), vmulq_f32(s3, vresidual_scale)));
             j += 16;
         }
         while j < n {
@@ -3213,10 +3415,60 @@ fn transformer_inner(
 mod tests {
     use super::{
         TurboquantHeadRead, axpy_turboquant_head_scalar, dot_turboquant_head_scalar, get_q2_at,
-        set_q2_at, set_sign_bit, turboquant_transform_in_place,
+        set_sign_bit, splitmix64, turboquant_fwht_inplace,
+        TURBOQUANT_RESIDUAL_PRE_SALT, TURBOQUANT_RESIDUAL_POST_SALT,
+        TURBOQUANT_ROTATE_PRE_SALT, TURBOQUANT_ROTATE_POST_SALT,
     };
     #[cfg(target_arch = "aarch64")]
     use super::{axpy_turboquant_head_neon, dot_turboquant_head_neon};
+
+    #[inline]
+    fn turboquant_seed(layer: usize, kv_head: usize, salt: u64) -> u64 {
+        splitmix64(((layer as u64) << 32) ^ kv_head as u64 ^ salt)
+    }
+
+    #[inline]
+    fn turboquant_sign(seed: u64, idx: usize) -> f32 {
+        if (splitmix64(seed ^ idx as u64) & 1) == 0 {
+            1.0
+        } else {
+            -1.0
+        }
+    }
+
+    fn turboquant_apply_signs(values: &mut [f32], seed: u64) {
+        for (idx, value) in values.iter_mut().enumerate() {
+            *value *= turboquant_sign(seed, idx);
+        }
+    }
+
+    fn turboquant_transform_in_place(
+        values: &mut [f32],
+        layer: usize,
+        kv_head: usize,
+        residual: bool,
+        inverse: bool,
+    ) {
+        let (pre_salt, post_salt) = if residual {
+            (TURBOQUANT_RESIDUAL_PRE_SALT, TURBOQUANT_RESIDUAL_POST_SALT)
+        } else {
+            (TURBOQUANT_ROTATE_PRE_SALT, TURBOQUANT_ROTATE_POST_SALT)
+        };
+        let (first_salt, second_salt) = if inverse {
+            (post_salt, pre_salt)
+        } else {
+            (pre_salt, post_salt)
+        };
+        turboquant_apply_signs(values, turboquant_seed(layer, kv_head, first_salt));
+        turboquant_fwht_inplace(values);
+        turboquant_apply_signs(values, turboquant_seed(layer, kv_head, second_salt));
+    }
+
+    fn set_q2_at(dst: &mut [u8], elem_idx: usize, code: u8) {
+        let shift = (elem_idx & 3) * 2;
+        let byte = &mut dst[elem_idx / 4];
+        *byte = (*byte & !(0b11 << shift)) | ((code & 0b11) << shift);
+    }
 
     #[test]
     fn turboquant_q2_pack_roundtrip() {
