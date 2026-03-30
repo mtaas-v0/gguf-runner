@@ -75,7 +75,7 @@ gguf-runner \
 
 ```bash
 wget https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf
-wget https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-Qwen3.5-2B-F16.gguf
+wget -O mmproj-Qwen3.5-2B-F16.gguf https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/mmproj-F16.gguf
 gguf-runner \
   --model ./Qwen3.5-2B-Q4_K_M.gguf \
   --image sample-image.jpg \
