@@ -43,9 +43,7 @@ const REPL_COMMANDS: [&str; 11] = [
 
 fn map_kv_cache_mode(mode: Option<crate::cli::CliKvCacheMode>) -> Option<KvCacheMode> {
     mode.map(|v| match v {
-        crate::cli::CliKvCacheMode::Auto => KvCacheMode::Auto,
         crate::cli::CliKvCacheMode::Q8 => KvCacheMode::Q8,
-        crate::cli::CliKvCacheMode::Q4 => KvCacheMode::Q4,
         crate::cli::CliKvCacheMode::Turbo => KvCacheMode::Turbo,
     })
 }

@@ -109,18 +109,12 @@ fn parse_think_mode(raw: &str) -> Result<crate::engine::types::ThinkMode, String
 
 fn parse_kv_cache_mode(raw: &str) -> Result<CliKvCacheMode, String> {
     let v = raw.trim();
-    if v.eq_ignore_ascii_case("auto") {
-        Ok(CliKvCacheMode::Auto)
-    } else if v.eq_ignore_ascii_case("q8") {
+    if v.eq_ignore_ascii_case("q8") {
         Ok(CliKvCacheMode::Q8)
-    } else if v.eq_ignore_ascii_case("q4") {
-        Ok(CliKvCacheMode::Q4)
     } else if v.eq_ignore_ascii_case("turbo") || v.eq_ignore_ascii_case("tq") {
         Ok(CliKvCacheMode::Turbo)
     } else {
-        Err(format!(
-            "invalid value '{raw}': expected one of auto/q8/q4/turbo"
-        ))
+        Err(format!("invalid value '{raw}': expected one of q8/turbo"))
     }
 }
 
@@ -142,9 +136,7 @@ fn parse_operation_mode(raw: &str) -> Result<CliOperationMode, String> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CliKvCacheMode {
-    Auto,
     Q8,
-    Q4,
     Turbo,
 }
 
@@ -595,6 +587,9 @@ struct Cli {
     )]
     top_p: f32,
 
+    #[arg(long, env = "GGUF_SEED")]
+    seed: Option<u64>,
+
     #[arg(
         long = "repeat-penalty",
         value_parser = parse_positive_f32,
@@ -870,6 +865,7 @@ pub(crate) struct CliOptions {
     pub(crate) temperature: f32,
     pub(crate) top_k: usize,
     pub(crate) top_p: f32,
+    pub(crate) seed: Option<u64>,
     pub(crate) repeat_penalty: f32,
     pub(crate) repeat_last_n: usize,
     pub(crate) max_tokens: usize,
@@ -987,6 +983,7 @@ impl CliOptions {
             temperature: cli.temperature,
             top_k: cli.top_k,
             top_p: cli.top_p,
+            seed: cli.seed,
             repeat_penalty: cli.repeat_penalty,
             repeat_last_n: cli.repeat_last_n,
             max_tokens: cli.max_tokens,
@@ -1069,5 +1066,14 @@ mod tests {
     fn parse_allowed_tools_none_disables_all_tools() {
         let parsed = parse_allowed_tools("none").expect("failed to parse none");
         assert!(parsed.is_empty(), "none should disable all tools");
+    }
+
+    #[test]
+    fn parse_kv_cache_mode_accepts_only_q8_and_turbo() {
+        assert_eq!(parse_kv_cache_mode("q8"), Ok(CliKvCacheMode::Q8));
+        assert_eq!(parse_kv_cache_mode("turbo"), Ok(CliKvCacheMode::Turbo));
+        assert_eq!(parse_kv_cache_mode("tq"), Ok(CliKvCacheMode::Turbo));
+        assert!(parse_kv_cache_mode("auto").is_err());
+        assert!(parse_kv_cache_mode("q4").is_err());
     }
 }

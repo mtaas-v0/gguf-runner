@@ -32,6 +32,7 @@ pub(crate) struct ChatMessage {
 pub(crate) struct VendorDecodePolicy {
     pub(crate) parse_think_tags: bool,
     pub(crate) stop_token_literals: &'static [&'static str],
+    pub(crate) stop_text_literals: &'static [&'static str],
     pub(crate) deterministic_loop_guard: bool,
     pub(crate) deterministic_loop_guard_min_generated_tokens: usize,
     pub(crate) recover_early_endoftext_once: bool,

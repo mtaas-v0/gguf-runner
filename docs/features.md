@@ -64,12 +64,11 @@ Supported tensor data paths include:
   - current runtime returns explicit "not implemented yet" errors for native image/video/audio embedding execution paths
 - autoregressive generation loop
 - quantized KV cache for attention state:
-  - default `Q8` KV cache
-  - automatic `Q4` KV cache fallback if `Q8` allocation fails
-  - optional TurboQuant-style `turbo` KV cache mode:
+  - default TurboQuant-style `turbo` KV cache mode:
     - head-wise signed-Hadamard rotation before scalar quantization
     - 2-bit rotated-domain base codebook plus 1-bit residual sketch per channel
     - per-head scale and residual-norm metadata used during cached key/value reads
+  - optional `Q8` KV cache mode
 - optional tool-agent loop (`--agent`) with host-side file tools:
   - `read_file`
   - `list_dir`
@@ -126,7 +125,8 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_PAR_MATMUL_CHUNK_ROWS`
 - `GGUF_PAR_ATTN_MIN_HEADS`
 - `GGUF_PAR_QWEN3NEXT_MIN_HEADS`
-- `GGUF_KV_CACHE_MODE` (`auto`, `q8`, `q4`, `turbo`)
+- `GGUF_KV_CACHE_MODE` (`q8`, `turbo`)
+- `GGUF_KERNEL_VALIDATION_WARNINGS` (`1`/`true` to print one-time kernel self-check disable warnings)
 - `GGUF_LAYER_DEBUG`
 - `GGUF_LAYER_DEBUG_POS`
 - `GGUF_AARCH64_DOTPROD_Q8` (aarch64 only)
@@ -135,7 +135,7 @@ Hidden runtime tuning env vars (advanced use):
 - `GGUF_X86_F16C` (x86_64 only)
 - `GGUF_X86_QK_MR4` (x86_64 only)
 - `GGUF_X86_AVXVNNI` (x86_64 only)
-- `GGUF_X86_AVX512VNNI_Q8` (x86_64 only; optional Q8_0 VNNI path)
+- `GGUF_X86_AVX512VNNI_Q8` (x86_64 only; optional lossy `Q8_0` VNNI path used only when the exact AVX2/FMA path is unavailable or disabled)
 
 ## Supported Platforms
 

@@ -127,9 +127,7 @@ static KV_CACHE_MODE_CFG: OnceLock<KvCacheMode> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvCacheMode {
-    Auto,
     Q8,
-    Q4,
     Turbo,
 }
 

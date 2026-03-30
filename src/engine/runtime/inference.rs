@@ -325,9 +325,8 @@ unsafe fn axpy_q8_row_neon(dst: &mut [f32], a: f32, cache: &[i8], row_offset: us
     }
 }
 
-/// Block size for Q4 KV cache quantization. Each block gets its own scale factor,
-/// matching the Q4_0 standard. Smaller blocks preserve more precision by limiting
-/// the impact of outlier activations.
+/// Block size used by the optional per-row Q8 block-scale path. Smaller blocks preserve more
+/// precision by limiting the impact of outlier activations.
 const Q4_BLOCK_SIZE: usize = 32;
 const TURBOQUANT_CENTROIDS: [f32; 4] = [-1.510_417, -0.452_78, 0.452_78, 1.510_417];
 const TURBOQUANT_THRESHOLD_LO: f32 = -0.981_598_5;
@@ -646,52 +645,6 @@ fn turboquant_q2_decode_table() -> &'static [[f32; 4]; 256] {
 
 fn turboquant_sign_decode_table() -> &'static [[f32; 8]; 256] {
     &TURBOQUANT_SIGN_DECODE_TABLE
-}
-
-fn quantize_q4_block(src: &[f32], dst: &mut [u8], base_elem: usize, scale_out: &mut f32) {
-    debug_assert_eq!(src.len(), Q4_BLOCK_SIZE);
-    let mut max_abs = 0.0f32;
-    for &x in src {
-        max_abs = max_abs.max(x.abs());
-    }
-    if max_abs == 0.0 {
-        *scale_out = 1.0;
-        for i in 0..src.len() {
-            let elem_idx = base_elem + i;
-            let byte_idx = elem_idx / 2;
-            if (elem_idx & 1) == 0 {
-                dst[byte_idx] &= 0xF0;
-            } else {
-                dst[byte_idx] &= 0x0F;
-            }
-        }
-        return;
-    }
-    let inv = 7.0 / max_abs;
-    let scale = max_abs / 7.0;
-    *scale_out = scale;
-    for (i, &x) in src.iter().enumerate() {
-        let q = (x * inv).round().clamp(-8.0, 7.0) as i8;
-        let nib = (q as i32 & 0x0F) as u8;
-        let elem_idx = base_elem + i;
-        let byte_idx = elem_idx / 2;
-        if (elem_idx & 1) == 0 {
-            dst[byte_idx] = (dst[byte_idx] & 0xF0) | nib;
-        } else {
-            dst[byte_idx] = (dst[byte_idx] & 0x0F) | (nib << 4);
-        }
-    }
-}
-
-#[inline]
-fn dequant_q4_at(src: &[u8], elem_idx: usize) -> i8 {
-    let byte = src[elem_idx / 2];
-    let nib = if (elem_idx & 1) == 0 {
-        byte & 0x0F
-    } else {
-        (byte >> 4) & 0x0F
-    };
-    if nib >= 8 { nib as i8 - 16 } else { nib as i8 }
 }
 
 #[inline]
@@ -1362,92 +1315,6 @@ fn finalize_turboquant_value_head(
     turboquant_transform_with_bits(base_accum, signs.rot_post, signs.rot_pre);
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn s8x8_to_f32x4x2(
-    v: std::arch::aarch64::int8x8_t,
-) -> (
-    std::arch::aarch64::float32x4_t,
-    std::arch::aarch64::float32x4_t,
-) {
-    use std::arch::aarch64::*;
-    let s16 = vmovl_s8(v);
-    let lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16)));
-    let hi = vcvtq_f32_s32(vmovl_high_s16(s16));
-    (lo, hi)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn dot_q4_block_neon(q_block: &[f32], cache: &[u8], elem_offset: usize) -> f32 {
-    use std::arch::aarch64::*;
-    debug_assert_eq!(q_block.len(), Q4_BLOCK_SIZE);
-    debug_assert_eq!(elem_offset & 1, 0);
-
-    let packed_ptr = cache.as_ptr().add(elem_offset / 2);
-    let q_ptr = q_block.as_ptr();
-    let nib_mask = vdup_n_u8(0x0f);
-    let sign_xor = vdup_n_u8(0x08);
-    let sign_sub = vdup_n_s8(8);
-    let mut acc = vdupq_n_f32(0.0);
-
-    // 32 q4 values are packed into 16 bytes => process two 8-byte chunks.
-    for chunk in 0..2usize {
-        let packed = vld1_u8(packed_ptr.add(chunk * 8));
-        let lo_u = vand_u8(packed, nib_mask);
-        let hi_u = vshr_n_u8(packed, 4);
-        // Map unsigned nibble [0, 15] -> signed q4 [-8, 7].
-        let lo_s = vsub_s8(vreinterpret_s8_u8(veor_u8(lo_u, sign_xor)), sign_sub);
-        let hi_s = vsub_s8(vreinterpret_s8_u8(veor_u8(hi_u, sign_xor)), sign_sub);
-        let (lo_f0, lo_f1) = s8x8_to_f32x4x2(lo_s);
-        let (hi_f0, hi_f1) = s8x8_to_f32x4x2(hi_s);
-
-        let base = chunk * 16;
-        let x_pairs0 = vld2q_f32(q_ptr.add(base));
-        let x_pairs1 = vld2q_f32(q_ptr.add(base + 8));
-        acc = vfmaq_f32(acc, x_pairs0.0, lo_f0);
-        acc = vfmaq_f32(acc, x_pairs0.1, hi_f0);
-        acc = vfmaq_f32(acc, x_pairs1.0, lo_f1);
-        acc = vfmaq_f32(acc, x_pairs1.1, hi_f1);
-    }
-    vaddvq_f32(acc)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn axpy_q4_block_neon(dst_block: &mut [f32], a: f32, cache: &[u8], elem_offset: usize) {
-    use std::arch::aarch64::*;
-    debug_assert_eq!(dst_block.len(), Q4_BLOCK_SIZE);
-    debug_assert_eq!(elem_offset & 1, 0);
-
-    let packed_ptr = cache.as_ptr().add(elem_offset / 2);
-    let dst_ptr = dst_block.as_mut_ptr();
-    let nib_mask = vdup_n_u8(0x0f);
-    let sign_xor = vdup_n_u8(0x08);
-    let sign_sub = vdup_n_s8(8);
-    let coeff = vdupq_n_f32(a);
-
-    for chunk in 0..2usize {
-        let packed = vld1_u8(packed_ptr.add(chunk * 8));
-        let lo_u = vand_u8(packed, nib_mask);
-        let hi_u = vshr_n_u8(packed, 4);
-        let lo_s = vsub_s8(vreinterpret_s8_u8(veor_u8(lo_u, sign_xor)), sign_sub);
-        let hi_s = vsub_s8(vreinterpret_s8_u8(veor_u8(hi_u, sign_xor)), sign_sub);
-        let (lo_f0, lo_f1) = s8x8_to_f32x4x2(lo_s);
-        let (hi_f0, hi_f1) = s8x8_to_f32x4x2(hi_s);
-
-        let base = chunk * 16;
-        let mut dst_pairs0 = vld2q_f32(dst_ptr.add(base));
-        let mut dst_pairs1 = vld2q_f32(dst_ptr.add(base + 8));
-        dst_pairs0.0 = vfmaq_f32(dst_pairs0.0, coeff, lo_f0);
-        dst_pairs0.1 = vfmaq_f32(dst_pairs0.1, coeff, hi_f0);
-        dst_pairs1.0 = vfmaq_f32(dst_pairs1.0, coeff, lo_f1);
-        dst_pairs1.1 = vfmaq_f32(dst_pairs1.1, coeff, hi_f1);
-        vst2q_f32(dst_ptr.add(base), dst_pairs0);
-        vst2q_f32(dst_ptr.add(base + 8), dst_pairs1);
-    }
-}
-
 #[inline]
 fn dot_q8_row(q: &[f32], cache: &[i8], row_offset: usize, scale: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -1597,150 +1464,6 @@ unsafe fn axpy_q8_row_blocks_ptr(
     }
 }
 
-#[inline(always)]
-fn dot_q4_full_block(q_block: &[f32], cache: &[u8], elem_offset: usize, scale: f32) -> f32 {
-    debug_assert_eq!(q_block.len(), Q4_BLOCK_SIZE);
-    #[cfg(target_arch = "aarch64")]
-    if (elem_offset & 1) == 0 {
-        unsafe {
-            return dot_q4_block_neon(q_block, cache, elem_offset) * scale;
-        }
-    }
-    let mut acc = 0.0f32;
-    for (i, &qv) in q_block.iter().enumerate() {
-        acc += qv * dequant_q4_at(cache, elem_offset + i) as f32 * scale;
-    }
-    acc
-}
-
-#[inline(always)]
-fn axpy_q4_full_block(dst_block: &mut [f32], a: f32, cache: &[u8], elem_offset: usize, scale: f32) {
-    debug_assert_eq!(dst_block.len(), Q4_BLOCK_SIZE);
-    let coeff = a * scale;
-    #[cfg(target_arch = "aarch64")]
-    if (elem_offset & 1) == 0 {
-        unsafe {
-            axpy_q4_block_neon(dst_block, coeff, cache, elem_offset);
-            return;
-        }
-    }
-    for (i, d) in dst_block.iter_mut().enumerate() {
-        *d += coeff * dequant_q4_at(cache, elem_offset + i) as f32;
-    }
-}
-
-#[inline]
-unsafe fn dot_q4_row_ptr(
-    q: &[f32],
-    cache: &[u8],
-    row_offset: usize,
-    scales_ptr: *const f32,
-    n_blocks: usize,
-) -> f32 {
-    let mut acc = 0.0f32;
-    let n_full = n_blocks.min(q.len() / Q4_BLOCK_SIZE);
-    let mut bi = 0usize;
-
-    while bi + 4 <= n_full {
-        let s0 = *scales_ptr.add(bi);
-        let s1 = *scales_ptr.add(bi + 1);
-        let s2 = *scales_ptr.add(bi + 2);
-        let s3 = *scales_ptr.add(bi + 3);
-        let b0 = bi * Q4_BLOCK_SIZE;
-        let b1 = b0 + Q4_BLOCK_SIZE;
-        let b2 = b1 + Q4_BLOCK_SIZE;
-        let b3 = b2 + Q4_BLOCK_SIZE;
-        acc += dot_q4_full_block(&q[b0..b1], cache, row_offset + b0, s0);
-        acc += dot_q4_full_block(&q[b1..b2], cache, row_offset + b1, s1);
-        acc += dot_q4_full_block(&q[b2..b3], cache, row_offset + b2, s2);
-        acc += dot_q4_full_block(&q[b3..b3 + Q4_BLOCK_SIZE], cache, row_offset + b3, s3);
-        bi += 4;
-    }
-    while bi < n_full {
-        let start = bi * Q4_BLOCK_SIZE;
-        let end = start + Q4_BLOCK_SIZE;
-        acc += dot_q4_full_block(
-            &q[start..end],
-            cache,
-            row_offset + start,
-            *scales_ptr.add(bi),
-        );
-        bi += 1;
-    }
-    while bi < n_blocks {
-        let start = bi * Q4_BLOCK_SIZE;
-        if start >= q.len() {
-            break;
-        }
-        let end = (start + Q4_BLOCK_SIZE).min(q.len());
-        let scale = *scales_ptr.add(bi);
-        for (i, &qv) in q[start..end].iter().enumerate() {
-            acc += qv * dequant_q4_at(cache, row_offset + start + i) as f32 * scale;
-        }
-        bi += 1;
-    }
-    acc
-}
-
-#[inline]
-unsafe fn axpy_q4_row_ptr(
-    dst: &mut [f32],
-    a: f32,
-    cache: &[u8],
-    row_offset: usize,
-    scales_ptr: *const f32,
-    n_blocks: usize,
-) {
-    let n_full = n_blocks.min(dst.len() / Q4_BLOCK_SIZE);
-    let mut bi = 0usize;
-
-    while bi + 4 <= n_full {
-        let s0 = *scales_ptr.add(bi);
-        let s1 = *scales_ptr.add(bi + 1);
-        let s2 = *scales_ptr.add(bi + 2);
-        let s3 = *scales_ptr.add(bi + 3);
-        let b0 = bi * Q4_BLOCK_SIZE;
-        let b1 = b0 + Q4_BLOCK_SIZE;
-        let b2 = b1 + Q4_BLOCK_SIZE;
-        let b3 = b2 + Q4_BLOCK_SIZE;
-        axpy_q4_full_block(&mut dst[b0..b1], a, cache, row_offset + b0, s0);
-        axpy_q4_full_block(&mut dst[b1..b2], a, cache, row_offset + b1, s1);
-        axpy_q4_full_block(&mut dst[b2..b3], a, cache, row_offset + b2, s2);
-        axpy_q4_full_block(
-            &mut dst[b3..b3 + Q4_BLOCK_SIZE],
-            a,
-            cache,
-            row_offset + b3,
-            s3,
-        );
-        bi += 4;
-    }
-    while bi < n_full {
-        let start = bi * Q4_BLOCK_SIZE;
-        let end = start + Q4_BLOCK_SIZE;
-        axpy_q4_full_block(
-            &mut dst[start..end],
-            a,
-            cache,
-            row_offset + start,
-            *scales_ptr.add(bi),
-        );
-        bi += 1;
-    }
-    while bi < n_blocks {
-        let start = bi * Q4_BLOCK_SIZE;
-        if start >= dst.len() {
-            break;
-        }
-        let end = (start + Q4_BLOCK_SIZE).min(dst.len());
-        let coeff = a * *scales_ptr.add(bi);
-        for (i, d) in dst[start..end].iter_mut().enumerate() {
-            *d += coeff * dequant_q4_at(cache, row_offset + start + i) as f32;
-        }
-        bi += 1;
-    }
-}
-
 #[inline]
 fn qwen35_uses_mrope(p: &Config) -> bool {
     p.is_qwen35 && p.rope_sections[0] > 0 && p.rope_sections[1] > 0
@@ -1878,7 +1601,6 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
     let kv_cache_len = kv_cache_rows
         .checked_mul(kv_dim)
         .ok_or_else(|| "overflow while computing kv cache size".to_string())?;
-    let kv_cache_q4_len = kv_cache_len.div_ceil(2);
     let kv_cache_turbo_base_len = kv_cache_len.div_ceil(4);
     let kv_cache_turbo_sign_len = kv_cache_len.div_ceil(8);
     let kv_cache_block_scale_len = kv_cache_rows
@@ -1894,8 +1616,6 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         kv_cache_format,
         key_cache_q8,
         value_cache_q8,
-        key_cache_q4,
-        value_cache_q4,
         key_cache_turbo_base,
         value_cache_turbo_base,
         key_cache_turbo_sign,
@@ -1906,23 +1626,6 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
             let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
             (
                 KvCacheFormat::Q8,
-                key,
-                value,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            )
-        }
-        SwitchKvCacheMode::Q4 => {
-            let key = alloc_u8(kv_cache_q4_len, "Q4 key cache")?;
-            let value = alloc_u8(kv_cache_q4_len, "Q4 value cache")?;
-            (
-                KvCacheFormat::Q4,
-                Vec::new(),
-                Vec::new(),
                 key,
                 value,
                 Vec::new(),
@@ -1940,52 +1643,11 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
                 KvCacheFormat::Turbo,
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                Vec::new(),
                 key_base,
                 value_base,
                 key_sign,
                 value_sign,
             )
-        }
-        SwitchKvCacheMode::Auto => {
-            let turbo_try = (|| -> Result<_, String> {
-                let base_key = alloc_u8(kv_cache_turbo_base_len, "Turbo key base cache")?;
-                let base_value = alloc_u8(kv_cache_turbo_base_len, "Turbo value base cache")?;
-                let sign_key = alloc_u8(kv_cache_turbo_sign_len, "Turbo key sign cache")?;
-                let sign_value = alloc_u8(kv_cache_turbo_sign_len, "Turbo value sign cache")?;
-                Ok((base_key, base_value, sign_key, sign_value))
-            })();
-            match turbo_try {
-                Ok((base_key, base_value, sign_key, sign_value)) => (
-                    KvCacheFormat::Turbo,
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    base_key,
-                    base_value,
-                    sign_key,
-                    sign_value,
-                ),
-                Err(turbo_err) => {
-                    eprintln!("KV cache Turbo allocation failed: {turbo_err}");
-                    eprintln!("Falling back to KV cache Q8 format.");
-                    let key = alloc_i8(kv_cache_len, "Q8 key cache")?;
-                    let value = alloc_i8(kv_cache_len, "Q8 value cache")?;
-                    (
-                        KvCacheFormat::Q8,
-                        key,
-                        value,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                }
-            }
         }
     };
 
@@ -2025,14 +1687,12 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         kv_cache_format,
         key_cache_q8,
         value_cache_q8,
-        key_cache_q4,
-        value_cache_q4,
         key_cache_turbo_base,
         value_cache_turbo_base,
         key_cache_turbo_sign,
         value_cache_turbo_sign,
-        // Q4 mode uses one scale per Q4_BLOCK_SIZE-element block per row, Q8 uses one scale
-        // per row, and Turbo uses one scale per KV head and row.
+        // Q8 block-scale mode uses one scale per Q4_BLOCK_SIZE-element block per row, plain Q8
+        // uses one scale per row, and Turbo uses one scale per KV head and row.
         key_cache_scale: alloc_f32(kv_cache_scale_len, "KV key scale buffer")?,
         value_cache_scale: alloc_f32(kv_cache_scale_len, "KV value scale buffer")?,
         key_cache_residual_norm: alloc_f32(kv_cache_head_aux_len, "KV key residual norm buffer")?,
@@ -2401,27 +2061,6 @@ fn transformer_inner(
                         );
                     }
                 }
-                KvCacheFormat::Q4 => {
-                    // Quantize in Q4_BLOCK_SIZE-element blocks so each block has its own scale,
-                    // preventing outlier activations in one block from zeroing out other blocks.
-                    let scale_base = row_index * n_blocks_per_row;
-                    for b in 0..n_blocks_per_row {
-                        let src_start = b * Q4_BLOCK_SIZE;
-                        let elem_off = row_elem_offset + src_start;
-                        quantize_q4_block(
-                            &s.k[src_start..src_start + Q4_BLOCK_SIZE],
-                            &mut s.key_cache_q4,
-                            elem_off,
-                            &mut s.key_cache_scale[scale_base + b],
-                        );
-                        quantize_q4_block(
-                            &s.v[src_start..src_start + Q4_BLOCK_SIZE],
-                            &mut s.value_cache_q4,
-                            elem_off,
-                            &mut s.value_cache_scale[scale_base + b],
-                        );
-                    }
-                }
                 KvCacheFormat::Turbo => {
                     let sign_table_slice = s.turbo_sign_table.as_slice();
                     let sign_bytes = turboquant_sign_bytes_per_head(head_size);
@@ -2475,8 +2114,6 @@ fn transformer_inner(
             let kv_format = s.kv_cache_format;
             let key_cache_q8 = &s.key_cache_q8;
             let value_cache_q8 = &s.value_cache_q8;
-            let key_cache_q4 = &s.key_cache_q4;
-            let value_cache_q4 = &s.value_cache_q4;
             let key_cache_turbo_base = &s.key_cache_turbo_base;
             let value_cache_turbo_base = &s.value_cache_turbo_base;
             let key_cache_turbo_sign = &s.key_cache_turbo_sign;
@@ -2574,18 +2211,6 @@ fn transformer_inner(
                                                 )
                                             }
                                         }
-                                        KvCacheFormat::Q4 => {
-                                            let sb = t_row * n_blocks_per_row;
-                                            unsafe {
-                                                dot_q4_row_ptr(
-                                                    q_head,
-                                                    key_cache_q4,
-                                                    row_offset,
-                                                    key_head_scales_ptr.add(sb),
-                                                    blocks_per_head,
-                                                )
-                                            }
-                                        }
                                         KvCacheFormat::Turbo => {
                                             let aux_idx =
                                                 turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
@@ -2644,19 +2269,6 @@ fn transformer_inner(
                                                     value_cache_q8,
                                                     row_offset,
                                                     value_scales[t_row],
-                                                );
-                                            }
-                                        }
-                                        KvCacheFormat::Q4 => {
-                                            let sb = t_row * n_blocks_per_row;
-                                            unsafe {
-                                                axpy_q4_row_ptr(
-                                                    xb_head,
-                                                    weight,
-                                                    value_cache_q4,
-                                                    row_offset,
-                                                    value_head_scales_ptr.add(sb),
-                                                    blocks_per_head,
                                                 );
                                             }
                                         }
@@ -2720,18 +2332,6 @@ fn transformer_inner(
                                                 )
                                             }
                                         }
-                                        KvCacheFormat::Q4 => {
-                                            let sb = t_row * n_blocks_per_row;
-                                            unsafe {
-                                                dot_q4_row_ptr(
-                                                    q_head,
-                                                    key_cache_q4,
-                                                    row_offset,
-                                                    key_head_scales_ptr.add(sb),
-                                                    blocks_per_head,
-                                                )
-                                            }
-                                        }
                                         KvCacheFormat::Turbo => {
                                             let aux_idx =
                                                 turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
@@ -2787,19 +2387,6 @@ fn transformer_inner(
                                                     value_cache_q8,
                                                     row_offset,
                                                     value_scales[t_row],
-                                                );
-                                            }
-                                        }
-                                        KvCacheFormat::Q4 => {
-                                            let sb = t_row * n_blocks_per_row;
-                                            unsafe {
-                                                axpy_q4_row_ptr(
-                                                    xb_head,
-                                                    a,
-                                                    value_cache_q4,
-                                                    row_offset,
-                                                    value_head_scales_ptr.add(sb),
-                                                    blocks_per_head,
                                                 );
                                             }
                                         }
@@ -2898,18 +2485,6 @@ fn transformer_inner(
                                         )
                                     }
                                 }
-                                KvCacheFormat::Q4 => {
-                                    let sb = t_row * n_blocks_per_row;
-                                    unsafe {
-                                        dot_q4_row_ptr(
-                                            q_head,
-                                            key_cache_q4,
-                                            row_offset,
-                                            key_head_scales_ptr.add(sb),
-                                            blocks_per_head,
-                                        )
-                                    }
-                                }
                                 KvCacheFormat::Turbo => {
                                     let aux_idx =
                                         turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
@@ -2968,19 +2543,6 @@ fn transformer_inner(
                                         );
                                     }
                                 }
-                                KvCacheFormat::Q4 => {
-                                    let sb = t_row * n_blocks_per_row;
-                                    unsafe {
-                                        axpy_q4_row_ptr(
-                                            xb_head,
-                                            weight,
-                                            value_cache_q4,
-                                            row_offset,
-                                            value_head_scales_ptr.add(sb),
-                                            blocks_per_head,
-                                        );
-                                    }
-                                }
                                 KvCacheFormat::Turbo => {
                                     let aux_idx =
                                         turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
@@ -3031,18 +2593,6 @@ fn transformer_inner(
                                             key_cache_q8,
                                             row_offset,
                                             key_scales[t_row],
-                                        )
-                                    }
-                                }
-                                KvCacheFormat::Q4 => {
-                                    let sb = t_row * n_blocks_per_row;
-                                    unsafe {
-                                        dot_q4_row_ptr(
-                                            q_head,
-                                            key_cache_q4,
-                                            row_offset,
-                                            key_head_scales_ptr.add(sb),
-                                            blocks_per_head,
                                         )
                                     }
                                 }
@@ -3098,19 +2648,6 @@ fn transformer_inner(
                                             value_cache_q8,
                                             row_offset,
                                             value_scales[t_row],
-                                        );
-                                    }
-                                }
-                                KvCacheFormat::Q4 => {
-                                    let sb = t_row * n_blocks_per_row;
-                                    unsafe {
-                                        axpy_q4_row_ptr(
-                                            xb_head,
-                                            a,
-                                            value_cache_q4,
-                                            row_offset,
-                                            value_head_scales_ptr.add(sb),
-                                            blocks_per_head,
                                         );
                                     }
                                 }

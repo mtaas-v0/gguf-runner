@@ -71,6 +71,7 @@ pub(super) fn decode_policy(config: &Config) -> VendorDecodePolicy {
     VendorDecodePolicy {
         parse_think_tags: config.qwen_chat_template_contains_think,
         stop_token_literals: qwen_common::QWEN_STOP_TOKEN_LITERALS,
+        stop_text_literals: qwen_common::QWEN_STOP_TEXT_LITERALS,
         deterministic_loop_guard: true,
         deterministic_loop_guard_min_generated_tokens: 192,
         recover_early_endoftext_once: true,

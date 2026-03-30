@@ -6,6 +6,14 @@ use crate::engine::types::{
 
 pub(crate) const QWEN_STOP_TOKEN_LITERALS: &[&str] =
     &["<|im_end|>", "<|endoftext|>", "<|im_start|>"];
+pub(crate) const QWEN_STOP_TEXT_LITERALS: &[&str] = &[
+    "</response>",
+    "</assistant_response>",
+    "</user_request>",
+    "</assistant>",
+    "</user>",
+    "</system>",
+];
 pub(crate) const QWEN_END_TURN_TOKEN_LITERALS: &[&str] = &["<|im_end|>", "<|endoftext|>"];
 pub(crate) const QWEN_MMPROJ_SCORE_HINTS: &[MmprojFilenameScoreHint] = &[
     MmprojFilenameScoreHint {

@@ -479,8 +479,6 @@ pub(crate) struct RunState {
     pub(crate) kv_cache_format: KvCacheFormat,
     pub(crate) key_cache_q8: Vec<i8>,
     pub(crate) value_cache_q8: Vec<i8>,
-    pub(crate) key_cache_q4: Vec<u8>,
-    pub(crate) value_cache_q4: Vec<u8>,
     pub(crate) key_cache_turbo_base: Vec<u8>,
     pub(crate) value_cache_turbo_base: Vec<u8>,
     pub(crate) key_cache_turbo_sign: Vec<u8>,
@@ -510,7 +508,6 @@ pub(crate) struct RunState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvCacheFormat {
     Q8,
-    Q4,
     Turbo,
 }
 

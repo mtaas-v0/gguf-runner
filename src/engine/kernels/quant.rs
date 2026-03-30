@@ -31,6 +31,17 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 #[cfg(target_arch = "x86_64")]
 const X86_MATMUL_PREFETCH_ROWS: usize = 6;
+
+fn kernel_validation_warnings_enabled() -> bool {
+    std::env::var("GGUF_KERNEL_VALIDATION_WARNINGS")
+        .ok()
+        .map(|v| {
+            let s = v.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn get_block_size(ttype: GgmlType) -> usize {
     match ttype.0 {
         GGML_TYPE_F32 | GGML_TYPE_F16 | GGML_TYPE_BF16 => 1,
@@ -1168,6 +1179,12 @@ pub(crate) fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
         }
     }
     #[cfg(target_arch = "x86_64")]
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q8_0_x86_avx2(x, w, n);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
     if use_x86_avx512_vnni_q8() {
         unsafe {
             return vec_dot_q8_0_x86_avx512vnni(x, w, n);
@@ -1179,13 +1196,6 @@ pub(crate) fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
             return vec_dot_q8_0_x86_avxvnni(x, w, n);
         }
     }
-    #[cfg(target_arch = "x86_64")]
-    if use_x86_avx2_fma() {
-        unsafe {
-            return vec_dot_q8_0_x86_avx2(x, w, n);
-        }
-    }
-
     let nb = n / QK8_0;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
     let mut sum = 0.0;
@@ -1753,7 +1763,7 @@ fn validate_q8_mr2_once(
     let ok = (mr2_0 - ref_0).abs() <= tol0 && (mr2_1 - ref_1).abs() <= tol1;
 
     AARCH64_Q8_0_MR2_STATUS.store(if ok { 1 } else { 2 }, AtomicOrdering::Relaxed);
-    if !ok {
+    if !ok && kernel_validation_warnings_enabled() {
         eprintln!("Warning: disabling aarch64 i8mm MR2 Q8_0 kernel due to validation mismatch");
     }
     ok
@@ -2701,7 +2711,7 @@ pub(crate) fn validate_qk_mr4_once(
     }
 
     status.store(if ok { 1 } else { 2 }, AtomicOrdering::Relaxed);
-    if !ok {
+    if !ok && kernel_validation_warnings_enabled() {
         eprintln!(
             "Warning: disabling aarch64 MR4 kernel for type {} due to validation mismatch",
             ttype
@@ -4079,7 +4089,7 @@ pub(crate) fn validate_qk_mr4_once_x86(
     }
 
     status.store(if ok { 1 } else { 2 }, AtomicOrdering::Relaxed);
-    if !ok {
+    if !ok && kernel_validation_warnings_enabled() {
         eprintln!(
             "Warning: disabling x86_64 MR4 kernel for type {} due to validation mismatch",
             ttype
@@ -4271,7 +4281,10 @@ pub(crate) fn matmul_quantized(
             }
             #[cfg(target_arch = "x86_64")]
             {
-                if n >= QK8_0 && n.is_multiple_of(QK8_0) {
+                // Prefer the exact AVX2/scalar Q8 path on x86. The VNNI kernels
+                // re-quantize activations to int8, which is faster but can perturb
+                // logits enough to change greedy decoding.
+                if !use_x86_avx2_fma() && n >= QK8_0 && n.is_multiple_of(QK8_0) {
                     if use_x86_avx512_vnni_q8() {
                         let preq = prequantize_activation_q8(&x[..n], n);
                         run_q8_rows_prequant(
@@ -4503,7 +4516,10 @@ pub(crate) fn matmul_quantized_rows(
             }
             #[cfg(target_arch = "x86_64")]
             {
-                if n >= QK8_0 && n.is_multiple_of(QK8_0) {
+                // Prefer the exact AVX2/scalar Q8 path on x86. The VNNI kernels
+                // re-quantize activations to int8, which is faster but can perturb
+                // logits enough to change greedy decoding.
+                if !use_x86_avx2_fma() && n >= QK8_0 && n.is_multiple_of(QK8_0) {
                     if use_x86_avx512_vnni_q8() {
                         let preq = prequantize_activation_q8(&x[..n], n);
                         run_q8_rows_prequant(

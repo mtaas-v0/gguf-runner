@@ -37,6 +37,7 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
     VendorDecodePolicy {
         parse_think_tags: false,
         stop_token_literals: &["<end_of_turn>"],
+        stop_text_literals: &[],
         deterministic_loop_guard: false,
         deterministic_loop_guard_min_generated_tokens: 0,
         recover_early_endoftext_once: false,

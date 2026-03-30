@@ -8,6 +8,7 @@ pub(super) fn decode_policy() -> VendorDecodePolicy {
     VendorDecodePolicy {
         parse_think_tags: false,
         stop_token_literals: qwen_common::QWEN_STOP_TOKEN_LITERALS,
+        stop_text_literals: qwen_common::QWEN_STOP_TEXT_LITERALS,
         deterministic_loop_guard: false,
         deterministic_loop_guard_min_generated_tokens: 0,
         recover_early_endoftext_once: false,
