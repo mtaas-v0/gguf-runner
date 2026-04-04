@@ -3527,19 +3527,14 @@ impl ModelRuntime {
                 if let Some((hidden_think_cap, hidden_total_cap)) = hidden_mode_caps {
                     if is_thinking {
                         hidden_think_token_count = hidden_think_token_count.saturating_add(1);
-                        if hidden_think_token_count >= hidden_think_cap {
-                            is_thinking = false;
-                            think_tail.clear();
-                            pending_newline = false;
-                            if debug_mode {
-                                emit_debug_line(
-                                    event_callback.as_ref(),
-                                    format!(
-                                        "Note: forced exit from hidden thinking block after {} tokens without </think>",
-                                        hidden_think_cap
-                                    ),
-                                );
-                            }
+                        if hidden_think_token_count == hidden_think_cap && debug_mode {
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!(
+                                    "Note: hidden thinking block exceeded {} tokens without </think>, continuing to suppress until total cap",
+                                    hidden_think_cap
+                                ),
+                            );
                         }
                     }
                     if generated_tokens.len() >= hidden_total_cap {
