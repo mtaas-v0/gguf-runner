@@ -4353,13 +4353,13 @@ mod tests {
     }
 
     #[test]
-    fn buffer_visible_think_stdout_only_for_retrying_visible_think_modes() {
+    fn visible_think_stdout_is_not_buffered_for_cli_streaming() {
         let policy = VendorDecodePolicy {
             parse_think_tags: true,
             retry_without_think_when_no_post_think_text: true,
             ..VendorDecodePolicy::default()
         };
-        assert!(should_buffer_visible_think_stdout(
+        assert!(!should_buffer_visible_think_stdout(
             true,
             false,
             ThinkMode::Yes,
