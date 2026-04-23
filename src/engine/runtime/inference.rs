@@ -2791,11 +2791,17 @@ fn transformer_inner(
                     let per_expert = routed_selected
                         .par_iter()
                         .enumerate()
-                        .map(
-                            |(order_idx, &(expert_idx, route_weight))| -> Result<(usize, Vec<f32>), String> {
-                                let mut hb_local = vec![0.0f32; expert_hidden];
-                                let mut hb2_local = vec![0.0f32; expert_hidden];
-                                let mut moe_tmp_local = vec![0.0f32; dim];
+                        .map_init(
+                            || {
+                                (
+                                    vec![0.0f32; expert_hidden],
+                                    vec![0.0f32; expert_hidden],
+                                    vec![0.0f32; dim],
+                                )
+                            },
+                            |(hb_local, hb2_local, moe_tmp_local),
+                             (order_idx, &(expert_idx, route_weight))|
+                             -> Result<(usize, Vec<f32>), String> {
                                 let row_start_ffn = expert_idx * expert_hidden;
                                 matmul_quantized_rows(
                                     &mut hb_local[..expert_hidden],
@@ -2830,7 +2836,7 @@ fn transformer_inner(
                                 for v in &mut moe_tmp_local[..dim] {
                                     *v *= route_weight;
                                 }
-                                Ok((order_idx, moe_tmp_local))
+                                Ok((order_idx, moe_tmp_local.clone()))
                             },
                         )
                         .collect::<Vec<_>>();

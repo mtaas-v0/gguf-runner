@@ -104,9 +104,17 @@ fn repeated_text_suffix_bytes(output: &str) -> Option<usize> {
 
 const THINK_CLOSE_TAG: &str = "</think>";
 const THINK_OPEN_TAG: &str = "<think>";
+const THINK_OPEN_TAG_ALIASES: &[&str] = &[THINK_OPEN_TAG, "<thinking>", "<thought>"];
+const THINK_CLOSE_TAG_ALIASES: &[&str] = &[THINK_CLOSE_TAG, "</thinking>", "</thought>"];
 const KNOWN_PROTOCOL_MARKERS: &[&str] = &[
     THINK_OPEN_TAG,
     THINK_CLOSE_TAG,
+    "<thinking>",
+    "</thinking>",
+    "<thought>",
+    "</thought>",
+    "<answer>",
+    "</answer>",
     "<|im_end|>",
     "<|endoftext|>",
     "<|eot_id|>",
@@ -174,6 +182,18 @@ fn append_visible_text(
         print!("{decoded}");
         let _ = io::stdout().flush();
     }
+}
+
+fn find_first_tag<'a>(text: &'a str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|&tag| text.find(tag).map(|idx| (idx, tag)))
+        .min_by_key(|(idx, _)| *idx)
+}
+
+fn find_last_tag<'a>(text: &'a str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
+    tags.iter()
+        .filter_map(|&tag| text.rfind(tag).map(|idx| (idx, tag)))
+        .max_by_key(|(idx, _)| *idx)
 }
 
 fn find_trailing_stop_text_literal(
@@ -287,6 +307,25 @@ fn emit_output_text(
     }
 }
 
+fn emit_cli_info_line(
+    callback: Option<&RuntimeEventCallback>,
+    text: impl Into<String>,
+    stream_stdout: bool,
+    prefer_stdout: bool,
+) {
+    let text = text.into();
+    if callback.is_some() {
+        emit_runtime_event(
+            callback,
+            RuntimeEvent::Log(crate::app::events::RuntimeLog::debug(text)),
+        );
+    } else if prefer_stdout && stream_stdout {
+        println!("{text}");
+    } else {
+        eprintln!("{text}");
+    }
+}
+
 fn emit_progress_update(callback: Option<&RuntimeEventCallback>, progress: RuntimeProgress) {
     emit_runtime_event(callback, RuntimeEvent::Progress(progress));
 }
@@ -337,11 +376,52 @@ fn flush_utf8_pending_lossy(pending: &mut Vec<u8>) -> String {
 }
 
 fn has_post_think_response_text(output: &str) -> bool {
-    if let Some(idx) = output.rfind(THINK_CLOSE_TAG) {
-        let rest = &output[idx + THINK_CLOSE_TAG.len()..];
+    if let Some((idx, close_tag)) = find_last_tag(output, THINK_CLOSE_TAG_ALIASES) {
+        let rest = &output[idx + close_tag.len()..];
         return has_meaningful_retry_text(rest);
     }
     false
+}
+
+fn is_incomplete_think_tag_fragment(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains('>') || !trimmed.starts_with('<') {
+        return false;
+    }
+    THINK_OPEN_TAG_ALIASES
+        .iter()
+        .any(|tag| tag.starts_with(trimmed))
+        || THINK_CLOSE_TAG_ALIASES
+            .iter()
+            .any(|tag| tag.starts_with(trimmed))
+        || trimmed.starts_with("<th")
+        || trimmed.starts_with("</th")
+}
+
+fn finalize_visible_think_tail(tail: &mut String, is_thinking: bool) -> String {
+    if tail.is_empty() {
+        return String::new();
+    }
+    let raw = std::mem::take(tail);
+    if !is_thinking {
+        return raw;
+    }
+    if THINK_OPEN_TAG_ALIASES
+        .iter()
+        .any(|tag| tag.starts_with(&raw))
+        || THINK_CLOSE_TAG_ALIASES
+            .iter()
+            .any(|tag| tag.starts_with(&raw))
+    {
+        return String::new();
+    }
+    if let Some(idx) = raw.rfind('<') {
+        let suffix = &raw[idx..];
+        if is_incomplete_think_tag_fragment(suffix) {
+            return raw[..idx].to_string();
+        }
+    }
+    raw
 }
 
 fn trim_trailing_protocol_markers(text: &str) -> String {
@@ -364,6 +444,15 @@ fn trim_trailing_protocol_markers(text: &str) -> String {
             trimmed = trimmed.trim_end().to_string();
             changed = true;
         }
+        if !changed
+            && let Some(last_line) = trimmed.lines().last()
+            && is_incomplete_think_tag_fragment(last_line)
+        {
+            let new_len = trimmed.len().saturating_sub(last_line.len());
+            trimmed.truncate(new_len);
+            trimmed = trimmed.trim_end().to_string();
+            changed = true;
+        }
         if !changed {
             break;
         }
@@ -373,11 +462,17 @@ fn trim_trailing_protocol_markers(text: &str) -> String {
 
 fn promote_think_only_content(output: &str) -> Option<String> {
     let mut promoted = trim_trailing_protocol_markers(output);
-    if let Some(prefix) = promoted.strip_suffix(THINK_CLOSE_TAG) {
-        promoted = prefix.trim().to_string();
+    for close_tag in THINK_CLOSE_TAG_ALIASES {
+        if let Some(prefix) = promoted.strip_suffix(close_tag) {
+            promoted = prefix.trim().to_string();
+            break;
+        }
     }
-    if let Some(rest) = promoted.strip_prefix(THINK_OPEN_TAG) {
-        promoted = rest.trim().to_string();
+    for open_tag in THINK_OPEN_TAG_ALIASES {
+        if let Some(rest) = promoted.strip_prefix(open_tag) {
+            promoted = rest.trim().to_string();
+            break;
+        }
     }
     if promoted.is_empty() {
         None
@@ -428,11 +523,8 @@ fn should_buffer_visible_think_stdout(
     think_mode: ThinkMode,
     decode_policy: crate::vendors::VendorDecodePolicy,
 ) -> bool {
-    stream_stdout
-        && !has_event_callback
-        && think_mode == ThinkMode::Yes
-        && decode_policy.parse_think_tags
-        && decode_policy.retry_without_think_when_no_post_think_text
+    let _ = (stream_stdout, has_event_callback, think_mode, decode_policy);
+    false
 }
 
 fn build_direct_answer_retry_system_prompt(system_prompt: &str) -> String {
@@ -928,8 +1020,6 @@ fn split_at_char_boundary(s: &str, byte_idx: usize) -> (&str, &str) {
 }
 
 fn hidden_strip_visible_chunk(decoded: &str, tail: &mut String) -> String {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
     let mut combined = String::new();
     if !tail.is_empty() {
         combined.push_str(tail);
@@ -938,7 +1028,10 @@ fn hidden_strip_visible_chunk(decoded: &str, tail: &mut String) -> String {
     combined.push_str(decoded);
 
     let mut keep_len = 0usize;
-    for tag in [OPEN, CLOSE] {
+    for tag in THINK_OPEN_TAG_ALIASES
+        .iter()
+        .chain(THINK_CLOSE_TAG_ALIASES.iter())
+    {
         let max_prefix = tag.len().saturating_sub(1);
         for k in 1..=max_prefix {
             if combined.ends_with(&tag[..k]) {
@@ -949,20 +1042,38 @@ fn hidden_strip_visible_chunk(decoded: &str, tail: &mut String) -> String {
     let split_at = combined.len().saturating_sub(keep_len);
     let (emit_part, tail_part) = split_at_char_boundary(&combined, split_at);
     tail.push_str(tail_part);
-    emit_part.replace(OPEN, "").replace(CLOSE, "")
+    let mut cleaned = emit_part.to_string();
+    for tag in THINK_OPEN_TAG_ALIASES {
+        cleaned = cleaned.replace(tag, "");
+    }
+    for tag in THINK_CLOSE_TAG_ALIASES {
+        cleaned = cleaned.replace(tag, "");
+    }
+    cleaned
 }
 
 fn hidden_finalize_tail(tail: &mut String) -> String {
-    const OPEN: &str = "<think>";
-    const CLOSE: &str = "</think>";
     if tail.is_empty() {
         return String::new();
     }
     let raw = std::mem::take(tail);
-    if OPEN.starts_with(&raw) || CLOSE.starts_with(&raw) {
+    if THINK_OPEN_TAG_ALIASES
+        .iter()
+        .any(|tag| tag.starts_with(&raw))
+        || THINK_CLOSE_TAG_ALIASES
+            .iter()
+            .any(|tag| tag.starts_with(&raw))
+    {
         return String::new();
     }
-    raw.replace(OPEN, "").replace(CLOSE, "")
+    let mut cleaned = raw;
+    for tag in THINK_OPEN_TAG_ALIASES {
+        cleaned = cleaned.replace(tag, "");
+    }
+    for tag in THINK_CLOSE_TAG_ALIASES {
+        cleaned = cleaned.replace(tag, "");
+    }
+    cleaned
 }
 
 fn trim_leading_line_breaks_for_first_visible<'a>(text: &'a str, output: &str) -> &'a str {
@@ -984,6 +1095,7 @@ fn process_decoded_with_think(
     output: &mut String,
     pending_newline: &mut bool,
     stream_stdout: bool,
+    suppress_visible_think_stdout: bool,
     callback: Option<&RuntimeEventCallback>,
     stop_text_literals: &'static [&'static str],
     stop_text_tail: &mut String,
@@ -1071,14 +1183,14 @@ fn process_decoded_with_think(
         return;
     }
 
-    if let Some(close_idx) = combined.find(THINK_CLOSE_TAG) {
+    if let Some((close_idx, close_tag)) = find_first_tag(&combined, THINK_CLOSE_TAG_ALIASES) {
         if think_mode == ThinkMode::Yes {
-            let end = close_idx + THINK_CLOSE_TAG.len();
+            let end = close_idx + close_tag.len();
             append_visible_text_with_stop_literals(
                 &combined[..end],
                 output,
                 pending_newline,
-                stream_stdout,
+                stream_stdout && !suppress_visible_think_stdout,
                 callback,
                 stop_text_literals,
                 stop_text_tail,
@@ -1088,7 +1200,7 @@ fn process_decoded_with_think(
             *pending_newline = false;
         }
         *is_thinking = false;
-        let rest = &combined[close_idx + THINK_CLOSE_TAG.len()..];
+        let rest = &combined[close_idx + close_tag.len()..];
         if !rest.is_empty() {
             if think_mode == ThinkMode::Hidden || think_mode == ThinkMode::No {
                 let cleaned = hidden_strip_visible_chunk(rest, hidden_visible_tail);
@@ -1119,7 +1231,11 @@ fn process_decoded_with_think(
         return;
     }
 
-    let keep = THINK_CLOSE_TAG.len().saturating_sub(1);
+    let keep = THINK_CLOSE_TAG_ALIASES
+        .iter()
+        .map(|tag| tag.len().saturating_sub(1))
+        .max()
+        .unwrap_or(0);
     if think_mode == ThinkMode::Yes {
         if combined.len() > keep {
             let emit_len = combined.len() - keep;
@@ -1128,7 +1244,7 @@ fn process_decoded_with_think(
                 emit_part,
                 output,
                 pending_newline,
-                stream_stdout,
+                stream_stdout && !suppress_visible_think_stdout,
                 callback,
                 stop_text_literals,
                 stop_text_tail,
@@ -3044,9 +3160,13 @@ impl ModelRuntime {
         let think_mode = self.settings.think_mode;
         let decode_policy = self.settings.vendor_decode_policy;
         let stop_text_literals = decode_policy.stop_text_literals;
+        let suppress_visible_think_stdout = stream_stdout
+            && event_callback.is_none()
+            && think_mode == ThinkMode::Yes
+            && decode_policy.parse_think_tags;
         let thinking_active = decode_policy.parse_think_tags && think_mode != ThinkMode::No;
         let mut is_thinking = thinking_active;
-        if thinking_active && think_mode == ThinkMode::Yes {
+        if thinking_active && think_mode == ThinkMode::Yes && !suppress_visible_think_stdout {
             emit_output_text(event_callback.as_ref(), "<think>", stream_stdout);
         }
         let stop_tokens = decode_policy
@@ -3462,6 +3582,7 @@ impl ModelRuntime {
                     &mut output,
                     &mut pending_newline,
                     stream_stdout,
+                    suppress_visible_think_stdout,
                     event_callback.as_ref(),
                     stop_text_literals,
                     &mut stop_text_tail,
@@ -3725,6 +3846,7 @@ impl ModelRuntime {
             &mut output,
             &mut pending_newline,
             stream_stdout,
+            suppress_visible_think_stdout,
             event_callback.as_ref(),
             stop_text_literals,
             &mut stop_text_tail,
@@ -3737,11 +3859,12 @@ impl ModelRuntime {
         }
         if !think_tail.is_empty() {
             if think_mode == ThinkMode::Yes {
+                let trailing = finalize_visible_think_tail(&mut think_tail, is_thinking);
                 append_visible_text_with_stop_literals(
-                    &think_tail,
+                    &trailing,
                     &mut output,
                     &mut pending_newline,
-                    stream_stdout,
+                    stream_stdout && !suppress_visible_think_stdout,
                     event_callback.as_ref(),
                     stop_text_literals,
                     &mut stop_text_tail,
@@ -3769,7 +3892,7 @@ impl ModelRuntime {
                 THINK_CLOSE_TAG,
                 &mut output,
                 &mut pending_newline,
-                stream_stdout,
+                stream_stdout && !suppress_visible_think_stdout,
                 event_callback.as_ref(),
                 stop_text_literals,
                 &mut stop_text_tail,
@@ -3836,14 +3959,21 @@ impl ModelRuntime {
                 context_limit: self.config.seq_len,
             },
         );
-        if (debug_mode || show_tokens) && pos > 1 {
+        let will_retry_without_think =
+            should_retry_without_think_for_output(think_mode, decode_policy, &output);
+        if (debug_mode || show_tokens) && pos > 1 && !will_retry_without_think {
+            if stream_stdout && !output.is_empty() && !output.ends_with('\n') {
+                println!();
+            }
             let elapsed_ms = (end - start).max(1) as f64;
-            emit_debug_line(
+            emit_cli_info_line(
                 event_callback.as_ref(),
                 format!(
                     "achieved tok/s: {:.3}",
                     (pos - 1) as f64 / elapsed_ms * 1000.0
                 ),
+                stream_stdout,
+                show_tokens && !debug_mode,
             );
         } else if stream_stdout && !output.is_empty() {
             println!();
@@ -4046,9 +4176,10 @@ impl ModelRuntime {
 mod tests {
     use super::{
         ModelRuntime, PrefixMatch, append_visible_text_with_stop_literals,
-        extract_first_complete_json_object, find_first_complete_json_object_span,
-        flush_visible_text_stop_tail, has_meaningful_retry_text, is_agent_json_safe_text,
-        match_agent_response_prefix, promote_think_only_content, sanitize_final_response_text,
+        extract_first_complete_json_object, finalize_visible_think_tail,
+        find_first_complete_json_object_span, flush_visible_text_stop_tail,
+        has_meaningful_retry_text, is_agent_json_safe_text, match_agent_response_prefix,
+        promote_think_only_content, sanitize_final_response_text,
         should_buffer_visible_think_stdout,
     };
     use crate::engine::types::ThinkMode;
@@ -4153,6 +4284,31 @@ mod tests {
         assert_eq!(
             sanitize_final_response_text("Hello!\n</think>\n\n</response>"),
             "Hello!"
+        );
+        assert_eq!(
+            sanitize_final_response_text("During execution...\n</think>\n</thn"),
+            "During execution..."
+        );
+        assert_eq!(
+            sanitize_final_response_text("The capital is Paris.\n</thinking>\n</response>"),
+            "The capital is Paris."
+        );
+    }
+
+    #[test]
+    fn visible_think_tail_drops_incomplete_terminal_think_fragment() {
+        let mut tail = "</thn".to_string();
+        assert_eq!(finalize_visible_think_tail(&mut tail, true), "");
+
+        let mut tail = "ution\n</thn".to_string();
+        assert_eq!(finalize_visible_think_tail(&mut tail, true), "ution\n");
+    }
+
+    #[test]
+    fn promote_think_only_content_supports_thinking_alias_tags() {
+        assert_eq!(
+            promote_think_only_content("<thinking>\nHello there.\n</thinking>"),
+            Some("Hello there.".to_string())
         );
     }
 
