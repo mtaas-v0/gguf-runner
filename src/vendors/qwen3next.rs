@@ -80,9 +80,12 @@ pub(super) fn decode_policy(config: &Config) -> VendorDecodePolicy {
         visible_think_token_cap_base: 384,
         prefer_hidden_think_for_multimodal: false,
         retry_without_think_when_no_post_think_text: false,
-        agent_force_deterministic: true,
+        // Greedy JSON-only decoding is brittle on Qwen3Next/Qwen3.6 and can
+        // collapse into malformed repeated prefixes like {"type":"{"{"...
+        // Use the generic low-temperature agent profile instead.
+        agent_force_deterministic: false,
         agent_protocol_max_failures: 3,
-        agent_plain_chat_fallback_after_protocol_failures: false,
+        agent_plain_chat_fallback_after_protocol_failures: true,
     }
 }
 

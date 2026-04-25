@@ -1568,6 +1568,11 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         .max(p.expert_hidden_dim)
         .max(p.shared_expert_hidden_dim);
     let scratch_dim = ffn_dim.max(ssm_conv_dim).max(ssm_inner).max(ssm_head_dim);
+    let moe_contrib_len = p
+        .n_experts_used
+        .max(1)
+        .checked_mul(p.dim)
+        .ok_or_else(|| "overflow while computing MoE contribution scratch size".to_string())?;
 
     let rope_dim = if p.rope_dim > 0 {
         p.rope_dim
@@ -1658,6 +1663,7 @@ pub(crate) fn malloc_run_state(p: &Config) -> Result<RunState, String> {
         hb: vec![0.0; scratch_dim],
         hb2: vec![0.0; scratch_dim],
         moe_tmp: vec![0.0; p.dim],
+        moe_contribs: alloc_f32(moe_contrib_len, "MoE contribution scratch")?,
         moe_logits: vec![0.0; p.n_experts],
         moe_topk_indices: vec![0usize; p.n_experts_used.max(1)],
         moe_topk_weights: vec![0.0f32; p.n_experts_used.max(1)],
@@ -1731,7 +1737,18 @@ pub(crate) fn transformer(
     w: &TransformerWeights,
     mapped: &[u8],
 ) -> Result<(), String> {
-    transformer_inner(Some(token), None, pos, p, s, w, mapped)
+    transformer_inner(TransformerInput::Token(token), pos, true, p, s, w, mapped)
+}
+
+pub(crate) fn transformer_without_logits(
+    token: usize,
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+) -> Result<(), String> {
+    transformer_inner(TransformerInput::Token(token), pos, false, p, s, w, mapped)
 }
 
 pub(crate) fn transformer_with_embedding(
@@ -1742,13 +1759,46 @@ pub(crate) fn transformer_with_embedding(
     w: &TransformerWeights,
     mapped: &[u8],
 ) -> Result<(), String> {
-    transformer_inner(None, Some(embedding), pos, p, s, w, mapped)
+    transformer_inner(
+        TransformerInput::Embedding(embedding),
+        pos,
+        true,
+        p,
+        s,
+        w,
+        mapped,
+    )
+}
+
+pub(crate) fn transformer_with_embedding_without_logits(
+    embedding: &[f32],
+    pos: usize,
+    p: &Config,
+    s: &mut RunState,
+    w: &TransformerWeights,
+    mapped: &[u8],
+) -> Result<(), String> {
+    transformer_inner(
+        TransformerInput::Embedding(embedding),
+        pos,
+        false,
+        p,
+        s,
+        w,
+        mapped,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TransformerInput<'a> {
+    Token(usize),
+    Embedding(&'a [f32]),
 }
 
 fn transformer_inner(
-    token: Option<usize>,
-    embedding: Option<&[f32]>,
+    input: TransformerInput<'_>,
     pos: usize,
+    compute_logits: bool,
     p: &Config,
     s: &mut RunState,
     w: &TransformerWeights,
@@ -1769,7 +1819,7 @@ fn transformer_inner(
         layer_debug_enabled() && layer_debug_pos().map_or(pos == 0, |p0| pos == p0);
     let mut deepstack_embedding: Option<&[f32]> = None;
 
-    if let Some(input_embedding) = embedding {
+    if let TransformerInput::Embedding(input_embedding) = input {
         if input_embedding.len() == dim {
             s.x[..dim].copy_from_slice(input_embedding);
         } else if p.n_deepstack_layers > 0 && input_embedding.len() == p.input_embedding_dim {
@@ -1784,7 +1834,9 @@ fn transformer_inner(
             ));
         }
     } else {
-        let token = token.ok_or_else(|| "missing token input for transformer step".to_string())?;
+        let TransformerInput::Token(token) = input else {
+            return Err("missing token input for transformer step".to_string());
+        };
         let emb_row = &w.token_embedding_table[token * dim..(token + 1) * dim];
         s.x[..dim].copy_from_slice(emb_row);
 
@@ -2787,21 +2839,17 @@ fn transformer_inner(
                     let gate_exps = &w.moe_gate_exps[l];
                     let up_exps = &w.moe_up_exps[l];
                     let down_exps = &w.moe_down_exps[l];
+                    let contribs_len = routed_selected.len() * dim;
+                    let contribs = &mut s.moe_contribs[..contribs_len];
 
-                    let per_expert = routed_selected
-                        .par_iter()
-                        .enumerate()
+                    let per_expert = contribs
+                        .par_chunks_mut(dim)
+                        .zip(routed_selected.par_iter())
                         .map_init(
-                            || {
-                                (
-                                    vec![0.0f32; expert_hidden],
-                                    vec![0.0f32; expert_hidden],
-                                    vec![0.0f32; dim],
-                                )
-                            },
-                            |(hb_local, hb2_local, moe_tmp_local),
-                             (order_idx, &(expert_idx, route_weight))|
-                             -> Result<(usize, Vec<f32>), String> {
+                            || (vec![0.0f32; expert_hidden], vec![0.0f32; expert_hidden]),
+                            |(hb_local, hb2_local),
+                             (contrib, &(expert_idx, route_weight))|
+                             -> Result<(), String> {
                                 let row_start_ffn = expert_idx * expert_hidden;
                                 matmul_quantized_rows(
                                     &mut hb_local[..expert_hidden],
@@ -2826,34 +2874,28 @@ fn transformer_inner(
 
                                 let row_start_down = expert_idx * dim;
                                 matmul_quantized_rows(
-                                    &mut moe_tmp_local[..dim],
+                                    contrib,
                                     &hb_local[..expert_hidden],
                                     down_exps,
                                     row_start_down,
                                     dim,
                                     mapped,
                                 )?;
-                                for v in &mut moe_tmp_local[..dim] {
+                                for v in contrib {
                                     *v *= route_weight;
                                 }
-                                Ok((order_idx, moe_tmp_local.clone()))
+                                Ok(())
                             },
                         )
                         .collect::<Vec<_>>();
 
-                    let mut contributions = Vec::with_capacity(per_expert.len());
                     for item in per_expert {
-                        contributions.push(item?);
+                        item?;
                     }
-                    contributions.sort_by_key(|(order_idx, _)| *order_idx);
 
                     s.xb[..dim].fill(0.0);
-                    for (_, contrib) in contributions {
-                        crate::engine::kernels::axpy_inplace(
-                            &mut s.xb[..dim],
-                            1.0,
-                            &contrib[..dim],
-                        );
+                    for contrib in contribs.chunks(dim) {
+                        crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], 1.0, contrib);
                     }
                 } else {
                     for &(expert_idx, route_weight) in &routed_selected {
@@ -2981,6 +3023,10 @@ fn transformer_inner(
             }
             accum(&mut s.x[..dim], &ds[ds_off..ds_end], dim);
         }
+    }
+
+    if !compute_logits {
+        return Ok(());
     }
 
     if !p.is_bert_family {

@@ -381,10 +381,13 @@ src/
 - `runtime/inference.rs`:
   - `malloc_run_state(...)`
   - `transformer(...)`
+  - `transformer_without_logits(...)` for prompt-prefill steps that only need KV/cache state
   - `transformer_with_embedding(...)` (prefill hook for external embedding vectors)
+  - `transformer_with_embedding_without_logits(...)` for embedded prefill steps that only need KV/cache state
   - accepts multimodal prefill vectors at either `dim` or `input_embedding_dim`
   - applies per-layer deepstack residual injection for Qwen3-VL-style expanded embeddings
   - applies llama-style Qwen3.5 M-RoPE cache reconstruction for text decode (`[t,h,w,e]=[pos,pos,pos,0]`)
+  - owns reusable per-token scratch buffers for routed MoE experts, including selected-expert contribution staging in `RunState`
   - quantized KV cache storage for attention state:
     - default TurboQuant-style cache mode with head-wise signed-Hadamard rotation, packed 2-bit base codes, and packed 1-bit residual sketches
     - optional Q8 cache mode

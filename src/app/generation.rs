@@ -3319,9 +3319,30 @@ impl ModelRuntime {
             }
 
             let prof_t0 = prof_start();
+            let needs_logits = pos >= prompt_tokens.len().saturating_sub(1);
             if let Some(embedding) = prefill_injected_embeddings.get(&pos) {
-                crate::engine::runtime::transformer_with_embedding(
-                    embedding,
+                if needs_logits {
+                    crate::engine::runtime::transformer_with_embedding(
+                        embedding,
+                        pos,
+                        &self.config,
+                        &mut state,
+                        &self.weights,
+                        self.gguf.mapped.as_slice(),
+                    )?;
+                } else {
+                    crate::engine::runtime::transformer_with_embedding_without_logits(
+                        embedding,
+                        pos,
+                        &self.config,
+                        &mut state,
+                        &self.weights,
+                        self.gguf.mapped.as_slice(),
+                    )?;
+                }
+            } else if needs_logits {
+                crate::engine::runtime::transformer(
+                    token as usize,
                     pos,
                     &self.config,
                     &mut state,
@@ -3329,7 +3350,7 @@ impl ModelRuntime {
                     self.gguf.mapped.as_slice(),
                 )?;
             } else {
-                crate::engine::runtime::transformer(
+                crate::engine::runtime::transformer_without_logits(
                     token as usize,
                     pos,
                     &self.config,

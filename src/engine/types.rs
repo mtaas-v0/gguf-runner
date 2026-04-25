@@ -450,6 +450,7 @@ pub(crate) struct RunState {
     pub(crate) hb: Vec<f32>,
     pub(crate) hb2: Vec<f32>,
     pub(crate) moe_tmp: Vec<f32>,
+    pub(crate) moe_contribs: Vec<f32>,
     pub(crate) moe_logits: Vec<f32>,
     pub(crate) moe_topk_indices: Vec<usize>,
     pub(crate) moe_topk_weights: Vec<f32>,
