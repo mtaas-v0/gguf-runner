@@ -553,10 +553,10 @@ pub(crate) fn run(cli: &CliOptions) -> Result<(), String> {
             continue;
         }
         match event::read().map_err(|e| format!("event read failed: {e}"))? {
-            Event::Key(key) => {
-                if handle_key_event(&mut app, &mut terminal, &command_tx, cli, key)? {
-                    break;
-                }
+            Event::Key(key)
+                if handle_key_event(&mut app, &mut terminal, &command_tx, cli, key)? =>
+            {
+                break;
             }
             Event::Resize(_, _) => {
                 terminal.render_footer(&app)?;
