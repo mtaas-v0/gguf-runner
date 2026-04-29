@@ -193,10 +193,8 @@ pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Re
                         return Err("incompatible mmproj family for qwen35 backend: deepstack vision tensors detected (Qwen3-VL style); use a Qwen3.5 mmproj sidecar".to_string());
                     }
                 }
-                MultimodalBackend::Qwen3Vl => {
-                    if has_qwen35 && !has_qwen3vl {
-                        return Err("incompatible mmproj family for qwen3vl backend: sidecar metadata indicates Qwen3.5; use a Qwen3-VL mmproj from the same checkpoint family".to_string());
-                    }
+                MultimodalBackend::Qwen3Vl if has_qwen35 && !has_qwen3vl => {
+                    return Err("incompatible mmproj family for qwen3vl backend: sidecar metadata indicates Qwen3.5; use a Qwen3-VL mmproj from the same checkpoint family".to_string());
                 }
                 _ => {}
             }

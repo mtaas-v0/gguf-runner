@@ -267,7 +267,7 @@ impl RagIndex {
 
         let mut chunks: Vec<RagChunk> = Vec::with_capacity(total);
         let mut flat_embeddings: Vec<f32> = Vec::with_capacity(total * dim);
-        for (raw, embedding) in raw_chunks.into_iter().zip(embeddings.into_iter()) {
+        for (raw, embedding) in raw_chunks.into_iter().zip(embeddings) {
             let embedding = embedding.ok_or_else(|| "missing RAG embedding result".to_string())?;
             flat_embeddings.extend_from_slice(&embedding);
             chunks.push(RagChunk {
@@ -391,7 +391,7 @@ impl RagIndex {
                     if hits > 0 { Some((i, hits)) } else { None }
                 })
                 .collect();
-            kw_scored.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            kw_scored.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
             for (i, _) in kw_scored.into_iter().take(k) {
                 selected.push(i);
             }
