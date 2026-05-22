@@ -57,57 +57,57 @@ pub(crate) fn bf16_to_fp32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
-fn read_exact_array<const N: usize>(r: &mut File) -> io::Result<[u8; N]> {
+fn read_exact_array<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
     let mut b = [0u8; N];
     r.read_exact(&mut b)?;
     Ok(b)
 }
 
-fn read_u8(r: &mut File) -> io::Result<u8> {
+fn read_u8(r: &mut impl Read) -> io::Result<u8> {
     Ok(read_exact_array::<1>(r)?[0])
 }
 
-fn read_i8(r: &mut File) -> io::Result<i8> {
+fn read_i8(r: &mut impl Read) -> io::Result<i8> {
     Ok(read_u8(r)? as i8)
 }
 
-fn read_u16(r: &mut File) -> io::Result<u16> {
+fn read_u16(r: &mut impl Read) -> io::Result<u16> {
     Ok(u16::from_le_bytes(read_exact_array::<2>(r)?))
 }
 
-fn read_i16(r: &mut File) -> io::Result<i16> {
+fn read_i16(r: &mut impl Read) -> io::Result<i16> {
     Ok(i16::from_le_bytes(read_exact_array::<2>(r)?))
 }
 
-fn read_u32(r: &mut File) -> io::Result<u32> {
+fn read_u32(r: &mut impl Read) -> io::Result<u32> {
     Ok(u32::from_le_bytes(read_exact_array::<4>(r)?))
 }
 
-fn read_i32(r: &mut File) -> io::Result<i32> {
+fn read_i32(r: &mut impl Read) -> io::Result<i32> {
     Ok(i32::from_le_bytes(read_exact_array::<4>(r)?))
 }
 
-fn read_u64(r: &mut File) -> io::Result<u64> {
+fn read_u64(r: &mut impl Read) -> io::Result<u64> {
     Ok(u64::from_le_bytes(read_exact_array::<8>(r)?))
 }
 
-fn read_i64(r: &mut File) -> io::Result<i64> {
+fn read_i64(r: &mut impl Read) -> io::Result<i64> {
     Ok(i64::from_le_bytes(read_exact_array::<8>(r)?))
 }
 
-fn read_f32(r: &mut File) -> io::Result<f32> {
+fn read_f32(r: &mut impl Read) -> io::Result<f32> {
     Ok(f32::from_le_bytes(read_exact_array::<4>(r)?))
 }
 
-fn read_f64(r: &mut File) -> io::Result<f64> {
+fn read_f64(r: &mut impl Read) -> io::Result<f64> {
     Ok(f64::from_le_bytes(read_exact_array::<8>(r)?))
 }
 
-fn read_bool(r: &mut File) -> io::Result<bool> {
+fn read_bool(r: &mut impl Read) -> io::Result<bool> {
     Ok(read_u8(r)? != 0)
 }
 
-fn read_gguf_string(r: &mut File) -> io::Result<String> {
+fn read_gguf_string(r: &mut impl Read) -> io::Result<String> {
     let len = read_u64(r)? as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
@@ -117,7 +117,7 @@ fn read_gguf_string(r: &mut File) -> io::Result<String> {
     }
 }
 
-fn skip_gguf_value(r: &mut File, value_type: u32) -> io::Result<()> {
+fn skip_gguf_value(r: &mut impl Read, value_type: u32) -> io::Result<()> {
     match value_type {
         GGUF_TYPE_UINT8 | GGUF_TYPE_INT8 | GGUF_TYPE_BOOL => {
             let _ = read_u8(r)?;
@@ -151,7 +151,7 @@ fn skip_gguf_value(r: &mut File, value_type: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn read_gguf_scalar(r: &mut File, value_type: u32) -> io::Result<GgufValue> {
+fn read_gguf_scalar(r: &mut impl Read, value_type: u32) -> io::Result<GgufValue> {
     match value_type {
         GGUF_TYPE_UINT8 => Ok(GgufValue::UInt(read_u8(r)? as u64)),
         GGUF_TYPE_INT8 => Ok(GgufValue::Int(read_i8(r)? as i64)),
@@ -172,7 +172,7 @@ fn read_gguf_scalar(r: &mut File, value_type: u32) -> io::Result<GgufValue> {
     }
 }
 
-fn read_gguf_integer_array_value(r: &mut File, value_type: u32) -> io::Result<i64> {
+fn read_gguf_integer_array_value(r: &mut impl Read, value_type: u32) -> io::Result<i64> {
     match value_type {
         GGUF_TYPE_UINT8 => Ok(read_u8(r)? as i64),
         GGUF_TYPE_INT8 => Ok(read_i8(r)? as i64),
@@ -189,23 +189,28 @@ fn read_gguf_integer_array_value(r: &mut File, value_type: u32) -> io::Result<i6
     }
 }
 
-fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {
-    let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
-
-    let magic = read_u32(&mut file).map_err(|e| format!("failed to read magic number: {e}"))?;
+/// Core GGUF parse logic shared by file-backed and bytes-backed loading.
+/// `reader` is used for the sequential header; `mapped` holds the full file
+/// bytes for tensor data access (already created by the caller).
+fn parse_gguf_inner<R: Read + Seek>(
+    reader: &mut R,
+    debug_mode: bool,
+    mapped: MappedFile,
+) -> Result<GGUFFile, String> {
+    let magic = read_u32(reader).map_err(|e| format!("failed to read magic number: {e}"))?;
     if magic != GGUF_MAGIC {
         return Err(format!(
             "invalid GGUF magic: expected 0x{GGUF_MAGIC:X}, got 0x{magic:X}"
         ));
     }
 
-    let version = read_u32(&mut file).map_err(|e| format!("failed to read version: {e}"))?;
+    let version = read_u32(reader).map_err(|e| format!("failed to read version: {e}"))?;
     if !(2..=3).contains(&version) {
         return Err(format!("unsupported GGUF version: {version}"));
     }
 
-    let n_tensors = read_u64(&mut file).map_err(|e| format!("failed to read n_tensors: {e}"))?;
-    let n_kv = read_u64(&mut file).map_err(|e| format!("failed to read n_kv: {e}"))?;
+    let n_tensors = read_u64(reader).map_err(|e| format!("failed to read n_tensors: {e}"))?;
+    let n_kv = read_u64(reader).map_err(|e| format!("failed to read n_kv: {e}"))?;
 
     if debug_mode {
         eprintln!("GGUF version: {version}, tensors: {n_tensors}, kv pairs: {n_kv}");
@@ -217,20 +222,20 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
     let mut vocab_merges: Vec<String> = Vec::new();
 
     for _ in 0..n_kv {
-        let key = read_gguf_string(&mut file).map_err(|e| format!("failed to read key: {e}"))?;
+        let key = read_gguf_string(reader).map_err(|e| format!("failed to read key: {e}"))?;
         let value_type =
-            read_u32(&mut file).map_err(|e| format!("failed to read value type: {e}"))?;
+            read_u32(reader).map_err(|e| format!("failed to read value type: {e}"))?;
 
         if value_type == GGUF_TYPE_ARRAY {
             let arr_type =
-                read_u32(&mut file).map_err(|e| format!("failed to read array type: {e}"))?;
+                read_u32(reader).map_err(|e| format!("failed to read array type: {e}"))?;
             let arr_len =
-                read_u64(&mut file).map_err(|e| format!("failed to read array len: {e}"))?;
+                read_u64(reader).map_err(|e| format!("failed to read array len: {e}"))?;
 
             if key == "tokenizer.ggml.tokens" && arr_type == GGUF_TYPE_STRING {
                 vocab_tokens.reserve(arr_len as usize);
                 for _ in 0..arr_len {
-                    let tok = read_gguf_string(&mut file)
+                    let tok = read_gguf_string(reader)
                         .map_err(|e| format!("failed to read token: {e}"))?;
                     vocab_tokens.push(tok);
                 }
@@ -238,20 +243,20 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
                 vocab_scores.reserve(arr_len as usize);
                 for _ in 0..arr_len {
                     let score =
-                        read_f32(&mut file).map_err(|e| format!("failed to read score: {e}"))?;
+                        read_f32(reader).map_err(|e| format!("failed to read score: {e}"))?;
                     vocab_scores.push(score);
                 }
             } else if key == "tokenizer.ggml.merges" && arr_type == GGUF_TYPE_STRING {
                 vocab_merges.reserve(arr_len as usize);
                 for _ in 0..arr_len {
-                    let merge = read_gguf_string(&mut file)
+                    let merge = read_gguf_string(reader)
                         .map_err(|e| format!("failed to read merge: {e}"))?;
                     vocab_merges.push(merge);
                 }
             } else if arr_type == GGUF_TYPE_FLOAT32 {
                 let mut values = Vec::with_capacity(arr_len as usize);
                 for _ in 0..arr_len {
-                    let value = read_f32(&mut file).map_err(|e| {
+                    let value = read_f32(reader).map_err(|e| {
                         format!("failed to read float32 array value for key {key}: {e}")
                     })?;
                     values.push(value);
@@ -260,7 +265,7 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
             } else if arr_type == GGUF_TYPE_FLOAT64 {
                 let mut values = Vec::with_capacity(arr_len as usize);
                 for _ in 0..arr_len {
-                    let value = read_f64(&mut file).map_err(|e| {
+                    let value = read_f64(reader).map_err(|e| {
                         format!("failed to read float64 array value for key {key}: {e}")
                     })?;
                     values.push(value as f32);
@@ -280,7 +285,7 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
                 let mut values = Vec::with_capacity(arr_len as usize);
                 for _ in 0..arr_len {
                     let value =
-                        read_gguf_integer_array_value(&mut file, arr_type).map_err(|e| {
+                        read_gguf_integer_array_value(reader, arr_type).map_err(|e| {
                             format!("failed to read integer array value for key {key}: {e}")
                         })?;
                     values.push(value);
@@ -288,12 +293,12 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
                 kv.insert(key, GgufValue::I64Array(values));
             } else {
                 for _ in 0..arr_len {
-                    skip_gguf_value(&mut file, arr_type)
+                    skip_gguf_value(reader, arr_type)
                         .map_err(|e| format!("failed to skip array value for key {key}: {e}"))?;
                 }
             }
         } else {
-            let value = read_gguf_scalar(&mut file, value_type)
+            let value = read_gguf_scalar(reader, value_type)
                 .map_err(|e| format!("failed to read scalar for key {key}: {e}"))?;
             kv.insert(key, value);
         }
@@ -303,22 +308,22 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
 
     for _ in 0..n_tensors {
         let name =
-            read_gguf_string(&mut file).map_err(|e| format!("failed to read tensor name: {e}"))?;
-        let n_dims = read_u32(&mut file).map_err(|e| format!("failed to read n_dims: {e}"))?;
+            read_gguf_string(reader).map_err(|e| format!("failed to read tensor name: {e}"))?;
+        let n_dims = read_u32(reader).map_err(|e| format!("failed to read n_dims: {e}"))?;
         if n_dims > 4 {
             return Err(format!("tensor {name} has unsupported n_dims={n_dims}"));
         }
 
         let mut ne = [1u64; 4];
         for n in ne.iter_mut().take(n_dims as usize) {
-            *n = read_u64(&mut file).map_err(|e| format!("failed reading tensor dims: {e}"))?;
+            *n = read_u64(reader).map_err(|e| format!("failed reading tensor dims: {e}"))?;
         }
 
         let ttype = GgmlType::from_u32(
-            read_u32(&mut file).map_err(|e| format!("failed reading tensor type: {e}"))?,
+            read_u32(reader).map_err(|e| format!("failed reading tensor type: {e}"))?,
         );
         let offset =
-            read_u64(&mut file).map_err(|e| format!("failed reading tensor offset: {e}"))?;
+            read_u64(reader).map_err(|e| format!("failed reading tensor offset: {e}"))?;
 
         tensors.push(Gguftensor {
             name,
@@ -330,14 +335,13 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
         });
     }
 
-    let header_end = file
+    let header_end = reader
         .stream_position()
         .map_err(|e| format!("failed to query header end: {e}"))?;
 
     let alignment = get_gguf_int_from_map(&kv, "general.alignment", 32) as u64;
     let tensor_data_offset = header_end.div_ceil(alignment) * alignment;
 
-    let mapped = MappedFile::map(&file).map_err(|e| format!("mmap failed: {e}"))?;
     let mapped_len = mapped.len;
 
     let mut tensor_lookup = HashMap::new();
@@ -367,6 +371,19 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
         vocab_merges,
         mapped,
     })
+}
+
+fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {
+    let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
+    let mapped = MappedFile::map(&file).map_err(|e| format!("mmap failed: {e}"))?;
+    parse_gguf_inner(&mut file, debug_mode, mapped)
+}
+
+/// Parse a GGUF model from a static byte slice (e.g. embedded via `include_bytes!`).
+pub(crate) fn parse_gguf_from_bytes(data: &'static [u8], debug_mode: bool) -> Result<GGUFFile, String> {
+    let mapped = MappedFile::from_static(data).map_err(|e| format!("static map failed: {e}"))?;
+    let mut cursor = std::io::Cursor::new(data);
+    parse_gguf_inner(&mut cursor, debug_mode, mapped)
 }
 
 pub(crate) fn parse_gguf_file(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {

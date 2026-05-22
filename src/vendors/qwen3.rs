@@ -44,11 +44,11 @@ pub(super) fn print_qwen3moe_debug(config: &Config) {
 
 pub(super) fn decode_policy() -> VendorDecodePolicy {
     VendorDecodePolicy {
-        parse_think_tags: false,
+        parse_think_tags: true,
         stop_token_literals: qwen_common::QWEN_STOP_TOKEN_LITERALS,
         stop_text_literals: qwen_common::QWEN_STOP_TEXT_LITERALS,
-        deterministic_loop_guard: false,
-        deterministic_loop_guard_min_generated_tokens: 0,
+        deterministic_loop_guard: true,
+        deterministic_loop_guard_min_generated_tokens: 96,
         recover_early_endoftext_once: false,
         early_endoftext_recover_max_tokens: 0,
         hidden_think_token_cap_base: 256,

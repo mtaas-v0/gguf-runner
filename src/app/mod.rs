@@ -1,4 +1,5 @@
 mod agent;
+pub mod embed;
 mod events;
 mod generation;
 mod repl;

@@ -16,11 +16,16 @@ use crate::engine::switches::{
 };
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 use crate::engine::types::{
-    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
-    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GgmlType, KVALUES_IQ4NL, QK_K, QK4_0, QK4_1, QK4_NL, QK5_0,
+    GGML_TYPE_BF16, GGML_TYPE_BIN1_40, GGML_TYPE_BIN1_41, GGML_TYPE_F16, GGML_TYPE_F32,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0, GgmlType, KVALUES_IQ4NL, QK_BIN1, QK_K, QK4_0, QK4_1, QK4_NL, QK5_0,
     QK5_1, QK8_0, QuantizedTensor, ensure_model_range,
 };
+
+/// type_size for BIN1 (types 40/41): f16 scale (2 bytes) + 16 bytes packed 1-bit values
+/// for 128 elements. Layout follows all other GGML types: scale first, data after.
+const BIN1_TYPE_SIZE: usize = 18;
 use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -52,6 +57,7 @@ pub(crate) fn get_block_size(ttype: GgmlType) -> usize {
         GGML_TYPE_Q8_0 => QK8_0,
         GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K => QK_K,
         GGML_TYPE_IQ4_NL => QK4_NL,
+        GGML_TYPE_BIN1_40 | GGML_TYPE_BIN1_41 => QK_BIN1,
         _ => 1,
     }
 }
@@ -71,6 +77,7 @@ pub(crate) fn get_type_size(ttype: GgmlType) -> usize {
         GGML_TYPE_Q5_K => 2 + 2 + 12 + QK_K / 8 + QK_K / 2,
         GGML_TYPE_Q6_K => QK_K / 2 + QK_K / 4 + QK_K / 16 + 2,
         GGML_TYPE_IQ4_NL => 2 + QK4_NL / 2,
+        GGML_TYPE_BIN1_40 | GGML_TYPE_BIN1_41 => BIN1_TYPE_SIZE,
         _ => 0,
     }
 }
@@ -489,6 +496,23 @@ pub(crate) fn dequantize_row_bf16(src: &[u8], dst: &mut [f32], k: usize) {
     }
 }
 
+/// Dequantise a 1-bit binary quantisation row (GGML types 40/41).
+/// Block layout (128 elements): [2 bytes f16 scale][16 bytes packed bits (LSB-first)].
+/// Each bit maps to +scale (1) or -scale (0). Scale is f16, consistent with all GGML types.
+pub(crate) fn dequantize_row_bin1(src: &[u8], dst: &mut [f32], k: usize) {
+    let nb = k / QK_BIN1;
+    for i in 0..nb {
+        let off = i * BIN1_TYPE_SIZE;
+        let scale = fp16_to_fp32(read_u16_le(src, off));
+        let bits = &src[off + 2..off + 18];
+        let base = i * QK_BIN1;
+        for j in 0..QK_BIN1 {
+            let bit = (bits[j >> 3] >> (j & 7)) & 1;
+            dst[base + j] = if bit != 0 { scale } else { -scale };
+        }
+    }
+}
+
 pub(crate) fn dequantize_row_iq4_nl(src: &[u8], dst: &mut [f32], k: usize) {
     let block_sz = get_type_size(GgmlType(GGML_TYPE_IQ4_NL));
     let nb = k / QK4_NL;
@@ -528,6 +552,7 @@ pub(crate) fn dequantize_tensor(
         GGML_TYPE_Q6_K => dequantize_row_q6_k(src, &mut dst, n_elements),
         GGML_TYPE_IQ4_NL => dequantize_row_iq4_nl(src, &mut dst, n_elements),
         GGML_TYPE_BF16 => dequantize_row_bf16(src, &mut dst, n_elements),
+        GGML_TYPE_BIN1_40 | GGML_TYPE_BIN1_41 => dequantize_row_bin1(src, &mut dst, n_elements),
         _ => return Err(format!("unsupported quantization type: {}", ttype.0)),
     }
     Ok(dst)
@@ -559,6 +584,7 @@ fn dequantize_row_into(
         GGML_TYPE_Q6_K => dequantize_row_q6_k(src, dst, k),
         GGML_TYPE_IQ4_NL => dequantize_row_iq4_nl(src, dst, k),
         GGML_TYPE_BF16 => dequantize_row_bf16(src, dst, k),
+        GGML_TYPE_BIN1_40 | GGML_TYPE_BIN1_41 => dequantize_row_bin1(src, dst, k),
         _ => {
             return Err(format!(
                 "unsupported quantization type in batched matmul: {}",
@@ -1075,6 +1101,26 @@ pub(crate) fn vec_dot_bf16(x: &[f32], w: &[u8], n: usize) -> f32 {
     let mut sum = 0.0f32;
     for i in 0..n {
         sum += x[i] * bf16_to_fp32(read_u16_le(w, i * 2));
+    }
+    sum
+}
+
+/// Dot product for 1-bit binary quantisation (types 40/41).
+/// Block layout (128 elements): [2 bytes f16 scale][16 bytes packed bits].
+/// Each bit 1 → +scale, bit 0 → -scale.
+pub(crate) fn vec_dot_bin1(x: &[f32], w: &[u8], n: usize) -> f32 {
+    let nb = n / QK_BIN1;
+    let mut sum = 0.0f32;
+    for i in 0..nb {
+        let off = i * BIN1_TYPE_SIZE;
+        let scale = fp16_to_fp32(read_u16_le(w, off));
+        let bits = &w[off + 2..off + 18];
+        let base = i * QK_BIN1;
+        for j in 0..QK_BIN1 {
+            let bit = (bits[j >> 3] >> (j & 7)) & 1;
+            let weight = if bit != 0 { scale } else { -scale };
+            sum += x[base + j] * weight;
+        }
     }
     sum
 }
@@ -4422,6 +4468,7 @@ pub(crate) fn matmul_quantized(
         GGML_TYPE_F16 => run_rows!(vec_dot_f16),
         GGML_TYPE_BF16 => run_rows!(vec_dot_bf16),
         GGML_TYPE_F32 => run_rows!(vec_dot_f32),
+        GGML_TYPE_BIN1_40 | GGML_TYPE_BIN1_41 => run_rows!(vec_dot_bin1),
         _ => {
             return Err(format!(
                 "unsupported quantization type in matmul: {}",
@@ -4657,6 +4704,7 @@ pub(crate) fn matmul_quantized_rows(
         GGML_TYPE_F16 => run_rows!(vec_dot_f16),
         GGML_TYPE_BF16 => run_rows!(vec_dot_bf16),
         GGML_TYPE_F32 => run_rows!(vec_dot_f32),
+        GGML_TYPE_BIN1_40 | GGML_TYPE_BIN1_41 => run_rows!(vec_dot_bin1),
         _ => {
             return Err(format!(
                 "unsupported quantization type in matmul: {}",

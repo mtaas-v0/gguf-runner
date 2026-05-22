@@ -80,6 +80,7 @@ enum ModelFamily {
     Llama,
     Gemma,
     Qwen2,
+    Qwen3Plain,
     Qwen35,
     Qwen3Vl,
     Qwen3Moe,
@@ -362,6 +363,15 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
                 identity.key_prefix
             );
         }
+    } else if arch == "qwen3" {
+        // Plain qwen3 (dense, no MoE/SSM/VL suffix).
+        // Uses the Qwen3 chat template (with think-mode framing) but the same
+        // transformer weights layout as Qwen2.
+        identity.family = ModelFamily::Qwen3Plain;
+        identity.key_prefix = "qwen3".to_string();
+        if debug_mode {
+            eprintln!("Detected Qwen3 architecture, using qwen3.* keys");
+        }
     } else if arch.starts_with("qwen") || arch == "qwen2" {
         identity.family = ModelFamily::Qwen2;
         identity.key_prefix = arch.to_string();
@@ -466,7 +476,10 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         rope_sections: [0; 4],
         is_bert_family: identity.family == ModelFamily::BertFamily,
         is_gemma3: identity.family == ModelFamily::Gemma,
-        is_qwen2: identity.family == ModelFamily::Qwen2 || identity.family == ModelFamily::Qwen35,
+        is_qwen3: identity.family == ModelFamily::Qwen3Plain,
+        is_qwen2: identity.family == ModelFamily::Qwen2
+            || identity.family == ModelFamily::Qwen3Plain
+            || identity.family == ModelFamily::Qwen35,
         is_qwen35: identity.family == ModelFamily::Qwen35,
         is_qwen3vl: identity.family == ModelFamily::Qwen3Vl,
         is_qwen3moe: identity.family == ModelFamily::Qwen3Moe || is_qwen3vlmoe_arch,
@@ -475,6 +488,11 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         online_attn_fusion: false,
         qwen_chat_template_contains_think: chat_template.contains("<think>"),
         qwen_chat_template_has_builtin_system: chat_template.contains("you are qwen"),
+        // Detect the pre-filled empty-think pattern used by no-reasoning Qwen3 variants
+        // (Bonsai, Qwen3-Instruct without thinking). The template literal in the GGUF
+        // shows up with escaped newlines, so check both renderings.
+        qwen_chat_template_uses_empty_think: chat_template.contains("<think>\\n\\n</think>")
+            || chat_template.contains("<think>\n\n</think>"),
         capabilities,
         final_logit_softcapping: get_gguf_float_from_map(&gguf.kv, &key_softcap, 0.0),
         rms_norm_eps: get_gguf_float_from_map(&gguf.kv, &key_rms_eps, 1e-6),
@@ -615,7 +633,7 @@ pub(crate) fn encode_chat_prompt(
             image_count,
             think_mode,
         )
-    } else if config.is_qwen3moe {
+    } else if config.is_qwen3moe || config.is_qwen3 {
         qwen3::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
     } else if config.is_qwen2 {
         qwen2::encode_chat_prompt(tokenizer, prompt, system_prompt)
@@ -639,7 +657,7 @@ pub(crate) fn encode_chat_messages(
         qwen3vl::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
     } else if cfg.is_qwen3next {
         qwen3next::encode_chat_messages(tokenizer, cfg, messages, system_prompt, think_mode)
-    } else if cfg.is_qwen3moe {
+    } else if cfg.is_qwen3moe || cfg.is_qwen3 {
         qwen3::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
     } else if cfg.is_qwen2 {
         qwen2::encode_chat_messages(tokenizer, messages, system_prompt)
@@ -676,7 +694,7 @@ pub(crate) fn encode_generation_request(
     if config.is_qwen3next {
         return qwen3next::encode_generation_request(tokenizer, config, request, think_mode);
     }
-    if config.is_qwen3moe {
+    if config.is_qwen3moe || config.is_qwen3 {
         return qwen3::encode_generation_request(tokenizer, request, think_mode);
     }
 
@@ -696,7 +714,7 @@ pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
         qwen3vl::decode_policy(config)
     } else if config.is_qwen3next {
         qwen3next::decode_policy(config)
-    } else if config.is_qwen3moe {
+    } else if config.is_qwen3moe || config.is_qwen3 {
         qwen3::decode_policy()
     } else if config.is_qwen2 {
         qwen2::decode_policy()

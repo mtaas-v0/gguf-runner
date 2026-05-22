@@ -4,6 +4,14 @@ version = "0.3.0"
 edition = "2024"
 license = "MIT"
 
+[[bin]]
+name = "gguf-runner"
+path = "src/main.rs"
+
+[lib]
+name = "gguf_runner"
+path = "src/lib.rs"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

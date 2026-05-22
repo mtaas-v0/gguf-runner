@@ -574,18 +574,20 @@ struct Cli {
     #[arg(long = "audio", value_name = "path")]
     audios: Vec<String>,
 
-    #[arg(long, default_value_t = 0.9)]
-    temperature: f32,
+    /// Sampling temperature (default: model hint or 0.9).
+    #[arg(long)]
+    temperature: Option<f32>,
 
-    #[arg(long = "top-k", default_value_t = 0)]
-    top_k: usize,
+    /// Top-k sampling (default: model hint or 0 = disabled).
+    #[arg(long = "top-k")]
+    top_k: Option<usize>,
 
+    /// Top-p nucleus sampling; only used when top-k > 0 (default: model hint or 1.0).
     #[arg(
         long = "top-p",
         value_parser = parse_top_p,
-        default_value_t = 1.0
     )]
-    top_p: f32,
+    top_p: Option<f32>,
 
     #[arg(long, env = "GGUF_SEED")]
     seed: Option<u64>,
@@ -862,9 +864,9 @@ pub(crate) struct CliOptions {
     pub(crate) images: Vec<String>,
     pub(crate) videos: Vec<String>,
     pub(crate) audios: Vec<String>,
-    pub(crate) temperature: f32,
-    pub(crate) top_k: usize,
-    pub(crate) top_p: f32,
+    pub(crate) temperature: Option<f32>,
+    pub(crate) top_k: Option<usize>,
+    pub(crate) top_p: Option<f32>,
     pub(crate) seed: Option<u64>,
     pub(crate) repeat_penalty: f32,
     pub(crate) repeat_last_n: usize,

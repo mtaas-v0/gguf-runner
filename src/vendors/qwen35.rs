@@ -125,6 +125,7 @@ mod tests {
             online_attn_fusion: false,
             qwen_chat_template_contains_think: true,
             qwen_chat_template_has_builtin_system: false,
+            qwen_chat_template_uses_empty_think: false,
             capabilities: ModelCapabilities::default(),
             final_logit_softcapping: 0.0,
             rms_norm_eps: 0.0,
