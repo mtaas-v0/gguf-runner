@@ -29,6 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Sampling parameters embedded in the GGUF file under `general.sampling.*`.
 /// These are model-provided defaults; explicit CLI flags take precedence.
+#[allow(dead_code)]
 struct GgufSamplingHints {
     temperature: Option<f32>,
     /// Intentionally unfilled. A small top_k from GGUF hints (e.g. 20 on Bonsai) can
@@ -38,6 +39,7 @@ struct GgufSamplingHints {
     top_p: Option<f32>,
 }
 
+#[allow(dead_code)]
 fn read_gguf_sampling_hints(gguf: &GGUFFile) -> GgufSamplingHints {
     use crate::engine::types::GgufValue;
     let get_f32 = |key: &str| -> Option<f32> {
