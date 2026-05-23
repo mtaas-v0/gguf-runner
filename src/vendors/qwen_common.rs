@@ -141,6 +141,19 @@ pub(super) fn encode_qwen3_messages_with_think_style(
             };
             tokenizer.bpe_encode(role, &mut temp);
             tokens.extend_from_slice(&temp);
+            // For Qwen3-style models that pre-fill an empty think block in the
+            // assistant prefix, past assistant messages must also include that
+            // empty block — otherwise the KV-cached representation of past turns
+            // looks different from what was actually generated, which confuses
+            // the model on subsequent turns.
+            if matches!(message.role, ChatRole::Assistant)
+                && inject_forced_think_prompt
+                && think_mode == ThinkMode::No
+                && !message.content.contains("</think>")
+            {
+                tokenizer.bpe_encode("<think>\n\n</think>\n\n", &mut temp);
+                tokens.extend_from_slice(&temp);
+            }
             tokenizer.bpe_encode(&message.content, &mut temp);
             tokens.extend_from_slice(&temp);
             tokens.push(end);

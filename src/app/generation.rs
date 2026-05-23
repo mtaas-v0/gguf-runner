@@ -32,9 +32,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[allow(dead_code)]
 struct GgufSamplingHints {
     temperature: Option<f32>,
-    /// Intentionally unfilled. A small top_k from GGUF hints (e.g. 20 on Bonsai) can
-    /// exclude the stop token (which ranks ~38th in noisy 1-bit logits) and make loops
-    /// worse, so we only read temperature and top_p.
     top_k: Option<usize>,
     top_p: Option<f32>,
 }
@@ -49,9 +46,17 @@ fn read_gguf_sampling_hints(gguf: &GGUFFile) -> GgufSamplingHints {
             _ => None,
         }
     };
+    let get_usize = |key: &str| -> Option<usize> {
+        match gguf.kv.get(key)? {
+            GgufValue::UInt(n) => Some(*n as usize),
+            GgufValue::Int(n) if *n >= 0 => Some(*n as usize),
+            GgufValue::F32(f) if *f >= 1.0 => Some(*f as usize),
+            _ => None,
+        }
+    };
     GgufSamplingHints {
         temperature: get_f32("general.sampling.temp"),
-        top_k: None,
+        top_k: get_usize("general.sampling.top_k"),
         top_p: get_f32("general.sampling.top_p"),
     }
 }
@@ -2371,10 +2376,17 @@ impl ModelRuntime {
             crate::engine::weights::init_multimodal_weights_from_gguf(&gguf, &config, false)?;
         let vendor_decode_policy = crate::vendors::decode_policy(&config);
 
+        // Embedded usage defaults to greedy decoding (temperature=0). Interactive
+        // assistants need predictable, reproducible output across sessions; stochastic
+        // sampling on noisy 1-bit models produces inconsistent answers even with the
+        // model's own recommended top_k/top_p. Greedy is also seed-independent, so
+        // every call returns the model's highest-probability answer. Callers who want
+        // variability can use the setters after loading.
+        let hints = read_gguf_sampling_hints(&gguf);
         let settings = GenerationSettings {
-            temperature: 0.7,
-            top_k: 0,
-            top_p: 0.9,
+            temperature: 0.0,
+            top_k: hints.top_k.unwrap_or(0),
+            top_p: hints.top_p.unwrap_or(0.9),
             sampling_seed: None,
             repeat_penalty: 1.1,
             repeat_last_n: 64,
@@ -2832,6 +2844,30 @@ impl ModelRuntime {
 
     pub(crate) fn set_debug_mode(&mut self, enabled: bool) {
         self.settings.debug_mode = enabled;
+    }
+
+    pub(crate) fn set_show_tokens(&mut self, enabled: bool) {
+        self.settings.show_tokens = enabled;
+    }
+
+    pub(crate) fn set_temperature(&mut self, temperature: f32) {
+        self.settings.temperature = temperature;
+    }
+
+    pub(crate) fn set_top_k(&mut self, top_k: usize) {
+        self.settings.top_k = top_k;
+    }
+
+    pub(crate) fn set_top_p(&mut self, top_p: f32) {
+        self.settings.top_p = top_p;
+    }
+
+    pub(crate) fn set_repeat_penalty(&mut self, repeat_penalty: f32) {
+        self.settings.repeat_penalty = repeat_penalty;
+    }
+
+    pub(crate) fn set_sampling_seed(&mut self, seed: Option<u64>) {
+        self.settings.sampling_seed = seed;
     }
 
     /// Load (or reload) an embedding encoder and build a RAG index from `source_dir`.
