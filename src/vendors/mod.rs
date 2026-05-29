@@ -490,6 +490,9 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         is_qwen3moe: identity.family == ModelFamily::Qwen3Moe || is_qwen3vlmoe_arch,
         is_qwen3next: identity.family == ModelFamily::Qwen3Next
             || identity.family == ModelFamily::Qwen35,
+        uses_chatml_template: identity.family == ModelFamily::Llama
+            && has_vocab_token(gguf, "<|im_start|>")
+            && has_vocab_token(gguf, "<|im_end|>"),
         online_attn_fusion: false,
         qwen_chat_template_contains_think: chat_template.contains("<think>"),
         qwen_chat_template_has_builtin_system: chat_template.contains("you are qwen"),
@@ -640,7 +643,7 @@ pub(crate) fn encode_chat_prompt(
         )
     } else if config.is_qwen3moe || config.is_qwen3 {
         qwen3::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
-    } else if config.is_qwen2 {
+    } else if config.is_qwen2 || config.uses_chatml_template {
         qwen2::encode_chat_prompt(tokenizer, prompt, system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, prompt, system_prompt)
@@ -664,7 +667,7 @@ pub(crate) fn encode_chat_messages(
         qwen3next::encode_chat_messages(tokenizer, cfg, messages, system_prompt, think_mode)
     } else if cfg.is_qwen3moe || cfg.is_qwen3 {
         qwen3::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
-    } else if cfg.is_qwen2 {
+    } else if cfg.is_qwen2 || cfg.uses_chatml_template {
         qwen2::encode_chat_messages(tokenizer, messages, system_prompt)
     } else {
         llama::encode_chat_messages(tokenizer, messages, system_prompt)
@@ -704,7 +707,7 @@ pub(crate) fn encode_generation_request(
     }
 
     let prompt = join_request_text(&request.parts);
-    let token_ids = if config.is_qwen2 {
+    let token_ids = if config.is_qwen2 || config.uses_chatml_template {
         qwen2::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
@@ -721,7 +724,7 @@ pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
         qwen3next::decode_policy(config)
     } else if config.is_qwen3moe || config.is_qwen3 {
         qwen3::decode_policy()
-    } else if config.is_qwen2 {
+    } else if config.is_qwen2 || config.uses_chatml_template {
         qwen2::decode_policy()
     } else if config.is_gemma3 {
         gemma::decode_policy()
@@ -739,7 +742,7 @@ pub(crate) fn tokenizer_policy(config: &Config) -> VendorTokenizerPolicy {
         qwen3next::tokenizer_policy()
     } else if config.is_qwen3moe {
         qwen3::tokenizer_policy()
-    } else if config.is_qwen2 {
+    } else if config.is_qwen2 || config.uses_chatml_template {
         qwen2::tokenizer_policy()
     } else if config.is_gemma3 {
         gemma::tokenizer_policy()

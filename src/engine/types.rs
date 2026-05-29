@@ -422,6 +422,10 @@ pub(crate) struct Config {
     pub(crate) is_qwen3vl: bool,
     pub(crate) is_qwen3moe: bool,
     pub(crate) is_qwen3next: bool,
+    /// True for llama-arch models that use ChatML tokens (<|im_start|>/<|im_end|>)
+    /// instead of the Llama 3 header tokens. Weight layout and RoPE are llama-style;
+    /// only the chat template encoding and stop tokens differ.
+    pub(crate) uses_chatml_template: bool,
     pub(crate) online_attn_fusion: bool,
     pub(crate) qwen_chat_template_contains_think: bool,
     pub(crate) qwen_chat_template_has_builtin_system: bool,
