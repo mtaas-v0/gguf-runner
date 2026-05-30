@@ -117,6 +117,10 @@ pub(crate) struct PlaceholderSpan {
     pub(crate) token_start: usize,
     pub(crate) token_len: usize,
     pub(crate) media_index: usize,
+    /// When true the entire span (all token_len tokens) is replaced by the image embeddings;
+    /// no begin/end marker tokens are emitted. Used for single-token placeholders like SmolVLM's
+    /// <image> where the model does not expect surrounding marker tokens.
+    pub(crate) replace_marker: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +148,7 @@ pub(crate) enum MultimodalBackend {
     Gemma3,
     Qwen3Vl,
     Qwen35,
+    Idefics3,
 }
 
 impl MultimodalBackend {
@@ -153,6 +158,7 @@ impl MultimodalBackend {
             MultimodalBackend::Gemma3 => "gemma3",
             MultimodalBackend::Qwen3Vl => "qwen3vl",
             MultimodalBackend::Qwen35 => "qwen35",
+            MultimodalBackend::Idefics3 => "idefics3",
         }
     }
 }
@@ -416,6 +422,7 @@ pub(crate) struct Config {
     pub(crate) rope_sections: [usize; 4],
     pub(crate) is_bert_family: bool,
     pub(crate) is_gemma3: bool,
+    pub(crate) is_smolvlm: bool,
     pub(crate) is_qwen2: bool,
     pub(crate) is_qwen3: bool,
     pub(crate) is_qwen35: bool,

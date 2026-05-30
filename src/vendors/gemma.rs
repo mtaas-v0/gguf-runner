@@ -110,6 +110,7 @@ fn append_image_placeholder(
         token_start,
         token_len,
         media_index: image_index,
+        replace_marker: false,
     });
 }
 

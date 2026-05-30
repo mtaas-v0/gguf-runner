@@ -346,6 +346,7 @@ fn encode_qwen3_request_with_think_style(
                         token_start,
                         token_len,
                         media_index: image_index,
+                        replace_marker: false,
                     });
                     image_index += 1;
                 }
@@ -363,6 +364,7 @@ fn encode_qwen3_request_with_think_style(
                         token_start,
                         token_len,
                         media_index: video_index,
+                        replace_marker: false,
                     });
                     video_index += 1;
                 }
@@ -379,6 +381,7 @@ fn encode_qwen3_request_with_think_style(
                         token_start,
                         token_len,
                         media_index: audio_index,
+                        replace_marker: false,
                     });
                     audio_index += 1;
                 }
@@ -440,6 +443,7 @@ fn encode_qwen3_request_with_think_style(
                     token_start,
                     token_len,
                     media_index: image_index,
+                    replace_marker: false,
                 });
                 image_index += 1;
             }
@@ -457,6 +461,7 @@ fn encode_qwen3_request_with_think_style(
                     token_start,
                     token_len,
                     media_index: video_index,
+                    replace_marker: false,
                 });
                 video_index += 1;
             }
@@ -473,6 +478,7 @@ fn encode_qwen3_request_with_think_style(
                     token_start,
                     token_len,
                     media_index: audio_index,
+                    replace_marker: false,
                 });
                 audio_index += 1;
             }

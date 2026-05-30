@@ -1541,6 +1541,7 @@ impl ModelRuntime {
                     && self.has_vocab_token("<|vision_end|>")
                     && self.has_vocab_token("<|image_pad|>")
             }
+            MultimodalBackend::Idefics3 => self.has_vocab_token("<image>"),
             MultimodalBackend::None => false,
         }
     }
@@ -1552,7 +1553,9 @@ impl ModelRuntime {
                     && self.has_vocab_token("<|vision_end|>")
                     && self.has_vocab_token("<|video_pad|>")
             }
-            MultimodalBackend::Gemma3 | MultimodalBackend::None => false,
+            MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 | MultimodalBackend::None => {
+                false
+            }
         }
     }
 
@@ -1561,7 +1564,9 @@ impl ModelRuntime {
             MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
                 self.has_vocab_token("<|audio_pad|>")
             }
-            MultimodalBackend::Gemma3 | MultimodalBackend::None => false,
+            MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 | MultimodalBackend::None => {
+                false
+            }
         }
     }
 
@@ -2006,6 +2011,13 @@ impl ModelRuntime {
                     self.has_vocab_token("<|video_pad|>"),
                     self.has_vocab_token("<|audio_pad|>"),
                 ),
+                MultimodalBackend::Idefics3 => (
+                    false,
+                    false,
+                    self.has_vocab_token("<image>"),
+                    false,
+                    false,
+                ),
                 MultimodalBackend::None => (false, false, false, false, false),
             };
         let has_vision_encoder =
@@ -2139,9 +2151,11 @@ impl ModelRuntime {
                     align_to,
                 );
             }
-            if self.config.capabilities.multimodal_backend == MultimodalBackend::Gemma3 {
-                // Gemma3 SigLIP path follows llama.cpp behavior: direct resize to fixed
-                // square input size (no aspect-preserving fit + crop).
+            if self.config.capabilities.multimodal_backend == MultimodalBackend::Gemma3
+                || self.config.capabilities.multimodal_backend == MultimodalBackend::Idefics3
+            {
+                // SigLIP-derived encoders (Gemma3, SmolVLM/idefics3) use a direct
+                // bilinear stretch to the encoder's fixed square input size.
                 return ImagePreprocessProfile::new_with_mode(
                     base_size,
                     base_size,
@@ -2170,6 +2184,9 @@ impl ModelRuntime {
                 ImageResizeMode::Stretch,
                 1,
             ),
+            MultimodalBackend::Idefics3 => {
+                ImagePreprocessProfile::new(384, 384, fallback_norm)
+            }
             MultimodalBackend::None => {
                 ImagePreprocessProfile::new(448, 448, ImageNormalization::UnitRange)
             }

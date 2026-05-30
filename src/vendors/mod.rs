@@ -11,6 +11,7 @@ mod qwen35;
 mod qwen3next;
 mod qwen3vl;
 mod qwen_common;
+mod smolvlm;
 
 use crate::engine::io::{
     get_gguf_float_from_map, get_gguf_i64_array_from_map, get_gguf_int_from_map,
@@ -91,6 +92,7 @@ enum ModelFamily {
     Qwen3Moe,
     Qwen3Next,
     BertFamily,
+    SmolVlm,
 }
 
 struct ModelIdentity {
@@ -206,6 +208,15 @@ pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Re
             }
             Ok(())
         }
+        MultimodalBackend::Idefics3 => {
+            if arch != "clip" || projector != "idefics3" {
+                return Err(
+                    "unsupported mmproj for this runner: expected clip.projector_type='idefics3'"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
         _ => Err(format!(
             "external vision mmproj is unsupported for backend '{}'",
             cfg.capabilities.multimodal_backend.as_str()
@@ -227,6 +238,7 @@ fn detect_model_capabilities(
         }
         ModelFamily::Qwen3Vl => MultimodalBackend::Qwen3Vl,
         ModelFamily::Qwen35 => MultimodalBackend::Qwen35,
+        ModelFamily::SmolVlm => MultimodalBackend::Idefics3,
         _ => MultimodalBackend::None,
     };
 
@@ -249,6 +261,7 @@ fn detect_model_capabilities(
                 && has_vocab_token(gguf, "<|video_pad|>"),
             has_vocab_token(gguf, "<|audio_pad|>"),
         ),
+        MultimodalBackend::Idefics3 => (has_vocab_token(gguf, "<image>"), false, false),
         MultimodalBackend::None => (false, false, false),
     };
     let has_vision_tensors = has_tensor_with_any_prefix(gguf, VISION_TENSOR_PREFIXES);
@@ -409,6 +422,24 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
         if debug_mode {
             eprintln!("Detected BERT-family architecture '{arch}', using {arch}.* keys");
         }
+    } else if arch == "llama" {
+        // SmolVLM is a llama-arch VLM using the idefics3 projector.
+        // Detect by basename or distinctive vocab tokens (<end_of_utterance>).
+        let basename = get_gguf_string_from_map(&gguf.kv, "general.basename")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let name = get_gguf_string_from_map(&gguf.kv, "general.name")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if basename.starts_with("smolvlm")
+            || name.contains("smolvlm")
+            || has_vocab_token(gguf, "<end_of_utterance>")
+        {
+            identity.family = ModelFamily::SmolVlm;
+            if debug_mode {
+                eprintln!("Detected SmolVLM (idefics3) architecture, using llama.* keys");
+            }
+        }
     }
 
     identity
@@ -481,6 +512,7 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         rope_sections: [0; 4],
         is_bert_family: identity.family == ModelFamily::BertFamily,
         is_gemma3: identity.family == ModelFamily::Gemma,
+        is_smolvlm: identity.family == ModelFamily::SmolVlm,
         is_qwen3: identity.family == ModelFamily::Qwen3Plain,
         is_qwen2: identity.family == ModelFamily::Qwen2
             || identity.family == ModelFamily::Qwen3Plain
@@ -628,6 +660,8 @@ pub(crate) fn encode_chat_prompt(
 ) -> Vec<i32> {
     if config.is_gemma3 {
         gemma::encode_chat_prompt(tokenizer, prompt, system_prompt)
+    } else if config.is_smolvlm {
+        smolvlm::encode_chat_prompt(tokenizer, prompt, system_prompt)
     } else if config.is_qwen35 {
         qwen35::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
     } else if config.is_qwen3vl {
@@ -659,6 +693,8 @@ pub(crate) fn encode_chat_messages(
 ) -> Vec<i32> {
     if cfg.is_gemma3 {
         gemma::encode_chat_messages(tokenizer, messages, system_prompt)
+    } else if cfg.is_smolvlm {
+        smolvlm::encode_chat_messages(tokenizer, messages, system_prompt)
     } else if cfg.is_qwen35 {
         qwen35::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
     } else if cfg.is_qwen3vl {
@@ -692,6 +728,9 @@ pub(crate) fn encode_generation_request(
 ) -> EncodedPrompt {
     if config.is_gemma3 {
         return gemma::encode_generation_request(tokenizer, request);
+    }
+    if config.is_smolvlm {
+        return smolvlm::encode_generation_request(tokenizer, request);
     }
     if config.is_qwen35 {
         return qwen35::encode_generation_request(tokenizer, request, think_mode);
@@ -728,6 +767,8 @@ pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
         qwen2::decode_policy()
     } else if config.is_gemma3 {
         gemma::decode_policy()
+    } else if config.is_smolvlm {
+        smolvlm::decode_policy()
     } else {
         llama::decode_policy()
     }
@@ -746,6 +787,8 @@ pub(crate) fn tokenizer_policy(config: &Config) -> VendorTokenizerPolicy {
         qwen2::tokenizer_policy()
     } else if config.is_gemma3 {
         gemma::tokenizer_policy()
+    } else if config.is_smolvlm {
+        smolvlm::tokenizer_policy()
     } else {
         llama::tokenizer_policy()
     }
@@ -764,6 +807,8 @@ pub(crate) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
         qwen2::multimodal_policy()
     } else if config.is_gemma3 {
         gemma::multimodal_policy()
+    } else if config.is_smolvlm {
+        smolvlm::multimodal_policy()
     } else {
         llama::multimodal_policy()
     }
@@ -780,6 +825,8 @@ pub(crate) fn runtime_debug_policy(config: &Config) -> VendorRuntimeDebugPolicy 
         qwen_common::runtime_debug_policy()
     } else if config.is_gemma3 {
         gemma::runtime_debug_policy()
+    } else if config.is_smolvlm {
+        smolvlm::runtime_debug_policy()
     } else {
         llama::runtime_debug_policy()
     }
