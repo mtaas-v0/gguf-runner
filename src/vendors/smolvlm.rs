@@ -49,8 +49,7 @@ pub(super) fn multimodal_policy() -> VendorMultimodalPolicy {
         image_prompt_suffix: "",
         detail_crop: Default::default(),
         mmproj_filename_score_hints: SMOLVLM_MMPROJ_SCORE_HINTS,
-        missing_sidecar_hint:
-            " hint: SmolVLM image inputs require a matching mmproj sidecar (mmproj-*.gguf) from the same checkpoint.",
+        missing_sidecar_hint: " hint: SmolVLM image inputs require a matching mmproj sidecar (mmproj-*.gguf) from the same checkpoint.",
     }
 }
 

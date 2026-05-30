@@ -147,7 +147,9 @@ impl EmbeddedRuntime {
         });
 
         self.inner.set_runtime_event_callback(Some(cb));
-        let result = self.inner.generate_chat_messages_for_repl(&messages, system_prompt);
+        let result = self
+            .inner
+            .generate_chat_messages_for_repl(&messages, system_prompt);
         // Dropping the stored Arc closes the Sender, so `rx` iteration will end.
         self.inner.set_runtime_event_callback(None);
 
@@ -316,7 +318,10 @@ fn extract_tool_call(text: &str) -> Option<ToolCallRequest> {
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-        return Some(ToolCallRequest { name: name.to_string(), arguments });
+        return Some(ToolCallRequest {
+            name: name.to_string(),
+            arguments,
+        });
     }
 
     // 2. Qwen3.5 native XML
@@ -361,10 +366,14 @@ fn parse_xml_function_call(body: &str) -> Option<ToolCallRequest> {
     let mut remaining = fn_body;
     while let Some(p_start) = remaining.find(param_open) {
         let after = &remaining[p_start + param_open.len()..];
-        let Some(key_end) = after.find('>') else { break };
+        let Some(key_end) = after.find('>') else {
+            break;
+        };
         let key = after[..key_end].trim().to_string();
         let value_part = &after[key_end + 1..];
-        let Some(value_end) = value_part.find(param_close) else { break };
+        let Some(value_end) = value_part.find(param_close) else {
+            break;
+        };
         let raw_value = value_part[..value_end].trim();
         // Try to parse as JSON (number, bool, object, array); otherwise treat as string.
         let value = serde_json::from_str::<serde_json::Value>(raw_value)
@@ -450,11 +459,20 @@ fn build_messages(history: &[(String, String)], input: &str) -> Vec<ChatMessage>
         .iter()
         .flat_map(|(user, assistant)| {
             [
-                ChatMessage { role: ChatRole::User, content: user.clone() },
-                ChatMessage { role: ChatRole::Assistant, content: assistant.clone() },
+                ChatMessage {
+                    role: ChatRole::User,
+                    content: user.clone(),
+                },
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: assistant.clone(),
+                },
             ]
         })
         .collect();
-    messages.push(ChatMessage { role: ChatRole::User, content: input.to_string() });
+    messages.push(ChatMessage {
+        role: ChatRole::User,
+        content: input.to_string(),
+    });
     messages
 }

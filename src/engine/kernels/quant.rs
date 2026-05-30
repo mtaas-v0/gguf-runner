@@ -18,9 +18,9 @@ use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 use crate::engine::types::{
     GGML_TYPE_BF16, GGML_TYPE_BIN1_40, GGML_TYPE_BIN1_41, GGML_TYPE_F16, GGML_TYPE_F32,
     GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
-    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-    GGML_TYPE_Q8_0, GgmlType, KVALUES_IQ4NL, QK_BIN1, QK_K, QK4_0, QK4_1, QK4_NL, QK5_0,
-    QK5_1, QK8_0, QuantizedTensor, ensure_model_range,
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GgmlType, KVALUES_IQ4NL, QK_BIN1, QK_K, QK4_0, QK4_1, QK4_NL, QK5_0, QK5_1, QK8_0,
+    QuantizedTensor, ensure_model_range,
 };
 
 /// type_size for BIN1 (types 40/41): f16 scale (2 bytes) + 16 bytes packed 1-bit values

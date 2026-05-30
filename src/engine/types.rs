@@ -301,7 +301,12 @@ impl MappedFile {
         let mut backing = bytes.into_boxed_slice();
         let ptr = backing.as_mut_ptr();
         let len = backing.len();
-        Ok(Self { ptr, len, is_static: false, backing })
+        Ok(Self {
+            ptr,
+            len,
+            is_static: false,
+            backing,
+        })
     }
 
     /// Wrap a static byte slice (e.g. from `include_bytes!`) without copying.
@@ -309,7 +314,10 @@ impl MappedFile {
     #[cfg(unix)]
     pub(crate) fn from_static(data: &'static [u8]) -> io::Result<Self> {
         if data.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty model data"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty model data",
+            ));
         }
         Ok(Self {
             ptr: data.as_ptr() as *mut u8,
@@ -321,7 +329,10 @@ impl MappedFile {
     #[cfg(not(unix))]
     pub(crate) fn from_static(data: &'static [u8]) -> io::Result<Self> {
         if data.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "empty model data"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty model data",
+            ));
         }
         Ok(Self {
             ptr: data.as_ptr() as *mut u8,

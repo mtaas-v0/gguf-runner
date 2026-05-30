@@ -1,7 +1,9 @@
 use std::fs;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "./Qwen3.5-2B-Q4_K_M.gguf".to_string());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "./Qwen3.5-2B-Q4_K_M.gguf".to_string());
     let data = fs::read(&path).expect("model file");
     let data: &'static [u8] = Box::leak(data.into_boxed_slice());
     eprintln!("loaded model: {path}");

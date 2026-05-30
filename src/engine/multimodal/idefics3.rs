@@ -24,8 +24,7 @@ fn load_tensor_float(
     name: &str,
     expected_elements: Option<usize>,
 ) -> Result<Vec<f32>, String> {
-    let tensor =
-        find_gguf_tensor(gguf, name).ok_or_else(|| format!("tensor not found: {name}"))?;
+    let tensor = find_gguf_tensor(gguf, name).ok_or_else(|| format!("tensor not found: {name}"))?;
     let n_elements = tensor_n_elements(tensor);
     if let Some(expected) = expected_elements
         && n_elements != expected
@@ -75,8 +74,7 @@ fn load_tensor_quantized(
     rows: usize,
     cols: usize,
 ) -> Result<QuantizedTensor, String> {
-    let tensor =
-        find_gguf_tensor(gguf, name).ok_or_else(|| format!("tensor not found: {name}"))?;
+    let tensor = find_gguf_tensor(gguf, name).ok_or_else(|| format!("tensor not found: {name}"))?;
     let n_elements = tensor_n_elements(tensor);
     let expected = rows
         .checked_mul(cols)
@@ -191,20 +189,15 @@ impl Idefics3VisionEncoder {
     }
 
     pub(crate) fn new(gguf: GGUFFile, target_dim: usize) -> Result<Self, String> {
-        let dim =
-            get_gguf_int_from_map(&gguf.kv, "clip.vision.embedding_length", 0) as usize;
+        let dim = get_gguf_int_from_map(&gguf.kv, "clip.vision.embedding_length", 0) as usize;
         let head_count =
             get_gguf_int_from_map(&gguf.kv, "clip.vision.attention.head_count", 0) as usize;
-        let ff_dim =
-            get_gguf_int_from_map(&gguf.kv, "clip.vision.feed_forward_length", 0) as usize;
-        let n_layers =
-            get_gguf_int_from_map(&gguf.kv, "clip.vision.block_count", 0) as usize;
+        let ff_dim = get_gguf_int_from_map(&gguf.kv, "clip.vision.feed_forward_length", 0) as usize;
+        let n_layers = get_gguf_int_from_map(&gguf.kv, "clip.vision.block_count", 0) as usize;
         let eps =
             get_gguf_float_from_map(&gguf.kv, "clip.vision.attention.layer_norm_epsilon", 1e-6);
-        let patch_size =
-            get_gguf_int_from_map(&gguf.kv, "clip.vision.patch_size", 16) as usize;
-        let image_size =
-            get_gguf_int_from_map(&gguf.kv, "clip.vision.image_size", 512) as usize;
+        let patch_size = get_gguf_int_from_map(&gguf.kv, "clip.vision.patch_size", 16) as usize;
+        let image_size = get_gguf_int_from_map(&gguf.kv, "clip.vision.image_size", 512) as usize;
         let scale_factor =
             get_gguf_int_from_map(&gguf.kv, "clip.vision.projector.scale_factor", 4) as usize;
         let image_mean = Self::parse_rgb_triplet(
@@ -257,11 +250,8 @@ impl Idefics3VisionEncoder {
         let patch_embd_w =
             load_tensor_float(&gguf, "v.patch_embd.weight", Some(patch_kernel_elems))?;
         let patch_embd_b = load_tensor_float(&gguf, "v.patch_embd.bias", Some(dim))?;
-        let position_embd = load_tensor_float(
-            &gguf,
-            "v.position_embd.weight",
-            Some(base_pos_tokens * dim),
-        )?;
+        let position_embd =
+            load_tensor_float(&gguf, "v.position_embd.weight", Some(base_pos_tokens * dim))?;
 
         // Projection FC: maps dim*scale_factor^2 → target_dim.
         // GGUF stores it as ne[0]=dim*sf^2 (input, fast), ne[1]=target_dim (output, slow).
@@ -287,7 +277,8 @@ impl Idefics3VisionEncoder {
             ));
         }
         // rows=ne[1]=target_dim, cols=ne[0]=expanded_dim
-        let proj_fc_w = load_tensor_quantized(&gguf, "mm.model.fc.weight", target_dim, expanded_dim)?;
+        let proj_fc_w =
+            load_tensor_quantized(&gguf, "mm.model.fc.weight", target_dim, expanded_dim)?;
 
         let post_ln_w = load_tensor_float(&gguf, "v.post_ln.weight", Some(dim))?;
         let post_ln_b = load_tensor_float(&gguf, "v.post_ln.bias", Some(dim))?;
@@ -312,19 +303,10 @@ impl Idefics3VisionEncoder {
                     dim,
                     dim,
                 )?,
-                attn_out_b: load_tensor_float(
-                    &gguf,
-                    &format!("{p}.attn_out.bias"),
-                    Some(dim),
-                )?,
+                attn_out_b: load_tensor_float(&gguf, &format!("{p}.attn_out.bias"), Some(dim))?,
                 // In this GGUF convention ffn_down is the expansion (dim→ff_dim)
                 // and ffn_up is the contraction (ff_dim→dim).
-                ffn_up_w: load_tensor_quantized(
-                    &gguf,
-                    &format!("{p}.ffn_up.weight"),
-                    dim,
-                    ff_dim,
-                )?,
+                ffn_up_w: load_tensor_quantized(&gguf, &format!("{p}.ffn_up.weight"), dim, ff_dim)?,
                 ffn_up_b: load_tensor_float(&gguf, &format!("{p}.ffn_up.bias"), Some(dim))?,
                 ffn_down_w: load_tensor_quantized(
                     &gguf,
@@ -332,11 +314,7 @@ impl Idefics3VisionEncoder {
                     ff_dim,
                     dim,
                 )?,
-                ffn_down_b: load_tensor_float(
-                    &gguf,
-                    &format!("{p}.ffn_down.bias"),
-                    Some(ff_dim),
-                )?,
+                ffn_down_b: load_tensor_float(&gguf, &format!("{p}.ffn_down.bias"), Some(ff_dim))?,
             });
         }
 
@@ -590,22 +568,21 @@ impl Idefics3VisionEncoder {
             for t in 0..n_tokens {
                 let dst = &mut attn_out[t * dim..(t + 1) * dim];
                 for h in 0..self.head_count {
-                    let src = &attn_head_major
-                        [h * head_token_stride + t * head_dim..h * head_token_stride + (t + 1) * head_dim];
+                    let src = &attn_head_major[h * head_token_stride + t * head_dim
+                        ..h * head_token_stride + (t + 1) * head_dim];
                     let off = h * head_dim;
                     dst[off..off + head_dim].copy_from_slice(src);
                 }
             }
 
-            proj_out
-                .par_chunks_mut(dim)
-                .enumerate()
-                .try_for_each(|(t, dst)| -> Result<(), String> {
+            proj_out.par_chunks_mut(dim).enumerate().try_for_each(
+                |(t, dst)| -> Result<(), String> {
                     let src = &attn_out[t * dim..(t + 1) * dim];
                     matmul_quantized(dst, src, &layer.attn_out_w, mapped)?;
                     Self::add_bias(dst, &layer.attn_out_b);
                     Ok(())
-                })?;
+                },
+            )?;
             for i in 0..tokens.len() {
                 tokens[i] += proj_out[i];
             }
@@ -615,31 +592,28 @@ impl Idefics3VisionEncoder {
                 layer_norm_affine(dst, src, &layer.ln2_w, &layer.ln2_b, eps);
             });
 
-            tokens
-                .par_chunks_mut(dim)
-                .enumerate()
-                .try_for_each_init(
-                    // intermediate=ff_dim (expand stage), output=dim (contract stage)
-                    || (vec![0.0f32; ff_dim], vec![0.0f32; dim]),
-                    |(intermediate, output), (t, dst)| -> Result<(), String> {
-                        let src = &x_norm[t * dim..(t + 1) * dim];
-                        // Expand: dim → ff_dim (ffn_down in this GGUF's naming)
-                        matmul_quantized(intermediate, src, &layer.ffn_down_w, mapped)?;
-                        Self::add_bias(intermediate, &layer.ffn_down_b);
-                        for v in intermediate.iter_mut() {
-                            *v = if use_gelu {
-                                Self::gelu(*v)
-                            } else {
-                                Self::quick_gelu(*v)
-                            };
-                        }
-                        // Contract: ff_dim → dim (ffn_up in this GGUF's naming)
-                        matmul_quantized(output, intermediate, &layer.ffn_up_w, mapped)?;
-                        Self::add_bias(output, &layer.ffn_up_b);
-                        axpy_inplace(dst, 1.0, output);
-                        Ok(())
-                    },
-                )?;
+            tokens.par_chunks_mut(dim).enumerate().try_for_each_init(
+                // intermediate=ff_dim (expand stage), output=dim (contract stage)
+                || (vec![0.0f32; ff_dim], vec![0.0f32; dim]),
+                |(intermediate, output), (t, dst)| -> Result<(), String> {
+                    let src = &x_norm[t * dim..(t + 1) * dim];
+                    // Expand: dim → ff_dim (ffn_down in this GGUF's naming)
+                    matmul_quantized(intermediate, src, &layer.ffn_down_w, mapped)?;
+                    Self::add_bias(intermediate, &layer.ffn_down_b);
+                    for v in intermediate.iter_mut() {
+                        *v = if use_gelu {
+                            Self::gelu(*v)
+                        } else {
+                            Self::quick_gelu(*v)
+                        };
+                    }
+                    // Contract: ff_dim → dim (ffn_up in this GGUF's naming)
+                    matmul_quantized(output, intermediate, &layer.ffn_up_w, mapped)?;
+                    Self::add_bias(output, &layer.ffn_up_b);
+                    axpy_inplace(dst, 1.0, output);
+                    Ok(())
+                },
+            )?;
         }
         Ok(())
     }
@@ -647,12 +621,7 @@ impl Idefics3VisionEncoder {
     // Idefics3 pixel shuffle: group scale_factor×scale_factor patches and concatenate.
     // Input:  [ph×pw, dim]  (1024 patches × 768 for 512-image with patch_size=16)
     // Output: [(ph/sf)×(pw/sf), dim*sf*sf]  (64 tokens × 12288)
-    fn pixel_shuffle(
-        &self,
-        tokens: &[f32],
-        ph: usize,
-        pw: usize,
-    ) -> Result<Vec<f32>, String> {
+    fn pixel_shuffle(&self, tokens: &[f32], ph: usize, pw: usize) -> Result<Vec<f32>, String> {
         let sf = self.scale_factor;
         if !ph.is_multiple_of(sf) || !pw.is_multiple_of(sf) {
             return Err(format!(
@@ -730,7 +699,9 @@ impl Idefics3VisionEncoder {
             result_tokens.push(projected.clone());
         }
 
-        Ok(ImageEmbeddingSequence { tokens: result_tokens })
+        Ok(ImageEmbeddingSequence {
+            tokens: result_tokens,
+        })
     }
 
     pub(crate) fn encode_images(

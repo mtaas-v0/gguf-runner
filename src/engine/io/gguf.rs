@@ -223,14 +223,12 @@ fn parse_gguf_inner<R: Read + Seek>(
 
     for _ in 0..n_kv {
         let key = read_gguf_string(reader).map_err(|e| format!("failed to read key: {e}"))?;
-        let value_type =
-            read_u32(reader).map_err(|e| format!("failed to read value type: {e}"))?;
+        let value_type = read_u32(reader).map_err(|e| format!("failed to read value type: {e}"))?;
 
         if value_type == GGUF_TYPE_ARRAY {
             let arr_type =
                 read_u32(reader).map_err(|e| format!("failed to read array type: {e}"))?;
-            let arr_len =
-                read_u64(reader).map_err(|e| format!("failed to read array len: {e}"))?;
+            let arr_len = read_u64(reader).map_err(|e| format!("failed to read array len: {e}"))?;
 
             if key == "tokenizer.ggml.tokens" && arr_type == GGUF_TYPE_STRING {
                 vocab_tokens.reserve(arr_len as usize);
@@ -284,10 +282,9 @@ fn parse_gguf_inner<R: Read + Seek>(
             ) {
                 let mut values = Vec::with_capacity(arr_len as usize);
                 for _ in 0..arr_len {
-                    let value =
-                        read_gguf_integer_array_value(reader, arr_type).map_err(|e| {
-                            format!("failed to read integer array value for key {key}: {e}")
-                        })?;
+                    let value = read_gguf_integer_array_value(reader, arr_type).map_err(|e| {
+                        format!("failed to read integer array value for key {key}: {e}")
+                    })?;
                     values.push(value);
                 }
                 kv.insert(key, GgufValue::I64Array(values));
@@ -322,8 +319,7 @@ fn parse_gguf_inner<R: Read + Seek>(
         let ttype = GgmlType::from_u32(
             read_u32(reader).map_err(|e| format!("failed reading tensor type: {e}"))?,
         );
-        let offset =
-            read_u64(reader).map_err(|e| format!("failed reading tensor offset: {e}"))?;
+        let offset = read_u64(reader).map_err(|e| format!("failed reading tensor offset: {e}"))?;
 
         tensors.push(Gguftensor {
             name,
@@ -380,7 +376,10 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
 }
 
 /// Parse a GGUF model from a static byte slice (e.g. embedded via `include_bytes!`).
-pub(crate) fn parse_gguf_from_bytes(data: &'static [u8], debug_mode: bool) -> Result<GGUFFile, String> {
+pub(crate) fn parse_gguf_from_bytes(
+    data: &'static [u8],
+    debug_mode: bool,
+) -> Result<GGUFFile, String> {
     let mapped = MappedFile::from_static(data).map_err(|e| format!("static map failed: {e}"))?;
     let mut cursor = std::io::Cursor::new(data);
     parse_gguf_inner(&mut cursor, debug_mode, mapped)

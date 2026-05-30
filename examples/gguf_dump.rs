@@ -8,8 +8,8 @@ use engine::io::parse_gguf_file;
 use engine::types::{
     GGML_TYPE_BF16, GGML_TYPE_BIN1_40, GGML_TYPE_BIN1_41, GGML_TYPE_F16, GGML_TYPE_F32,
     GGML_TYPE_IQ4_NL, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
-    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-    GGML_TYPE_Q8_0, GGUFFile, GgmlType, GgufValue,
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGUFFile, GgmlType, GgufValue,
 };
 
 struct InspectOptions {

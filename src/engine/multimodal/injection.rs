@@ -15,8 +15,14 @@ fn validate_image_spans(encoded: &EncodedPrompt) -> Result<(), String> {
         if span.token_len < min_len {
             return Err(format!(
                 "image placeholder span[{}] is too short: token_len={} (expected at least {} for {})",
-                span.media_index, span.token_len, min_len,
-                if span.replace_marker { "replace-marker span" } else { "image begin/end markers" }
+                span.media_index,
+                span.token_len,
+                min_len,
+                if span.replace_marker {
+                    "replace-marker span"
+                } else {
+                    "image begin/end markers"
+                }
             ));
         }
         if span.token_start < prev_end {
@@ -87,7 +93,10 @@ pub(crate) fn expand_prompt_with_image_embeddings(
             if emb.len() != expected_embedding_dim {
                 return Err(format!(
                     "image embedding dim mismatch for image {} token {}: got {}, expected {}",
-                    image_idx, tok_idx, emb.len(), expected_embedding_dim
+                    image_idx,
+                    tok_idx,
+                    emb.len(),
+                    expected_embedding_dim
                 ));
             }
         }

@@ -130,10 +130,7 @@ fn repeated_inline_phrase(output: &str) -> Option<String> {
             if &bytes[i..i + phrase_len] == suffix {
                 count += 1;
                 if count >= MIN_REPS {
-                    return Some(
-                        String::from_utf8_lossy(suffix)
-                            .replace('\n', "\\n"),
-                    );
+                    return Some(String::from_utf8_lossy(suffix).replace('\n', "\\n"));
                 }
                 i += phrase_len; // non-overlapping: skip past this occurrence
             } else {
@@ -2011,13 +2008,9 @@ impl ModelRuntime {
                     self.has_vocab_token("<|video_pad|>"),
                     self.has_vocab_token("<|audio_pad|>"),
                 ),
-                MultimodalBackend::Idefics3 => (
-                    false,
-                    false,
-                    self.has_vocab_token("<image>"),
-                    false,
-                    false,
-                ),
+                MultimodalBackend::Idefics3 => {
+                    (false, false, self.has_vocab_token("<image>"), false, false)
+                }
                 MultimodalBackend::None => (false, false, false, false, false),
             };
         let has_vision_encoder =
@@ -2184,9 +2177,7 @@ impl ModelRuntime {
                 ImageResizeMode::Stretch,
                 1,
             ),
-            MultimodalBackend::Idefics3 => {
-                ImagePreprocessProfile::new(384, 384, fallback_norm)
-            }
+            MultimodalBackend::Idefics3 => ImagePreprocessProfile::new(384, 384, fallback_norm),
             MultimodalBackend::None => {
                 ImagePreprocessProfile::new(448, 448, ImageNormalization::UnitRange)
             }
@@ -2449,9 +2440,15 @@ impl ModelRuntime {
             eprintln!("Loading GGUF model: {checkpoint}");
             eprintln!(
                 "Sampling (CLI): temperature={}, top_k={}, top_p={}, repeat_penalty={}, repeat_last_n={}, seed={}",
-                cli.temperature.map(|v| v.to_string()).unwrap_or_else(|| "model/default".to_string()),
-                cli.top_k.map(|v| v.to_string()).unwrap_or_else(|| "model/default".to_string()),
-                cli.top_p.map(|v| v.to_string()).unwrap_or_else(|| "model/default".to_string()),
+                cli.temperature
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "model/default".to_string()),
+                cli.top_k
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "model/default".to_string()),
+                cli.top_p
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "model/default".to_string()),
                 cli.repeat_penalty,
                 cli.repeat_last_n,
                 cli.seed
@@ -2615,7 +2612,9 @@ impl ModelRuntime {
                 "Sampling{source}: temperature={temperature}, top_k={top_k}, top_p={top_p}, repeat_penalty={}, repeat_last_n={}, seed={}",
                 cli.repeat_penalty,
                 cli.repeat_last_n,
-                cli.seed.map(|s| s.to_string()).unwrap_or_else(|| "time".to_string())
+                cli.seed
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "time".to_string())
             );
         }
         let settings = GenerationSettings {
@@ -3098,14 +3097,23 @@ impl ModelRuntime {
                     ),
                 );
                 // Dump full prompt token list so we can verify the chat template.
-                let prompt_preview: Vec<String> = encoded_prompt.token_ids.iter().map(|&id| {
-                    let text = self.tokenizer.decode_token(id)
-                        .unwrap_or_else(|| format!("?{id}"))
-                        .replace('\n', "\\n")
-                        .replace('\r', "\\r");
-                    format!("{id}(\"{text}\")")
-                }).collect();
-                emit_debug_line(event_callback, format!("Prompt tokens: [{}]", prompt_preview.join(", ")));
+                let prompt_preview: Vec<String> = encoded_prompt
+                    .token_ids
+                    .iter()
+                    .map(|&id| {
+                        let text = self
+                            .tokenizer
+                            .decode_token(id)
+                            .unwrap_or_else(|| format!("?{id}"))
+                            .replace('\n', "\\n")
+                            .replace('\r', "\\r");
+                        format!("{id}(\"{text}\")")
+                    })
+                    .collect();
+                emit_debug_line(
+                    event_callback,
+                    format!("Prompt tokens: [{}]", prompt_preview.join(", ")),
+                );
             }
 
             let mut preprocess_summary: Vec<String> = Vec::new();
@@ -3633,7 +3641,9 @@ impl ModelRuntime {
                         } else {
                             f32::NEG_INFINITY
                         };
-                        let rank = ranked.iter().position(|(id, _)| *id == *sid as usize)
+                        let rank = ranked
+                            .iter()
+                            .position(|(id, _)| *id == *sid as usize)
                             .map(|r| r + 1)
                             .unwrap_or(0);
                         format!("{slit}(id={sid},rank={rank},logit={logit:.2})")
