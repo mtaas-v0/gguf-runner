@@ -11,10 +11,18 @@ pub(crate) struct ImageEmbeddingSequence {
 fn validate_image_spans(encoded: &EncodedPrompt) -> Result<(), String> {
     let mut prev_end = 0usize;
     for span in &encoded.image_spans {
-        if span.token_len < 2 {
+        let min_len = if span.replace_marker { 1 } else { 2 };
+        if span.token_len < min_len {
             return Err(format!(
-                "image placeholder span[{}] is too short: token_len={} (expected at least 2 for image begin/end markers)",
-                span.media_index, span.token_len
+                "image placeholder span[{}] is too short: token_len={} (expected at least {} for {})",
+                span.media_index,
+                span.token_len,
+                min_len,
+                if span.replace_marker {
+                    "replace-marker span"
+                } else {
+                    "image begin/end markers"
+                }
             ));
         }
         if span.token_start < prev_end {
@@ -74,9 +82,6 @@ pub(crate) fn expand_prompt_with_image_embeddings(
 
         out_tokens.extend_from_slice(&encoded.token_ids[src_cursor..span.token_start]);
 
-        let (image_begin, image_placeholder, image_end) = image_marker_tokens(encoded, span);
-        out_tokens.push(image_begin);
-
         let seq = &image_embeddings[image_idx];
         if seq.tokens.is_empty() {
             return Err(format!(
@@ -94,12 +99,26 @@ pub(crate) fn expand_prompt_with_image_embeddings(
                     expected_embedding_dim
                 ));
             }
-            let dst_pos = out_tokens.len();
-            out_tokens.push(image_placeholder);
-            injected_embeddings.insert(dst_pos, emb.clone());
         }
 
-        out_tokens.push(image_end);
+        if span.replace_marker {
+            // Replace the single placeholder token with all image embedding slots.
+            let placeholder = encoded.token_ids[span.token_start];
+            for emb in &seq.tokens {
+                let dst_pos = out_tokens.len();
+                out_tokens.push(placeholder);
+                injected_embeddings.insert(dst_pos, emb.clone());
+            }
+        } else {
+            let (image_begin, image_placeholder, image_end) = image_marker_tokens(encoded, span);
+            out_tokens.push(image_begin);
+            for emb in &seq.tokens {
+                let dst_pos = out_tokens.len();
+                out_tokens.push(image_placeholder);
+                injected_embeddings.insert(dst_pos, emb.clone());
+            }
+            out_tokens.push(image_end);
+        }
         src_cursor = span.token_start + span.token_len;
     }
 

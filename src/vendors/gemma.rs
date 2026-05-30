@@ -1,3 +1,8 @@
+// Items in this module are used by the binary crate. When the library crate is linted
+// in isolation (cargo clippy without --bin) they appear unused because the lib only
+// exports EmbeddedRuntime and does not re-export binary-only code.
+#![allow(dead_code)]
+
 use super::{
     ChatMessage, ChatRole, MmprojFilenameScoreHint, VendorDecodePolicy, VendorMultimodalPolicy,
     VendorRuntimeDebugPolicy,
@@ -105,6 +110,7 @@ fn append_image_placeholder(
         token_start,
         token_len,
         media_index: image_index,
+        replace_marker: false,
     });
 }
 

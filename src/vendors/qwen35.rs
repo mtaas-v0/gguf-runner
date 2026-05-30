@@ -1,3 +1,8 @@
+// Items in this module are used by the binary crate. When the library crate is linted
+// in isolation (cargo clippy without --bin) they appear unused because the lib only
+// exports EmbeddedRuntime and does not re-export binary-only code.
+#![allow(dead_code)]
+
 use super::{
     ChatMessage, VendorDecodePolicy, VendorDetailCropPolicy, VendorMultimodalPolicy,
     VendorRuntimeDebugPolicy, VendorTokenizerPolicy, qwen_common,
@@ -122,9 +127,13 @@ mod tests {
             is_qwen3vl: false,
             is_qwen3moe: false,
             is_qwen3next: false,
+            is_qwen3: false,
+            is_smolvlm: false,
+            uses_chatml_template: false,
             online_attn_fusion: false,
             qwen_chat_template_contains_think: true,
             qwen_chat_template_has_builtin_system: false,
+            qwen_chat_template_uses_empty_think: false,
             capabilities: ModelCapabilities::default(),
             final_logit_softcapping: 0.0,
             rms_norm_eps: 0.0,

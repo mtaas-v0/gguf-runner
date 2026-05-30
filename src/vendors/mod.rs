@@ -1,3 +1,8 @@
+// Items in this module are used by the binary crate. When the library crate is linted
+// in isolation (cargo clippy without --bin) they appear unused because the lib only
+// exports EmbeddedRuntime and does not re-export binary-only code.
+#![allow(dead_code)]
+
 mod gemma;
 mod llama;
 mod qwen2;
@@ -6,6 +11,7 @@ mod qwen35;
 mod qwen3next;
 mod qwen3vl;
 mod qwen_common;
+mod smolvlm;
 
 use crate::engine::io::{
     get_gguf_float_from_map, get_gguf_i64_array_from_map, get_gguf_int_from_map,
@@ -80,11 +86,13 @@ enum ModelFamily {
     Llama,
     Gemma,
     Qwen2,
+    Qwen3Plain,
     Qwen35,
     Qwen3Vl,
     Qwen3Moe,
     Qwen3Next,
     BertFamily,
+    SmolVlm,
 }
 
 struct ModelIdentity {
@@ -200,6 +208,15 @@ pub(crate) fn validate_mmproj_for_backend(cfg: &Config, mmproj: &GGUFFile) -> Re
             }
             Ok(())
         }
+        MultimodalBackend::Idefics3 => {
+            if arch != "clip" || projector != "idefics3" {
+                return Err(
+                    "unsupported mmproj for this runner: expected clip.projector_type='idefics3'"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
         _ => Err(format!(
             "external vision mmproj is unsupported for backend '{}'",
             cfg.capabilities.multimodal_backend.as_str()
@@ -221,6 +238,7 @@ fn detect_model_capabilities(
         }
         ModelFamily::Qwen3Vl => MultimodalBackend::Qwen3Vl,
         ModelFamily::Qwen35 => MultimodalBackend::Qwen35,
+        ModelFamily::SmolVlm => MultimodalBackend::Idefics3,
         _ => MultimodalBackend::None,
     };
 
@@ -243,6 +261,7 @@ fn detect_model_capabilities(
                 && has_vocab_token(gguf, "<|video_pad|>"),
             has_vocab_token(gguf, "<|audio_pad|>"),
         ),
+        MultimodalBackend::Idefics3 => (has_vocab_token(gguf, "<image>"), false, false),
         MultimodalBackend::None => (false, false, false),
     };
     let has_vision_tensors = has_tensor_with_any_prefix(gguf, VISION_TENSOR_PREFIXES);
@@ -362,6 +381,15 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
                 identity.key_prefix
             );
         }
+    } else if arch == "qwen3" {
+        // Plain qwen3 (dense, no MoE/SSM/VL suffix).
+        // Uses the Qwen3 chat template (with think-mode framing) but the same
+        // transformer weights layout as Qwen2.
+        identity.family = ModelFamily::Qwen3Plain;
+        identity.key_prefix = "qwen3".to_string();
+        if debug_mode {
+            eprintln!("Detected Qwen3 architecture, using qwen3.* keys");
+        }
     } else if arch.starts_with("qwen") || arch == "qwen2" {
         identity.family = ModelFamily::Qwen2;
         identity.key_prefix = arch.to_string();
@@ -393,6 +421,24 @@ fn detect_model_identity(gguf: &GGUFFile, debug_mode: bool) -> ModelIdentity {
         identity.key_prefix = arch.to_string();
         if debug_mode {
             eprintln!("Detected BERT-family architecture '{arch}', using {arch}.* keys");
+        }
+    } else if arch == "llama" {
+        // SmolVLM is a llama-arch VLM using the idefics3 projector.
+        // Detect by basename or distinctive vocab tokens (<end_of_utterance>).
+        let basename = get_gguf_string_from_map(&gguf.kv, "general.basename")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let name = get_gguf_string_from_map(&gguf.kv, "general.name")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if basename.starts_with("smolvlm")
+            || name.contains("smolvlm")
+            || has_vocab_token(gguf, "<end_of_utterance>")
+        {
+            identity.family = ModelFamily::SmolVlm;
+            if debug_mode {
+                eprintln!("Detected SmolVLM (idefics3) architecture, using llama.* keys");
+            }
         }
     }
 
@@ -466,15 +512,27 @@ pub(crate) fn build_config_from_gguf(gguf: &GGUFFile, debug_mode: bool) -> Resul
         rope_sections: [0; 4],
         is_bert_family: identity.family == ModelFamily::BertFamily,
         is_gemma3: identity.family == ModelFamily::Gemma,
-        is_qwen2: identity.family == ModelFamily::Qwen2 || identity.family == ModelFamily::Qwen35,
+        is_smolvlm: identity.family == ModelFamily::SmolVlm,
+        is_qwen3: identity.family == ModelFamily::Qwen3Plain,
+        is_qwen2: identity.family == ModelFamily::Qwen2
+            || identity.family == ModelFamily::Qwen3Plain
+            || identity.family == ModelFamily::Qwen35,
         is_qwen35: identity.family == ModelFamily::Qwen35,
         is_qwen3vl: identity.family == ModelFamily::Qwen3Vl,
         is_qwen3moe: identity.family == ModelFamily::Qwen3Moe || is_qwen3vlmoe_arch,
         is_qwen3next: identity.family == ModelFamily::Qwen3Next
             || identity.family == ModelFamily::Qwen35,
+        uses_chatml_template: identity.family == ModelFamily::Llama
+            && has_vocab_token(gguf, "<|im_start|>")
+            && has_vocab_token(gguf, "<|im_end|>"),
         online_attn_fusion: false,
         qwen_chat_template_contains_think: chat_template.contains("<think>"),
         qwen_chat_template_has_builtin_system: chat_template.contains("you are qwen"),
+        // Detect the pre-filled empty-think pattern used by no-reasoning Qwen3 variants
+        // (Bonsai, Qwen3-Instruct without thinking). The template literal in the GGUF
+        // shows up with escaped newlines, so check both renderings.
+        qwen_chat_template_uses_empty_think: chat_template.contains("<think>\\n\\n</think>")
+            || chat_template.contains("<think>\n\n</think>"),
         capabilities,
         final_logit_softcapping: get_gguf_float_from_map(&gguf.kv, &key_softcap, 0.0),
         rms_norm_eps: get_gguf_float_from_map(&gguf.kv, &key_rms_eps, 1e-6),
@@ -602,6 +660,8 @@ pub(crate) fn encode_chat_prompt(
 ) -> Vec<i32> {
     if config.is_gemma3 {
         gemma::encode_chat_prompt(tokenizer, prompt, system_prompt)
+    } else if config.is_smolvlm {
+        smolvlm::encode_chat_prompt(tokenizer, prompt, system_prompt)
     } else if config.is_qwen35 {
         qwen35::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
     } else if config.is_qwen3vl {
@@ -615,9 +675,9 @@ pub(crate) fn encode_chat_prompt(
             image_count,
             think_mode,
         )
-    } else if config.is_qwen3moe {
+    } else if config.is_qwen3moe || config.is_qwen3 {
         qwen3::encode_chat_prompt(tokenizer, prompt, system_prompt, image_count, think_mode)
-    } else if config.is_qwen2 {
+    } else if config.is_qwen2 || config.uses_chatml_template {
         qwen2::encode_chat_prompt(tokenizer, prompt, system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, prompt, system_prompt)
@@ -633,15 +693,17 @@ pub(crate) fn encode_chat_messages(
 ) -> Vec<i32> {
     if cfg.is_gemma3 {
         gemma::encode_chat_messages(tokenizer, messages, system_prompt)
+    } else if cfg.is_smolvlm {
+        smolvlm::encode_chat_messages(tokenizer, messages, system_prompt)
     } else if cfg.is_qwen35 {
         qwen35::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
     } else if cfg.is_qwen3vl {
         qwen3vl::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
     } else if cfg.is_qwen3next {
         qwen3next::encode_chat_messages(tokenizer, cfg, messages, system_prompt, think_mode)
-    } else if cfg.is_qwen3moe {
+    } else if cfg.is_qwen3moe || cfg.is_qwen3 {
         qwen3::encode_chat_messages(tokenizer, messages, system_prompt, think_mode)
-    } else if cfg.is_qwen2 {
+    } else if cfg.is_qwen2 || cfg.uses_chatml_template {
         qwen2::encode_chat_messages(tokenizer, messages, system_prompt)
     } else {
         llama::encode_chat_messages(tokenizer, messages, system_prompt)
@@ -667,6 +729,9 @@ pub(crate) fn encode_generation_request(
     if config.is_gemma3 {
         return gemma::encode_generation_request(tokenizer, request);
     }
+    if config.is_smolvlm {
+        return smolvlm::encode_generation_request(tokenizer, request);
+    }
     if config.is_qwen35 {
         return qwen35::encode_generation_request(tokenizer, request, think_mode);
     }
@@ -676,12 +741,12 @@ pub(crate) fn encode_generation_request(
     if config.is_qwen3next {
         return qwen3next::encode_generation_request(tokenizer, config, request, think_mode);
     }
-    if config.is_qwen3moe {
+    if config.is_qwen3moe || config.is_qwen3 {
         return qwen3::encode_generation_request(tokenizer, request, think_mode);
     }
 
     let prompt = join_request_text(&request.parts);
-    let token_ids = if config.is_qwen2 {
+    let token_ids = if config.is_qwen2 || config.uses_chatml_template {
         qwen2::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
     } else {
         llama::encode_chat_prompt(tokenizer, &prompt, &request.system_prompt)
@@ -696,12 +761,14 @@ pub(crate) fn decode_policy(config: &Config) -> VendorDecodePolicy {
         qwen3vl::decode_policy(config)
     } else if config.is_qwen3next {
         qwen3next::decode_policy(config)
-    } else if config.is_qwen3moe {
+    } else if config.is_qwen3moe || config.is_qwen3 {
         qwen3::decode_policy()
-    } else if config.is_qwen2 {
+    } else if config.is_qwen2 || config.uses_chatml_template {
         qwen2::decode_policy()
     } else if config.is_gemma3 {
         gemma::decode_policy()
+    } else if config.is_smolvlm {
+        smolvlm::decode_policy()
     } else {
         llama::decode_policy()
     }
@@ -716,10 +783,12 @@ pub(crate) fn tokenizer_policy(config: &Config) -> VendorTokenizerPolicy {
         qwen3next::tokenizer_policy()
     } else if config.is_qwen3moe {
         qwen3::tokenizer_policy()
-    } else if config.is_qwen2 {
+    } else if config.is_qwen2 || config.uses_chatml_template {
         qwen2::tokenizer_policy()
     } else if config.is_gemma3 {
         gemma::tokenizer_policy()
+    } else if config.is_smolvlm {
+        smolvlm::tokenizer_policy()
     } else {
         llama::tokenizer_policy()
     }
@@ -738,6 +807,8 @@ pub(crate) fn multimodal_policy(config: &Config) -> VendorMultimodalPolicy {
         qwen2::multimodal_policy()
     } else if config.is_gemma3 {
         gemma::multimodal_policy()
+    } else if config.is_smolvlm {
+        smolvlm::multimodal_policy()
     } else {
         llama::multimodal_policy()
     }
@@ -754,6 +825,8 @@ pub(crate) fn runtime_debug_policy(config: &Config) -> VendorRuntimeDebugPolicy 
         qwen_common::runtime_debug_policy()
     } else if config.is_gemma3 {
         gemma::runtime_debug_policy()
+    } else if config.is_smolvlm {
+        smolvlm::runtime_debug_policy()
     } else {
         llama::runtime_debug_policy()
     }

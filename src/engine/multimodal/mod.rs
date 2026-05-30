@@ -1,4 +1,5 @@
 mod gemma3;
+mod idefics3;
 mod injection;
 mod qwen3vl;
 
@@ -9,6 +10,7 @@ pub(crate) use injection::{ImageEmbeddingSequence, expand_prompt_with_image_embe
 pub(crate) enum VisionEncoder {
     Gemma3(gemma3::Gemma3VisionEncoder),
     Qwen3Vl(qwen3vl::Qwen3VlVisionEncoder),
+    Idefics3(idefics3::Idefics3VisionEncoder),
 }
 
 impl VisionEncoder {
@@ -16,6 +18,7 @@ impl VisionEncoder {
         match self {
             VisionEncoder::Gemma3(enc) => enc.recommended_image_size(),
             VisionEncoder::Qwen3Vl(enc) => enc.recommended_image_size(),
+            VisionEncoder::Idefics3(enc) => enc.recommended_image_size(),
         }
     }
 
@@ -23,6 +26,7 @@ impl VisionEncoder {
         match self {
             VisionEncoder::Gemma3(enc) => enc.recommended_image_alignment(),
             VisionEncoder::Qwen3Vl(enc) => enc.recommended_image_alignment(),
+            VisionEncoder::Idefics3(enc) => enc.recommended_image_alignment(),
         }
     }
 
@@ -30,6 +34,7 @@ impl VisionEncoder {
         match self {
             VisionEncoder::Gemma3(enc) => enc.recommended_image_normalization(),
             VisionEncoder::Qwen3Vl(enc) => enc.recommended_image_normalization(),
+            VisionEncoder::Idefics3(enc) => enc.recommended_image_normalization(),
         }
     }
 
@@ -40,6 +45,7 @@ impl VisionEncoder {
         match self {
             VisionEncoder::Gemma3(enc) => enc.encode_images(images),
             VisionEncoder::Qwen3Vl(enc) => enc.encode_images(images),
+            VisionEncoder::Idefics3(enc) => enc.encode_images(images),
         }
     }
 }
@@ -57,6 +63,10 @@ pub(crate) fn build_vision_encoder_from_mmproj(
             let encoder =
                 qwen3vl::Qwen3VlVisionEncoder::new(mmproj, cfg.dim, cfg.n_deepstack_layers)?;
             Ok(Some(VisionEncoder::Qwen3Vl(encoder)))
+        }
+        MultimodalBackend::Idefics3 => {
+            let encoder = idefics3::Idefics3VisionEncoder::new(mmproj, cfg.dim)?;
+            Ok(Some(VisionEncoder::Idefics3(encoder)))
         }
         _ => Ok(None),
     }

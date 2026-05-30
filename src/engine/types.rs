@@ -33,6 +33,9 @@ pub(crate) const QK5_1: usize = 32;
 pub(crate) const QK8_0: usize = 32;
 pub(crate) const QK_K: usize = 256;
 pub(crate) const QK4_NL: usize = 32;
+/// Block size for 1-bit binary quantisation types 40/41.
+/// Each block is 128 elements: [f16 scale (2 bytes)][packed 1-bit values (16 bytes)] = 18 bytes.
+pub(crate) const QK_BIN1: usize = 128;
 
 pub(crate) const GGML_TYPE_F32: i32 = 0;
 pub(crate) const GGML_TYPE_F16: i32 = 1;
@@ -48,6 +51,10 @@ pub(crate) const GGML_TYPE_Q5_K: i32 = 13;
 pub(crate) const GGML_TYPE_Q6_K: i32 = 14;
 pub(crate) const GGML_TYPE_IQ4_NL: i32 = 20;
 pub(crate) const GGML_TYPE_BF16: i32 = 30;
+/// 1-bit binary quantisation: 256-element blocks, 32 bytes packed bits + 4 bytes f32 scale.
+/// Appears as GGML type 40 (dominant weights) and 41 (embedding layer) in Bonsai-style models.
+pub(crate) const GGML_TYPE_BIN1_40: i32 = 40;
+pub(crate) const GGML_TYPE_BIN1_41: i32 = 41;
 
 pub(crate) const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -110,6 +117,10 @@ pub(crate) struct PlaceholderSpan {
     pub(crate) token_start: usize,
     pub(crate) token_len: usize,
     pub(crate) media_index: usize,
+    /// When true the entire span (all token_len tokens) is replaced by the image embeddings;
+    /// no begin/end marker tokens are emitted. Used for single-token placeholders like SmolVLM's
+    /// <image> where the model does not expect surrounding marker tokens.
+    pub(crate) replace_marker: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +148,7 @@ pub(crate) enum MultimodalBackend {
     Gemma3,
     Qwen3Vl,
     Qwen35,
+    Idefics3,
 }
 
 impl MultimodalBackend {
@@ -146,6 +158,7 @@ impl MultimodalBackend {
             MultimodalBackend::Gemma3 => "gemma3",
             MultimodalBackend::Qwen3Vl => "qwen3vl",
             MultimodalBackend::Qwen35 => "qwen35",
+            MultimodalBackend::Idefics3 => "idefics3",
         }
     }
 }
@@ -231,6 +244,9 @@ impl Default for GgmlType {
 pub(crate) struct MappedFile {
     pub(crate) ptr: *mut u8,
     pub(crate) len: usize,
+    /// True when the bytes are from a `&'static [u8]` embedded in the binary.
+    /// The Drop impl skips munmap for static slices.
+    is_static: bool,
     #[cfg(not(unix))]
     #[allow(dead_code)]
     backing: Box<[u8]>,
@@ -265,6 +281,7 @@ impl MappedFile {
         Ok(Self {
             ptr: ptr as *mut u8,
             len,
+            is_static: false,
         })
     }
 
@@ -284,7 +301,45 @@ impl MappedFile {
         let mut backing = bytes.into_boxed_slice();
         let ptr = backing.as_mut_ptr();
         let len = backing.len();
-        Ok(Self { ptr, len, backing })
+        Ok(Self {
+            ptr,
+            len,
+            is_static: false,
+            backing,
+        })
+    }
+
+    /// Wrap a static byte slice (e.g. from `include_bytes!`) without copying.
+    /// The slice must live for the lifetime of this `MappedFile`.
+    #[cfg(unix)]
+    pub(crate) fn from_static(data: &'static [u8]) -> io::Result<Self> {
+        if data.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty model data",
+            ));
+        }
+        Ok(Self {
+            ptr: data.as_ptr() as *mut u8,
+            len: data.len(),
+            is_static: true,
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn from_static(data: &'static [u8]) -> io::Result<Self> {
+        if data.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "empty model data",
+            ));
+        }
+        Ok(Self {
+            ptr: data.as_ptr() as *mut u8,
+            len: data.len(),
+            is_static: true,
+            backing: Box::new([]),
+        })
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
@@ -294,6 +349,9 @@ impl MappedFile {
 
 impl Drop for MappedFile {
     fn drop(&mut self) {
+        if self.is_static {
+            return;
+        }
         #[cfg(unix)]
         unsafe {
             let _ = munmap(self.ptr as *mut c_void, self.len);
@@ -375,14 +433,25 @@ pub(crate) struct Config {
     pub(crate) rope_sections: [usize; 4],
     pub(crate) is_bert_family: bool,
     pub(crate) is_gemma3: bool,
+    pub(crate) is_smolvlm: bool,
     pub(crate) is_qwen2: bool,
+    pub(crate) is_qwen3: bool,
     pub(crate) is_qwen35: bool,
     pub(crate) is_qwen3vl: bool,
     pub(crate) is_qwen3moe: bool,
     pub(crate) is_qwen3next: bool,
+    /// True for llama-arch models that use ChatML tokens (<|im_start|>/<|im_end|>)
+    /// instead of the Llama 3 header tokens. Weight layout and RoPE are llama-style;
+    /// only the chat template encoding and stop tokens differ.
+    pub(crate) uses_chatml_template: bool,
     pub(crate) online_attn_fusion: bool,
     pub(crate) qwen_chat_template_contains_think: bool,
     pub(crate) qwen_chat_template_has_builtin_system: bool,
+    /// True when the chat template pre-fills an empty `<think>\n\n</think>\n\n` block
+    /// in the assistant prefix (e.g. Bonsai-style models that don't actually reason).
+    /// In this case the model expects the close tag already present and won't generate
+    /// thinking content — we must always inject the closed block regardless of --think.
+    pub(crate) qwen_chat_template_uses_empty_think: bool,
     pub(crate) capabilities: ModelCapabilities,
     pub(crate) final_logit_softcapping: f32,
     pub(crate) rms_norm_eps: f32,

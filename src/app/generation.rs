@@ -27,6 +27,40 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Sampling parameters embedded in the GGUF file under `general.sampling.*`.
+/// These are model-provided defaults; explicit CLI flags take precedence.
+#[allow(dead_code)]
+struct GgufSamplingHints {
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+}
+
+#[allow(dead_code)]
+fn read_gguf_sampling_hints(gguf: &GGUFFile) -> GgufSamplingHints {
+    use crate::engine::types::GgufValue;
+    let get_f32 = |key: &str| -> Option<f32> {
+        match gguf.kv.get(key)? {
+            GgufValue::F32(f) => Some(*f),
+            GgufValue::F64(f) => Some(*f as f32),
+            _ => None,
+        }
+    };
+    let get_usize = |key: &str| -> Option<usize> {
+        match gguf.kv.get(key)? {
+            GgufValue::UInt(n) => Some(*n as usize),
+            GgufValue::Int(n) if *n >= 0 => Some(*n as usize),
+            GgufValue::F32(f) if *f >= 1.0 => Some(*f as usize),
+            _ => None,
+        }
+    };
+    GgufSamplingHints {
+        temperature: get_f32("general.sampling.temp"),
+        top_k: get_usize("general.sampling.top_k"),
+        top_p: get_f32("general.sampling.top_p"),
+    }
+}
+
 fn time_in_ms() -> i64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -37,7 +71,8 @@ fn time_in_ms() -> i64 {
 fn repeated_cycle_period(tokens: &[i32]) -> Option<usize> {
     // Detect degenerate decode loops by checking whether the current token suffix
     // reappears several times in a recent lookback window (alignment-agnostic).
-    const WINDOWS: &[usize] = &[16, 24, 32, 48, 64, 96, 128];
+    // Smaller windows catch tight think-phase cycles (e.g. "I think." = 3 tokens).
+    const WINDOWS: &[usize] = &[4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128];
     for &window in WINDOWS {
         let need = window * 3;
         if tokens.len() < need {
@@ -60,6 +95,47 @@ fn repeated_cycle_period(tokens: &[i32]) -> Option<usize> {
                 continue;
             }
             start += 1;
+        }
+    }
+    None
+}
+
+/// Detect inline phrase repetition — works without newlines and tolerates
+/// slight token-level variations (e.g. "The The capital" vs "The capital").
+/// Returns the repeated phrase if a substring of 8–80 bytes appears 4+ times
+/// in the last 1024 bytes of output.
+fn repeated_inline_phrase(output: &str) -> Option<String> {
+    const MIN_PHRASE: usize = 8;
+    const MAX_PHRASE: usize = 80;
+    const MIN_REPS: usize = 3;
+    const LOOKBACK: usize = 1024;
+
+    let window = if output.len() > LOOKBACK {
+        &output[output.len() - LOOKBACK..]
+    } else {
+        output
+    };
+    if window.len() < MIN_PHRASE * MIN_REPS {
+        return None;
+    }
+    let bytes = window.as_bytes();
+    let n = bytes.len();
+
+    // Try each candidate phrase length from large to small (prefer longer matches).
+    for phrase_len in (MIN_PHRASE..=MAX_PHRASE.min(n / MIN_REPS)).rev() {
+        let suffix = &bytes[n - phrase_len..n];
+        let mut count = 0usize;
+        let mut i = 0;
+        while i + phrase_len <= n {
+            if &bytes[i..i + phrase_len] == suffix {
+                count += 1;
+                if count >= MIN_REPS {
+                    return Some(String::from_utf8_lossy(suffix).replace('\n', "\\n"));
+                }
+                i += phrase_len; // non-overlapping: skip past this occurrence
+            } else {
+                i += 1;
+            }
         }
     }
     None
@@ -1462,6 +1538,7 @@ impl ModelRuntime {
                     && self.has_vocab_token("<|vision_end|>")
                     && self.has_vocab_token("<|image_pad|>")
             }
+            MultimodalBackend::Idefics3 => self.has_vocab_token("<image>"),
             MultimodalBackend::None => false,
         }
     }
@@ -1473,7 +1550,9 @@ impl ModelRuntime {
                     && self.has_vocab_token("<|vision_end|>")
                     && self.has_vocab_token("<|video_pad|>")
             }
-            MultimodalBackend::Gemma3 | MultimodalBackend::None => false,
+            MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 | MultimodalBackend::None => {
+                false
+            }
         }
     }
 
@@ -1482,7 +1561,9 @@ impl ModelRuntime {
             MultimodalBackend::Qwen3Vl | MultimodalBackend::Qwen35 => {
                 self.has_vocab_token("<|audio_pad|>")
             }
-            MultimodalBackend::Gemma3 | MultimodalBackend::None => false,
+            MultimodalBackend::Gemma3 | MultimodalBackend::Idefics3 | MultimodalBackend::None => {
+                false
+            }
         }
     }
 
@@ -1927,6 +2008,9 @@ impl ModelRuntime {
                     self.has_vocab_token("<|video_pad|>"),
                     self.has_vocab_token("<|audio_pad|>"),
                 ),
+                MultimodalBackend::Idefics3 => {
+                    (false, false, self.has_vocab_token("<image>"), false, false)
+                }
                 MultimodalBackend::None => (false, false, false, false, false),
             };
         let has_vision_encoder =
@@ -2060,9 +2144,11 @@ impl ModelRuntime {
                     align_to,
                 );
             }
-            if self.config.capabilities.multimodal_backend == MultimodalBackend::Gemma3 {
-                // Gemma3 SigLIP path follows llama.cpp behavior: direct resize to fixed
-                // square input size (no aspect-preserving fit + crop).
+            if self.config.capabilities.multimodal_backend == MultimodalBackend::Gemma3
+                || self.config.capabilities.multimodal_backend == MultimodalBackend::Idefics3
+            {
+                // SigLIP-derived encoders (Gemma3, SmolVLM/idefics3) use a direct
+                // bilinear stretch to the encoder's fixed square input size.
                 return ImagePreprocessProfile::new_with_mode(
                     base_size,
                     base_size,
@@ -2091,6 +2177,7 @@ impl ModelRuntime {
                 ImageResizeMode::Stretch,
                 1,
             ),
+            MultimodalBackend::Idefics3 => ImagePreprocessProfile::new(384, 384, fallback_norm),
             MultimodalBackend::None => {
                 ImagePreprocessProfile::new(448, 448, ImageNormalization::UnitRange)
             }
@@ -2271,16 +2358,97 @@ impl ModelRuntime {
         Self::load_with_debug_mode(cli, false)
     }
 
+    /// Load a model from bytes embedded in the binary (e.g. via `include_bytes!`).
+    /// Skips multimodal, RAG, and mmproj discovery. Uses conservative defaults
+    /// suitable for an interactive assistant.
+    pub(crate) fn load_from_bytes(data: &'static [u8]) -> Result<Self, String> {
+        use crate::engine::io::parse_gguf_from_bytes;
+
+        let gguf = parse_gguf_from_bytes(data, false)?;
+        let mut config = crate::vendors::build_config_from_gguf(&gguf, false)?;
+        let tokenizer_policy = crate::vendors::tokenizer_policy(&config);
+        let vendor_multimodal_policy = crate::vendors::multimodal_policy(&config);
+        let mut tokenizer = crate::engine::tokenizer::init_tokenizer_from_gguf(
+            &gguf,
+            &mut config,
+            tokenizer_policy,
+            false,
+        )?;
+        tokenizer.use_sentencepiece = config.is_gemma3;
+
+        crate::engine::runtime::apply_context_size_overrides(&mut config, 0, false);
+        let max_tokens = config.seq_len;
+
+        let weights = crate::engine::weights::init_weights_from_gguf(&gguf, &config, false)?;
+        let multimodal_weights =
+            crate::engine::weights::init_multimodal_weights_from_gguf(&gguf, &config, false)?;
+        let vendor_decode_policy = crate::vendors::decode_policy(&config);
+
+        // Embedded usage defaults to greedy decoding (temperature=0). Interactive
+        // assistants need predictable, reproducible output across sessions; stochastic
+        // sampling on noisy 1-bit models produces inconsistent answers even with the
+        // model's own recommended top_k/top_p. Greedy is also seed-independent, so
+        // every call returns the model's highest-probability answer. Callers who want
+        // variability can use the setters after loading.
+        let hints = read_gguf_sampling_hints(&gguf);
+        let settings = GenerationSettings {
+            temperature: 0.0,
+            top_k: hints.top_k.unwrap_or(0),
+            top_p: hints.top_p.unwrap_or(0.9),
+            sampling_seed: None,
+            repeat_penalty: 1.1,
+            repeat_last_n: 64,
+            max_tokens,
+            profiling_mode: false,
+            show_tokens: false,
+            debug_mode: false,
+            think_mode: if config.qwen_chat_template_uses_empty_think {
+                crate::engine::types::ThinkMode::No
+            } else {
+                crate::engine::types::ThinkMode::Hidden
+            },
+            structured_output_mode: StructuredOutputMode::None,
+            vendor_decode_policy,
+            vendor_multimodal_policy,
+            runtime_event_callback: None,
+            rag_top_k: 5,
+            rag_max_chars_per_chunk: 1800,
+            rag_max_tokens_per_chunk: 0,
+        };
+
+        Ok(Self {
+            checkpoint_path: "<embedded>".to_string(),
+            gguf,
+            config,
+            tokenizer,
+            weights,
+            settings,
+            multimodal_weights,
+            mmproj_sidecar: None,
+            mmproj_candidates: Vec::new(),
+            vision_encoder: None,
+            document_encoder: None,
+            rag_index: None,
+            kv_cache_format_logged: false,
+        })
+    }
+
     fn load_with_debug_mode(cli: &CliOptions, debug_mode: bool) -> Result<Self, String> {
         let mut max_tokens = cli.max_tokens;
         let checkpoint = &cli.model;
         if debug_mode {
             eprintln!("Loading GGUF model: {checkpoint}");
             eprintln!(
-                "Sampling: temperature={}, top_k={}, top_p={}, repeat_penalty={}, repeat_last_n={}, seed={}",
-                cli.temperature,
-                cli.top_k,
-                cli.top_p,
+                "Sampling (CLI): temperature={}, top_k={}, top_p={}, repeat_penalty={}, repeat_last_n={}, seed={}",
+                cli.temperature
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "model/default".to_string()),
+                cli.top_k
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "model/default".to_string()),
+                cli.top_p
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "model/default".to_string()),
                 cli.repeat_penalty,
                 cli.repeat_last_n,
                 cli.seed
@@ -2410,10 +2578,49 @@ impl ModelRuntime {
         let multimodal_weights =
             crate::engine::weights::init_multimodal_weights_from_gguf(&gguf, &config, debug_mode)?;
         let vendor_decode_policy = crate::vendors::decode_policy(&config);
+
+        // For Qwen3-style chat templates that pre-fill an empty `<think>\n\n</think>\n\n`
+        // block, the model was trained to see the closed block already in the prompt and
+        // produce the answer directly. Forcing No-mode here ensures the encoder emits the
+        // closed block (matching the model's training distribution) and the runtime's
+        // think-tag parser starts in the "outside think" state so visible output isn't
+        // suppressed. Any user-supplied --think yes/hidden is ignored for these models
+        // because they don't actually reason — the flag would just confuse the model.
+        let effective_think_mode = if config.qwen_chat_template_uses_empty_think {
+            if debug_mode && cli.think_mode != crate::engine::types::ThinkMode::No {
+                eprintln!(
+                    "Note: chat template pre-fills empty <think>/</think>; overriding --think={:?} to no",
+                    cli.think_mode
+                );
+            }
+            crate::engine::types::ThinkMode::No
+        } else {
+            cli.think_mode
+        };
+
+        let hints = read_gguf_sampling_hints(&gguf);
+        let temperature = cli.temperature.or(hints.temperature).unwrap_or(0.9);
+        let top_k = cli.top_k.or(hints.top_k).unwrap_or(0);
+        let top_p = cli.top_p.or(hints.top_p).unwrap_or(1.0);
+        if debug_mode {
+            let source = if hints.temperature.is_some() || hints.top_k.is_some() {
+                " (model hints applied where not overridden)"
+            } else {
+                ""
+            };
+            eprintln!(
+                "Sampling{source}: temperature={temperature}, top_k={top_k}, top_p={top_p}, repeat_penalty={}, repeat_last_n={}, seed={}",
+                cli.repeat_penalty,
+                cli.repeat_last_n,
+                cli.seed
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "time".to_string())
+            );
+        }
         let settings = GenerationSettings {
-            temperature: cli.temperature,
-            top_k: cli.top_k,
-            top_p: cli.top_p,
+            temperature,
+            top_k,
+            top_p,
             sampling_seed: cli.seed,
             repeat_penalty: cli.repeat_penalty,
             repeat_last_n: cli.repeat_last_n,
@@ -2421,7 +2628,7 @@ impl ModelRuntime {
             profiling_mode: cli.profiling,
             show_tokens: cli.show_tokens,
             debug_mode,
-            think_mode: cli.think_mode,
+            think_mode: effective_think_mode,
             structured_output_mode: StructuredOutputMode::None,
             vendor_decode_policy,
             vendor_multimodal_policy,
@@ -2655,6 +2862,30 @@ impl ModelRuntime {
         self.settings.debug_mode = enabled;
     }
 
+    pub(crate) fn set_show_tokens(&mut self, enabled: bool) {
+        self.settings.show_tokens = enabled;
+    }
+
+    pub(crate) fn set_temperature(&mut self, temperature: f32) {
+        self.settings.temperature = temperature;
+    }
+
+    pub(crate) fn set_top_k(&mut self, top_k: usize) {
+        self.settings.top_k = top_k;
+    }
+
+    pub(crate) fn set_top_p(&mut self, top_p: f32) {
+        self.settings.top_p = top_p;
+    }
+
+    pub(crate) fn set_repeat_penalty(&mut self, repeat_penalty: f32) {
+        self.settings.repeat_penalty = repeat_penalty;
+    }
+
+    pub(crate) fn set_sampling_seed(&mut self, seed: Option<u64>) {
+        self.settings.sampling_seed = seed;
+    }
+
     /// Load (or reload) an embedding encoder and build a RAG index from `source_dir`.
     /// Returns a human-readable status string on success.
     pub(crate) fn load_rag_from_dir(
@@ -2864,6 +3095,24 @@ impl ModelRuntime {
                         encoded_prompt.video_spans.len(),
                         encoded_prompt.audio_spans.len()
                     ),
+                );
+                // Dump full prompt token list so we can verify the chat template.
+                let prompt_preview: Vec<String> = encoded_prompt
+                    .token_ids
+                    .iter()
+                    .map(|&id| {
+                        let text = self
+                            .tokenizer
+                            .decode_token(id)
+                            .unwrap_or_else(|| format!("?{id}"))
+                            .replace('\n', "\\n")
+                            .replace('\r', "\\r");
+                        format!("{id}(\"{text}\")")
+                    })
+                    .collect();
+                emit_debug_line(
+                    event_callback,
+                    format!("Prompt tokens: [{}]", prompt_preview.join(", ")),
                 );
             }
 
@@ -3364,26 +3613,43 @@ impl ModelRuntime {
                 record_forward_pass();
             }
 
-            if debug_mode
-                && pos >= prompt_tokens.len().saturating_sub(1)
-                && pos < prompt_tokens.len() + 3
-            {
-                let mut top: Vec<(usize, f32)> = state.logits[..self.config.vocab_size]
+            if debug_mode && pos >= prompt_tokens.len().saturating_sub(1) {
+                let mut ranked: Vec<(usize, f32)> = state.logits[..self.config.vocab_size]
                     .iter()
                     .copied()
                     .enumerate()
                     .collect();
-                top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-                let mut line = format!("[DEBUG pos={pos}] Top 5 logits: ");
-                for (id, v) in top.into_iter().take(5) {
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+                let mut line = format!("[DEBUG pos={pos}] Top 5: ");
+                for (id, v) in ranked.iter().take(5) {
                     let decoded = self
                         .tokenizer
-                        .decode_token(id as i32)
+                        .decode_token(*id as i32)
                         .unwrap_or_else(|| "?".to_string())
                         .replace('\n', "\\n")
                         .replace('\r', "\\r");
                     line.push_str(&format!("{id}({v:.2},\"{decoded}\") "));
                 }
+                // Always show where every stop token ranks, so we can see if the model
+                // ever wants to stop but is prevented by sampling or a missing check.
+                let stop_info: Vec<String> = stop_tokens
+                    .iter()
+                    .chain(std::iter::once(&(self.tokenizer.eos_token, "<eos>")))
+                    .map(|(sid, slit)| {
+                        let logit = if (*sid as usize) < self.config.vocab_size {
+                            state.logits[*sid as usize]
+                        } else {
+                            f32::NEG_INFINITY
+                        };
+                        let rank = ranked
+                            .iter()
+                            .position(|(id, _)| *id == *sid as usize)
+                            .map(|r| r + 1)
+                            .unwrap_or(0);
+                        format!("{slit}(id={sid},rank={rank},logit={logit:.2})")
+                    })
+                    .collect();
+                line.push_str(&format!(" | stop: {}", stop_info.join(" ")));
                 emit_debug_line(event_callback.as_ref(), line);
             }
 
@@ -3809,6 +4075,7 @@ impl ModelRuntime {
                         break;
                     }
                 }
+                // Existing gated checks (newline-based or exact suffix).
                 if self.settings.vendor_decode_policy.deterministic_loop_guard
                     && generated_tokens.len()
                         >= self
@@ -3839,15 +4106,28 @@ impl ModelRuntime {
                         }
                         break;
                     }
-                    if temperature == 0.0
-                        && let Some(period) = repeated_cycle_period(&generated_tokens)
+                }
+                // Unconditional checks — catch loops regardless of temperature or think mode.
+                // Fires every 4 tokens after the first 8 generated tokens.
+                if generated_tokens.len() >= 8 && generated_tokens.len() % 4 == 0 {
+                    // Text-level: inline phrase repetition in visible output.
+                    if !output.is_empty()
+                        && let Some(phrase) = repeated_inline_phrase(&output)
                     {
                         if debug_mode {
                             emit_debug_line(
                                 event_callback.as_ref(),
-                                format!(
-                                    "Stopping due to repeated token cycle (window={period}, repeated suffix)"
-                                ),
+                                format!("Stopping due to repeated inline phrase: \"{phrase}\""),
+                            );
+                        }
+                        break;
+                    }
+                    // Token-level: tight cycle in all generated tokens (catches hidden think loops).
+                    if let Some(period) = repeated_cycle_period(&generated_tokens) {
+                        if debug_mode {
+                            emit_debug_line(
+                                event_callback.as_ref(),
+                                format!("Stopping due to repeated token cycle (window={period})"),
                             );
                         }
                         break;
