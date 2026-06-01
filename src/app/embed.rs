@@ -191,8 +191,7 @@ impl EmbeddedRuntime {
         max_chars_per_chunk: usize,
         max_tokens_per_chunk: usize,
     ) -> Result<Vec<u8>, String> {
-        let mut encoder =
-            crate::rag::encoder::DocumentEncoder::load_from_bytes(encoder_bytes)?;
+        let mut encoder = crate::rag::encoder::DocumentEncoder::load_from_bytes(encoder_bytes)?;
         let index = crate::rag::RagIndex::build_from_text_slices(
             docs,
             &mut encoder,

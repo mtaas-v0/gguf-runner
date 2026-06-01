@@ -78,7 +78,8 @@ pub(crate) fn save_to_writer<W: Write>(
     dim: usize,
     chunks: &[RagChunk],
 ) -> Result<(), String> {
-    w.write_all(MAGIC).map_err(|e| format!("write magic: {e}"))?;
+    w.write_all(MAGIC)
+        .map_err(|e| format!("write magic: {e}"))?;
     write_u32(&mut w, dim as u32)?;
     write_u32(&mut w, chunks.len() as u32)?;
 

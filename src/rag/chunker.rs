@@ -588,7 +588,10 @@ mod tests {
         // each individual section still clears MIN_CHUNK_CHARS).
         let md = "# A\n\naaaaaaaaaaaaaaaaaaaaaaaa\n\n# B\n\nbbbbbbbbbbbbbbbbbbbbbbbb\n";
         let chunks = chunk_markdown("test.md", md, 40);
-        assert!(chunks.len() >= 2, "expected multiple chunks, got {chunks:?}");
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks, got {chunks:?}"
+        );
     }
 
     #[test]

@@ -3040,7 +3040,9 @@ impl ModelRuntime {
         let chunk_count = index.len();
         self.document_encoder = Some(encoder);
         self.rag_index = Some(index);
-        Ok(format!("RAG: {chunk_count} chunks indexed from embedded docs"))
+        Ok(format!(
+            "RAG: {chunk_count} chunks indexed from embedded docs"
+        ))
     }
 
     /// Load a precomputed serialized RAG index plus an embedding encoder, both
