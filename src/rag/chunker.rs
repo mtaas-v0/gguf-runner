@@ -59,6 +59,23 @@ pub(crate) fn chunk_markdown(source_path: &str, content: &str, max_chars: usize)
     let sections = split_into_sections(content);
     let mut out = Vec::new();
 
+    // Greedily merge adjacent sections into chunks up to `max_chars`.  Without
+    // this, every heading in a heavily-subdivided doc becomes its own tiny
+    // chunk — embedding then spends most of its time on per-call overhead and
+    // the resulting index bloats.  Merged chunks also retrieve better: small
+    // section bodies in isolation rarely have enough signal to score well.
+    let mut pending = String::new();
+    let flush_pending = |pending: &mut String, out: &mut Vec<RawChunk>| {
+        let trimmed = pending.trim();
+        if trimmed.len() >= MIN_CHUNK_CHARS {
+            out.push(RawChunk {
+                source: source_path.to_string(),
+                text: trimmed.to_string(),
+            });
+        }
+        pending.clear();
+    };
+
     for (breadcrumb, body) in sections {
         let prefix = if breadcrumb.is_empty() {
             String::new()
@@ -66,27 +83,35 @@ pub(crate) fn chunk_markdown(source_path: &str, content: &str, max_chars: usize)
             format!("{breadcrumb}\n\n")
         };
         let full = format!("{prefix}{body}");
-        if full.trim().len() < MIN_CHUNK_CHARS {
-            continue;
-        }
-        if full.len() <= max_chars {
-            out.push(RawChunk {
-                source: source_path.to_string(),
-                text: full.trim().to_string(),
-            });
-        } else {
-            // Sliding-window split within the section.
-            let windows = sliding_window(&full, max_chars, overlap);
-            for window in windows {
-                if window.trim().len() >= MIN_CHUNK_CHARS {
+
+        if full.len() > max_chars {
+            // Section larger than max — flush whatever we were merging, then
+            // emit sliding windows for this section directly.
+            flush_pending(&mut pending, &mut out);
+            for window in sliding_window(&full, max_chars, overlap) {
+                let trimmed = window.trim();
+                if trimmed.len() >= MIN_CHUNK_CHARS {
                     out.push(RawChunk {
                         source: source_path.to_string(),
-                        text: window.trim().to_string(),
+                        text: trimmed.to_string(),
                     });
                 }
             }
+            continue;
         }
+
+        // Would appending overflow the current merged chunk? If so, flush
+        // and start a fresh one with just this section.
+        let joiner = if pending.is_empty() { "" } else { "\n\n" };
+        if !pending.is_empty() && pending.len() + joiner.len() + full.len() > max_chars {
+            flush_pending(&mut pending, &mut out);
+        }
+        if !pending.is_empty() {
+            pending.push_str(joiner);
+        }
+        pending.push_str(&full);
     }
+    flush_pending(&mut pending, &mut out);
 
     out
 }
@@ -542,11 +567,28 @@ mod tests {
 
     #[test]
     fn splits_on_headings() {
+        // Two small sections fit comfortably under max_chars=2000, so the
+        // greedy merger combines them into a single chunk that still carries
+        // both heading breadcrumbs.
         let md = "# Alpha\n\nalpha body\n\n## Beta\n\nbeta body\n";
         let chunks = chunk_markdown("test.md", md, 2000);
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 1);
         assert!(chunks[0].text.contains("Alpha"));
-        assert!(chunks[1].text.contains("Beta"));
+        assert!(chunks[0].text.contains("Beta"));
+    }
+
+    #[test]
+    fn small_sections_merge_until_max_chars() {
+        // Three small sections that fit together; one chunk total.
+        let md = "# A\n\na body\n\n# B\n\nb body\n\n# C\n\nc body\n";
+        let chunks = chunk_markdown("test.md", md, 2000);
+        assert_eq!(chunks.len(), 1);
+
+        // Tight max forces a flush between sections (use larger bodies so
+        // each individual section still clears MIN_CHUNK_CHARS).
+        let md = "# A\n\naaaaaaaaaaaaaaaaaaaaaaaa\n\n# B\n\nbbbbbbbbbbbbbbbbbbbbbbbb\n";
+        let chunks = chunk_markdown("test.md", md, 40);
+        assert!(chunks.len() >= 2, "expected multiple chunks, got {chunks:?}");
     }
 
     #[test]

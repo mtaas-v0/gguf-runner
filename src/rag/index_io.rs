@@ -62,15 +62,59 @@ pub(crate) fn save(path: &Path, dim: usize, chunks: &[RagChunk]) -> Result<(), S
 pub(crate) fn load(path: &Path) -> Result<(usize, Vec<RagChunk>), String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("cannot open index file '{}': {e}", path.display()))?;
-    let mut r = std::io::BufReader::new(file);
+    let r = std::io::BufReader::new(file);
+    parse(r, &path.display().to_string())
+}
 
+/// Parse a serialized index from an in-memory byte slice. Mirrors [`load`] but
+/// avoids touching the filesystem — useful for precomputed indices embedded in
+/// the binary via `include_bytes!`.
+pub(crate) fn load_from_bytes(data: &[u8]) -> Result<(usize, Vec<RagChunk>), String> {
+    parse(std::io::Cursor::new(data), "<embedded>")
+}
+
+pub(crate) fn save_to_writer<W: Write>(
+    mut w: W,
+    dim: usize,
+    chunks: &[RagChunk],
+) -> Result<(), String> {
+    w.write_all(MAGIC).map_err(|e| format!("write magic: {e}"))?;
+    write_u32(&mut w, dim as u32)?;
+    write_u32(&mut w, chunks.len() as u32)?;
+
+    for chunk in chunks {
+        let src = chunk.source.as_bytes();
+        let txt = chunk.text.as_bytes();
+        if src.len() > u16::MAX as usize {
+            return Err(format!(
+                "source path too long ({} bytes): {}",
+                src.len(),
+                chunk.source
+            ));
+        }
+        if txt.len() > u32::MAX as usize {
+            return Err(format!("chunk text too long: {} bytes", txt.len()));
+        }
+        write_u16(&mut w, src.len() as u16)?;
+        w.write_all(src).map_err(|e| format!("write source: {e}"))?;
+        write_u32(&mut w, txt.len() as u32)?;
+        w.write_all(txt).map_err(|e| format!("write text: {e}"))?;
+        for &v in &chunk.embedding {
+            w.write_all(&v.to_le_bytes())
+                .map_err(|e| format!("write embedding float: {e}"))?;
+        }
+    }
+    w.flush().map_err(|e| format!("flush index: {e}"))?;
+    Ok(())
+}
+
+fn parse<R: Read>(mut r: R, source_label: &str) -> Result<(usize, Vec<RagChunk>), String> {
     let mut magic = [0u8; 8];
     r.read_exact(&mut magic)
         .map_err(|e| format!("read magic: {e}"))?;
     if &magic != MAGIC {
         return Err(format!(
-            "invalid RAG index magic in '{}' — expected RAGIDX v1",
-            path.display()
+            "invalid RAG index magic in '{source_label}' — expected RAGIDX v1"
         ));
     }
 

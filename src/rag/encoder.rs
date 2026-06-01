@@ -792,6 +792,14 @@ impl DocumentEncoder {
         Ok(Self::Embedding(enc))
     }
 
+    pub(crate) fn load_from_bytes(data: &'static [u8]) -> Result<Self, String> {
+        use crate::engine::io::parse_gguf_from_bytes;
+        let gguf = parse_gguf_from_bytes(data, false)
+            .map_err(|e| format!("failed to load embedded RAG encoder: {e}"))?;
+        let enc = EmbeddingEncoder::new(gguf, false)?;
+        Ok(Self::Embedding(enc))
+    }
+
     /// Embedding dimension.
     pub(crate) fn dim(&self) -> usize {
         match self {

@@ -130,16 +130,40 @@ impl RagIndex {
         progress: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
         trace_build: bool,
     ) -> Result<Self, String> {
-        let build_started = Instant::now();
         let chunk_t0 = Instant::now();
         let raw_chunks = chunker::chunk_directory(wiki_dir, max_chars_per_chunk)?;
         let chunking_secs = chunk_t0.elapsed().as_secs_f64();
-        let total = raw_chunks.len();
-        if total == 0 {
+        if raw_chunks.is_empty() {
             return Err(format!(
                 "no markdown files found under '{}'",
                 wiki_dir.display()
             ));
+        }
+        Self::build_from_raw_chunks(
+            raw_chunks,
+            encoder,
+            max_tokens_per_chunk,
+            progress,
+            trace_build,
+            chunking_secs,
+        )
+    }
+
+    /// Shared parallel pipeline used by both `build_from_dir` and
+    /// `build_from_text_slices`.  `chunking_secs` is purely cosmetic — it just
+    /// labels the chunking phase in the optional trace output.
+    fn build_from_raw_chunks(
+        raw_chunks: Vec<chunker::RawChunk>,
+        encoder: &mut DocumentEncoder,
+        max_tokens_per_chunk: usize,
+        progress: Option<std::sync::Arc<dyn Fn(String) + Send + Sync>>,
+        trace_build: bool,
+        chunking_secs: f64,
+    ) -> Result<Self, String> {
+        let build_started = Instant::now();
+        let total = raw_chunks.len();
+        if total == 0 {
+            return Err("no chunks to index".to_string());
         }
         let dim = encoder.dim();
 
@@ -316,6 +340,34 @@ impl RagIndex {
         })
     }
 
+    /// Build an index from in-memory `(source_name, markdown_content)` pairs.
+    ///
+    /// Each pair is chunked with [`chunker::chunk_markdown`] and embedded.
+    /// Useful when the source documents are embedded in the binary at compile time.
+    pub(crate) fn build_from_text_slices(
+        docs: &[(&str, &str)],
+        encoder: &mut encoder::DocumentEncoder,
+        max_chars_per_chunk: usize,
+        max_tokens_per_chunk: usize,
+    ) -> Result<Self, String> {
+        let chunk_t0 = Instant::now();
+        let raw_chunks: Vec<chunker::RawChunk> = docs
+            .iter()
+            .flat_map(|(source, content)| {
+                chunker::chunk_markdown(source, content, max_chars_per_chunk)
+            })
+            .collect();
+        let chunking_secs = chunk_t0.elapsed().as_secs_f64();
+        Self::build_from_raw_chunks(
+            raw_chunks,
+            encoder,
+            max_tokens_per_chunk,
+            None,
+            false,
+            chunking_secs,
+        )
+    }
+
     /// Load a pre-built index from a `.ragidx` file.
     pub(crate) fn load(path: &std::path::Path) -> Result<Self, String> {
         let (dim, chunks) = index_io::load(path)?;
@@ -333,6 +385,28 @@ impl RagIndex {
     /// Persist the index to a `.ragidx` file.
     pub(crate) fn save(&self, path: &std::path::Path) -> Result<(), String> {
         index_io::save(path, self.dim, &self.chunks)
+    }
+
+    /// Load a pre-built index from an in-memory byte slice (e.g. `include_bytes!`).
+    pub(crate) fn load_from_bytes(data: &[u8]) -> Result<Self, String> {
+        let (dim, chunks) = index_io::load_from_bytes(data)?;
+        let flat_embeddings = chunks
+            .iter()
+            .flat_map(|c| c.embedding.iter().copied())
+            .collect();
+        Ok(Self {
+            chunks,
+            dim,
+            flat_embeddings,
+        })
+    }
+
+    /// Serialize the index into a `Vec<u8>` in the `.ragidx` wire format.
+    /// Suitable for embedding into a binary at build time.
+    pub(crate) fn save_to_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut buf: Vec<u8> = Vec::new();
+        index_io::save_to_writer(&mut buf, self.dim, &self.chunks)?;
+        Ok(buf)
     }
 
     /// Number of chunks in the index.

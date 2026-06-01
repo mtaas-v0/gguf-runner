@@ -1568,6 +1568,10 @@ impl ModelRuntime {
     }
 
     fn supports_external_vision(&self) -> bool {
+        // Vision encoder already loaded from embedded bytes (load_mmproj_from_bytes).
+        if self.vision_encoder.is_some() {
+            return true;
+        }
         self.mmproj_sidecar
             .as_ref()
             .map(|probe| probe.has_vision_encoder && probe.has_vision_projector)
@@ -2358,6 +2362,98 @@ impl ModelRuntime {
         Self::load_with_debug_mode(cli, false)
     }
 
+    /// Load a model from a filesystem path.
+    ///
+    /// Prefer this over `load_from_bytes` when the model is too large to embed
+    /// at compile time (e.g. vision models).  The real `checkpoint_path` is
+    /// recorded so that mmproj sidecar discovery works when the first image
+    /// request arrives — the sidecar is initialised lazily on demand.
+    pub(crate) fn load_from_file(path: &std::path::Path, debug_mode: bool) -> Result<Self, String> {
+        use crate::engine::io::parse_gguf_file;
+
+        let checkpoint = path
+            .to_str()
+            .ok_or("model path contains non-UTF8 characters")?;
+        let gguf = parse_gguf_file(checkpoint, debug_mode)?;
+        let mut config = crate::vendors::build_config_from_gguf(&gguf, debug_mode)?;
+        let tokenizer_policy = crate::vendors::tokenizer_policy(&config);
+        let vendor_multimodal_policy = crate::vendors::multimodal_policy(&config);
+        let mut tokenizer = crate::engine::tokenizer::init_tokenizer_from_gguf(
+            &gguf,
+            &mut config,
+            tokenizer_policy,
+            debug_mode,
+        )?;
+        tokenizer.use_sentencepiece = config.is_gemma3;
+
+        crate::engine::runtime::apply_context_size_overrides(&mut config, 0, debug_mode);
+        let max_tokens = config.seq_len;
+
+        let weights = crate::engine::weights::init_weights_from_gguf(&gguf, &config, debug_mode)?;
+        let multimodal_weights =
+            crate::engine::weights::init_multimodal_weights_from_gguf(&gguf, &config, debug_mode)?;
+        let vendor_decode_policy = crate::vendors::decode_policy(&config);
+
+        let hints = read_gguf_sampling_hints(&gguf);
+        let settings = GenerationSettings {
+            temperature: 0.0,
+            top_k: hints.top_k.unwrap_or(0),
+            top_p: hints.top_p.unwrap_or(0.9),
+            sampling_seed: None,
+            repeat_penalty: 1.1,
+            repeat_last_n: 64,
+            max_tokens,
+            profiling_mode: false,
+            show_tokens: false,
+            debug_mode,
+            think_mode: if config.qwen_chat_template_uses_empty_think {
+                crate::engine::types::ThinkMode::No
+            } else {
+                crate::engine::types::ThinkMode::Hidden
+            },
+            structured_output_mode: StructuredOutputMode::None,
+            vendor_decode_policy,
+            vendor_multimodal_policy,
+            runtime_event_callback: None,
+            rag_top_k: 5,
+            rag_max_chars_per_chunk: 1800,
+            rag_max_tokens_per_chunk: 0,
+        };
+
+        Ok(Self {
+            checkpoint_path: checkpoint.to_string(),
+            gguf,
+            config,
+            tokenizer,
+            weights,
+            settings,
+            multimodal_weights,
+            // mmproj sidecar is probed lazily the first time an image is provided.
+            mmproj_sidecar: None,
+            mmproj_candidates: Vec::new(),
+            vision_encoder: None,
+            document_encoder: None,
+            rag_index: None,
+            kv_cache_format_logged: false,
+        })
+    }
+
+    /// Load the mmproj vision projector from bytes embedded in the binary.
+    ///
+    /// Call this once after [`load_from_bytes`](Self::load_from_bytes) to enable
+    /// image inference without needing a sidecar file on disk.  Has no effect if
+    /// a vision encoder is already loaded.
+    pub(crate) fn load_mmproj_from_bytes(&mut self, data: &'static [u8]) -> Result<(), String> {
+        if self.vision_encoder.is_some() {
+            return Ok(());
+        }
+        use crate::engine::io::parse_gguf_from_bytes;
+        let mmproj = parse_gguf_from_bytes(data, false)
+            .map_err(|e| format!("failed to parse embedded mmproj: {e}"))?;
+        self.vision_encoder = build_vision_encoder_from_mmproj(&self.config, mmproj)?;
+        Ok(())
+    }
+
     /// Load a model from bytes embedded in the binary (e.g. via `include_bytes!`).
     /// Skips multimodal, RAG, and mmproj discovery. Uses conservative defaults
     /// suitable for an interactive assistant.
@@ -2886,6 +2982,10 @@ impl ModelRuntime {
         self.settings.sampling_seed = seed;
     }
 
+    pub(crate) fn set_think_mode_hidden(&mut self) {
+        self.settings.think_mode = ThinkMode::Hidden;
+    }
+
     /// Load (or reload) an embedding encoder and build a RAG index from `source_dir`.
     /// Returns a human-readable status string on success.
     pub(crate) fn load_rag_from_dir(
@@ -2921,6 +3021,45 @@ impl ModelRuntime {
         self.document_encoder = Some(encoder);
         self.rag_index = Some(index);
         Ok(summary)
+    }
+
+    /// Build a RAG index from in-memory `(source_name, markdown_content)` pairs
+    /// using an embedding encoder loaded from bytes embedded in the binary.
+    pub(crate) fn load_rag_from_embedded_docs(
+        &mut self,
+        encoder_bytes: &'static [u8],
+        docs: &[(&str, &str)],
+    ) -> Result<String, String> {
+        let mut encoder = crate::rag::encoder::DocumentEncoder::load_from_bytes(encoder_bytes)?;
+        let index = crate::rag::RagIndex::build_from_text_slices(
+            docs,
+            &mut encoder,
+            self.settings.rag_max_chars_per_chunk,
+            self.settings.rag_max_tokens_per_chunk,
+        )?;
+        let chunk_count = index.len();
+        self.document_encoder = Some(encoder);
+        self.rag_index = Some(index);
+        Ok(format!("RAG: {chunk_count} chunks indexed from embedded docs"))
+    }
+
+    /// Load a precomputed serialized RAG index plus an embedding encoder, both
+    /// from bytes embedded in the binary.  Avoids the CPU-heavy per-chunk
+    /// embedding work that `load_rag_from_embedded_docs` does at startup —
+    /// the chunks were already embedded at build time.
+    pub(crate) fn load_rag_from_serialized_bytes(
+        &mut self,
+        encoder_bytes: &'static [u8],
+        index_bytes: &[u8],
+    ) -> Result<String, String> {
+        let encoder = crate::rag::encoder::DocumentEncoder::load_from_bytes(encoder_bytes)?;
+        let index = crate::rag::RagIndex::load_from_bytes(index_bytes)?;
+        let chunk_count = index.len();
+        self.document_encoder = Some(encoder);
+        self.rag_index = Some(index);
+        Ok(format!(
+            "RAG: {chunk_count} chunks loaded from precomputed index"
+        ))
     }
 
     /// Drop the active RAG encoder and index.

@@ -62,6 +62,48 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Load a model from a filesystem path at runtime.
+    ///
+    /// Use this instead of [`load_from_bytes`](Self::load_from_bytes) when the
+    /// model is too large to embed at compile time (e.g. multimodal vision
+    /// models of 2 GB+).  The real path is preserved internally so that mmproj
+    /// sidecar files are discovered automatically the first time an image is
+    /// passed to [`generate_with_image`](Self::generate_with_image).
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, String> {
+        Ok(Self {
+            inner: ModelRuntime::load_from_file(path, false)?,
+        })
+    }
+
+    /// Load the mmproj vision projector from bytes embedded in the binary.
+    ///
+    /// Call this once after [`load_from_bytes`] to enable image inference without
+    /// a sidecar file on disk.  The bytes must be a valid GGUF mmproj file
+    /// (e.g. `mmproj-SmolVLM-256M-Instruct-f16.gguf`) passed via `include_bytes!`.
+    pub fn load_mmproj_from_bytes(&mut self, data: &'static [u8]) -> Result<(), String> {
+        self.inner.load_mmproj_from_bytes(data)
+    }
+
+    /// Generate text for an image + prompt pair, returning the complete output.
+    ///
+    /// The image must be a file on the local filesystem — pass the path as-is;
+    /// gguf-runner reads and preprocesses the image internally.
+    ///
+    /// On the first call the mmproj vision projector sidecar is located next to
+    /// the model file and loaded; subsequent calls reuse it.
+    pub fn generate_with_image(
+        &mut self,
+        image_path: &std::path::Path,
+        prompt: &str,
+        system_prompt: &str,
+    ) -> Result<String, String> {
+        let image_str = image_path
+            .to_str()
+            .ok_or_else(|| "image path contains non-UTF8 characters".to_string())?;
+        self.inner
+            .generate_text_with_images(prompt, system_prompt, &[image_str.to_string()], false)
+    }
+
     /// Set the sampling temperature.
     ///
     /// `0.0` (default) → greedy decoding: always picks the highest-probability
@@ -99,6 +141,76 @@ impl EmbeddedRuntime {
     /// time-based seed. Ignored when `temperature == 0.0`.
     pub fn set_sampling_seed(&mut self, seed: Option<u64>) -> &mut Self {
         self.inner.set_sampling_seed(seed);
+        self
+    }
+
+    /// Build a RAG knowledge index from in-memory `(source_name, markdown_content)` pairs.
+    ///
+    /// `encoder_bytes` is a GGUF embedding model (e.g. `include_bytes!("nomic-embed.gguf")`).
+    /// `docs` is a slice of `(source_label, markdown_text)` pairs; the source labels appear
+    /// in the context block shown to the model so they should be human-readable paths.
+    ///
+    /// Every subsequent [`generate`](Self::generate) call will embed the user query,
+    /// retrieve the most relevant chunks, and prepend them to the system prompt automatically.
+    pub fn load_rag_from_embedded_docs(
+        &mut self,
+        encoder_bytes: &'static [u8],
+        docs: &[(&str, &str)],
+    ) -> Result<String, String> {
+        self.inner.load_rag_from_embedded_docs(encoder_bytes, docs)
+    }
+
+    /// Load a precomputed RAG index that was serialized at build time.
+    ///
+    /// `encoder_bytes` is the GGUF embedding model used to embed the runtime
+    /// query.  `index_bytes` is the output of [`build_serialized_rag_index`] —
+    /// a flat byte buffer containing every chunk plus its precomputed embedding.
+    ///
+    /// Unlike [`load_rag_from_embedded_docs`](Self::load_rag_from_embedded_docs),
+    /// this path does **no** per-chunk embedding work at startup, so the model
+    /// is ready to serve immediately even for large doc sets.
+    pub fn load_rag_from_serialized_bytes(
+        &mut self,
+        encoder_bytes: &'static [u8],
+        index_bytes: &[u8],
+    ) -> Result<String, String> {
+        self.inner
+            .load_rag_from_serialized_bytes(encoder_bytes, index_bytes)
+    }
+
+    /// Build a serialized RAG index from `(source, markdown)` pairs and return
+    /// its bytes.  Intended to be called from a `build.rs` script so the
+    /// resulting bytes can be embedded via `include_bytes!`.
+    ///
+    /// `encoder_bytes` is the GGUF embedding model used at build time; it must
+    /// match (or share a vector space with) the encoder loaded at runtime via
+    /// [`load_rag_from_serialized_bytes`].
+    pub fn build_serialized_rag_index(
+        encoder_bytes: &'static [u8],
+        docs: &[(&str, &str)],
+        max_chars_per_chunk: usize,
+        max_tokens_per_chunk: usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut encoder =
+            crate::rag::encoder::DocumentEncoder::load_from_bytes(encoder_bytes)?;
+        let index = crate::rag::RagIndex::build_from_text_slices(
+            docs,
+            &mut encoder,
+            max_chars_per_chunk,
+            max_tokens_per_chunk,
+        )?;
+        index.save_to_bytes()
+    }
+
+    /// Force hidden think mode regardless of what the model's chat template specifies.
+    ///
+    /// Some models (e.g. Qwen3.5) default to `ThinkMode::No` based on their chat template,
+    /// which pre-fills an empty `<think></think>` block. When the model produces no visible
+    /// output after that block, there is no retry. Calling this method switches to
+    /// `ThinkMode::Hidden` instead, which enables an automatic retry with thinking suppressed
+    /// whenever the first pass yields empty output.
+    pub fn use_hidden_think_mode(&mut self) -> &mut Self {
+        self.inner.set_think_mode_hidden();
         self
     }
 

@@ -359,6 +359,12 @@ impl Drop for MappedFile {
     }
 }
 
+// SAFETY: The raw pointer points to memory-mapped model weights that are
+// immutable after loading.  mmap ranges are accessible from any thread within
+// the same process.  `EmbeddedRuntime` serialises access via a `Mutex` in
+// `GgufInferenceProvider`, so no concurrent mutation occurs.
+unsafe impl Send for MappedFile {}
+
 pub(crate) fn ensure_model_range(offset: usize, len: usize) -> Result<(), String> {
     let _ = offset;
     let _ = len;
