@@ -2986,6 +2986,22 @@ impl ModelRuntime {
         self.settings.think_mode = ThinkMode::Hidden;
     }
 
+    /// Override the model's effective context length.
+    ///
+    /// Clamps `config.seq_len` (and `settings.max_tokens` when it would
+    /// exceed the new limit) so that subsequent generations allocate a
+    /// smaller KV cache and truncate to the override on prefill. Passing
+    /// `0` is a no-op, matching `apply_context_size_overrides`.
+    pub(crate) fn set_context_size(&mut self, context_size: usize) {
+        if context_size == 0 {
+            return;
+        }
+        self.config.seq_len = context_size;
+        if self.settings.max_tokens == 0 || self.settings.max_tokens > context_size {
+            self.settings.max_tokens = context_size;
+        }
+    }
+
     /// Load (or reload) an embedding encoder and build a RAG index from `source_dir`.
     /// Returns a human-readable status string on success.
     pub(crate) fn load_rag_from_dir(

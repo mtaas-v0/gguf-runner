@@ -213,6 +213,24 @@ impl EmbeddedRuntime {
         self
     }
 
+    /// Cap the effective context length used for generation and KV cache
+    /// allocation.
+    ///
+    /// Models advertise large native context windows in their GGUF metadata
+    /// (e.g. 32 K for Qwen3.5), but most embedded use cases only need a
+    /// fraction of that. Shrinking the context reduces the per-generation
+    /// KV cache allocation roughly linearly and is the cheapest knob for
+    /// trimming memory and prefill time when long conversations are not
+    /// expected.
+    ///
+    /// `0` is a no-op (keeps whatever the GGUF or chat template requested).
+    /// Values larger than the model's native context are clamped on a
+    /// best-effort basis by the runtime — they will not extend it.
+    pub fn set_context_size(&mut self, context_size: usize) -> &mut Self {
+        self.inner.set_context_size(context_size);
+        self
+    }
+
     /// Enable verbose debug logging (prompt tokens, top-k logits per step,
     /// stop-token rank). Prints to stderr. Off by default.
     pub fn set_debug(&mut self, enabled: bool) -> &mut Self {

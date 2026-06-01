@@ -718,6 +718,18 @@ impl EmbeddingEncoder {
         self.tokenizer.bpe_encode(text, out);
     }
 
+    pub(crate) fn prepare_tokenizer(&mut self) {
+        self.tokenizer.prepare_for_encode();
+    }
+
+    pub(crate) fn tokenize_prepared(&self, text: &str, out: &mut Vec<i32>) {
+        self.tokenizer.encode_prepared(text, out);
+    }
+
+    pub(crate) fn prepared_tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
     /// Borrow the inference-time (read-only) parts as an `EmbedContext`.
     ///
     /// Call this after all tokenisation is done.  The returned context is `Send + Sync`
@@ -811,6 +823,24 @@ impl DocumentEncoder {
     pub(crate) fn tokenize(&mut self, text: &str, out: &mut Vec<i32>) {
         match self {
             Self::Embedding(e) => e.tokenize(text, out),
+        }
+    }
+
+    pub(crate) fn prepare_tokenizer(&mut self) {
+        match self {
+            Self::Embedding(e) => e.prepare_tokenizer(),
+        }
+    }
+
+    pub(crate) fn tokenize_prepared(&self, text: &str, out: &mut Vec<i32>) {
+        match self {
+            Self::Embedding(e) => e.tokenize_prepared(text, out),
+        }
+    }
+
+    pub(crate) fn prepared_tokenizer(&self) -> &Tokenizer {
+        match self {
+            Self::Embedding(e) => e.prepared_tokenizer(),
         }
     }
 

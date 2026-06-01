@@ -186,6 +186,8 @@ src/
 - RAG module entrypoint and shared index types.
 - Owns:
   - index build orchestration from chunked source documents
+  - exact duplicate-chunk elimination ahead of tokenisation/embedding
+  - tokenizer priming plus parallel chunk tokenisation ahead of embedding
   - dynamically scheduled chunk embedding/progress reporting
   - in-memory embedding matrix assembly for retrieval
   - cosine-similarity retrieval plus keyword rescue

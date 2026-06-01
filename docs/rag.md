@@ -212,7 +212,7 @@ This is handled automatically when the encoder's `general.architecture` is `nomi
 
 ## Performance notes
 
-- **Index build**: single-threaded tokenisation followed by parallel transformer inference across rayon workers (one `RunState` per thread). For BERT-family encoders, smaller chunks can be materially faster because attention cost grows with sequence length, but smaller chunks also raise total chunk count. A token cap is often a better tradeoff: try `--rag-max-tokens-per-chunk 256` or `320` before reducing `--rag-max-chars-per-chunk` aggressively.
+- **Index build**: exact duplicate chunk texts are deduplicated first, then unique chunks go through parallel tokenisation and parallel transformer inference across rayon workers (one `RunState` per thread). For BERT-family encoders, smaller chunks can be materially faster because attention cost grows with sequence length, but smaller chunks also raise total chunk count. A token cap is often a better tradeoff: try `--rag-max-tokens-per-chunk 256` or `320` before reducing `--rag-max-chars-per-chunk` aggressively.
 - **Index load**: sequential disk read, ~1 s for 150 MB on SSD.
 - **Query time**: negligible — a single matrix-vector multiply over the flat embedding matrix, parallelised by rayon.
 - **Memory**: the flat embedding matrix for 40k × 768 = ~117 MB resident in RAM while loaded.

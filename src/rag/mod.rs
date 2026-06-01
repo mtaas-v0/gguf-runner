@@ -31,6 +31,7 @@ struct RagBuildWorkerStats {
 #[derive(Debug, Clone)]
 struct RagBuildTrace {
     chunks: usize,
+    unique_chunks: usize,
     dim: usize,
     is_bert_family: bool,
     total_tokens: usize,
@@ -46,6 +47,12 @@ struct RagBuildTrace {
     worker_stats: Vec<RagBuildWorkerStats>,
 }
 
+#[derive(Debug, Clone)]
+struct ChunkDedupPlan {
+    unique_texts: Vec<String>,
+    chunk_to_unique: Vec<usize>,
+}
+
 impl RagBuildTrace {
     fn print(&self) {
         let arch = if self.is_bert_family {
@@ -54,8 +61,9 @@ impl RagBuildTrace {
             "decoder-family"
         };
         eprintln!(
-            "[RAG-BUILD] chunks={} dim={} arch={} tokens={} avg_tokens/chunk={:.1} max_tokens={}",
+            "[RAG-BUILD] chunks={} unique_chunks={} dim={} arch={} tokens={} avg_tokens/chunk={:.1} max_tokens={}",
             self.chunks,
+            self.unique_chunks,
             self.dim,
             arch,
             self.total_tokens,
@@ -89,6 +97,36 @@ impl RagBuildTrace {
                 tok_per_sec
             );
         }
+    }
+}
+
+fn build_chunk_dedup_plan(
+    raw_chunks: &[chunker::RawChunk],
+    document_prefix: &str,
+) -> ChunkDedupPlan {
+    let total = raw_chunks.len();
+    let mut unique_lookup: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(total);
+    let mut unique_texts: Vec<String> = Vec::with_capacity(total);
+    let mut chunk_to_unique: Vec<usize> = Vec::with_capacity(total);
+    for raw in raw_chunks {
+        let mut text = String::with_capacity(document_prefix.len() + raw.text.len());
+        if !document_prefix.is_empty() {
+            text.push_str(document_prefix);
+        }
+        text.push_str(&raw.text);
+        if let Some(&idx) = unique_lookup.get(&text) {
+            chunk_to_unique.push(idx);
+        } else {
+            let idx = unique_texts.len();
+            unique_lookup.insert(text.clone(), idx);
+            unique_texts.push(text);
+            chunk_to_unique.push(idx);
+        }
+    }
+    ChunkDedupPlan {
+        unique_texts,
+        chunk_to_unique,
     }
 }
 
@@ -167,39 +205,46 @@ impl RagIndex {
         }
         let dim = encoder.dim();
 
-        // ── Phase 1: tokenise all chunks sequentially ──────────────────────
-        // `bpe_encode` requires `&mut Tokenizer` (lazy hashmap init), so this
-        // cannot be parallelised without cloning the tokenizer per thread.
-        // Tokenisation is fast compared to inference; do it upfront.
+        // ── Phase 0: deduplicate identical chunk texts ─────────────────────
+        // Large doc trees often repeat boilerplate blocks or generated content.
+        // Tokenize/embed each exact chunk body once, then fan the shared result
+        // back out when assembling the final index.
+        let dedup_plan = build_chunk_dedup_plan(&raw_chunks, encoder.document_prefix());
+        let unique_texts = dedup_plan.unique_texts;
+        let chunk_to_unique = dedup_plan.chunk_to_unique;
+        let unique_total = unique_texts.len();
+
+        // ── Phase 1: tokenise all chunks in parallel ───────────────────────
+        // The tokenizer lazily builds lookup tables, so prime those once on
+        // the main thread, then share the read-only tokenizer across rayon
+        // workers for the steady-state encode path.
         let token_t0 = Instant::now();
+        encoder.prepare_tokenizer();
         let all_token_ids: Vec<Vec<i32>> = {
-            let doc_prefix = encoder.document_prefix().to_string();
-            let mut out = Vec::with_capacity(total);
-            let mut ids = Vec::new();
-            for raw in &raw_chunks {
-                let text = if doc_prefix.is_empty() {
-                    raw.text.clone()
-                } else {
-                    format!("{doc_prefix}{}", raw.text)
-                };
-                encoder.tokenize(&text, &mut ids);
-                if max_tokens_per_chunk > 0 && ids.len() > max_tokens_per_chunk {
-                    ids.truncate(max_tokens_per_chunk);
-                }
-                out.push(ids.clone());
-                ids.clear();
-            }
-            out
+            let tokenizer = encoder.prepared_tokenizer();
+            unique_texts
+                .par_iter()
+                .map_init(Vec::new, |ids, text| {
+                    tokenizer.encode_prepared(text, ids);
+                    if max_tokens_per_chunk > 0 && ids.len() > max_tokens_per_chunk {
+                        ids.truncate(max_tokens_per_chunk);
+                    }
+                    ids.clone()
+                })
+                .collect()
         };
         let tokenization_secs = token_t0.elapsed().as_secs_f64();
-        let total_tokens: usize = all_token_ids.iter().map(Vec::len).sum();
+        let total_tokens: usize = chunk_to_unique
+            .iter()
+            .map(|&idx| all_token_ids[idx].len())
+            .sum();
         let max_tokens = all_token_ids.iter().map(Vec::len).max().unwrap_or(0);
         let avg_tokens_per_chunk = total_tokens as f64 / total as f64;
 
         let ctx = encoder.embed_context();
         let done = AtomicUsize::new(0);
         let start = Instant::now();
-        let num_threads = rayon::current_num_threads().min(total).max(1);
+        let num_threads = rayon::current_num_threads().min(unique_total).max(1);
         let scheduling_secs = 0.0;
         let work_grain = if ctx.config.is_bert_family {
             1usize
@@ -238,10 +283,10 @@ impl RagIndex {
 
                 loop {
                     let lo = next_chunk.fetch_add(work_grain, Ordering::Relaxed);
-                    if lo >= total {
+                    if lo >= unique_total {
                         break;
                     }
-                    let hi = (lo + work_grain).min(total);
+                    let hi = (lo + work_grain).min(unique_total);
                     for (offset, ids) in all_token_ids[lo..hi].iter().enumerate() {
                         let idx = lo + offset;
                         batch_chunks += 1;
@@ -250,11 +295,13 @@ impl RagIndex {
                         batch_est_cost += ids.len().saturating_mul(ids.len());
                         let emb = embed_raw(ids, &ctx, &mut rs, &mut bs)?;
                         let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n.is_multiple_of(10) || n == total {
+                        if n.is_multiple_of(10) || n == unique_total {
                             let elapsed = start.elapsed().as_secs_f64();
                             let rate = n as f64 / elapsed;
-                            let eta = ((total - n) as f64 / rate) as u64;
-                            let msg = format!("{n}/{total}  {rate:.0} chunks/s  ETA {eta}s");
+                            let eta = ((unique_total - n) as f64 / rate) as u64;
+                            let msg = format!(
+                                "{n}/{unique_total} unique chunks  {rate:.0} chunks/s  ETA {eta}s"
+                            );
                             if let Some(cb) = &progress {
                                 cb(msg);
                             } else {
@@ -285,7 +332,7 @@ impl RagIndex {
         }
 
         let assembly_t0 = Instant::now();
-        let mut embeddings: Vec<Option<Vec<f32>>> = (0..total).map(|_| None).collect();
+        let mut embeddings: Vec<Option<Vec<f32>>> = (0..unique_total).map(|_| None).collect();
         let mut worker_stats = Vec::with_capacity(num_threads);
         for (batch, stats) in batches.into_iter().collect::<Result<Vec<_>, _>>()? {
             for (idx, embedding) in batch {
@@ -296,8 +343,11 @@ impl RagIndex {
 
         let mut chunks: Vec<RagChunk> = Vec::with_capacity(total);
         let mut flat_embeddings: Vec<f32> = Vec::with_capacity(total * dim);
-        for (raw, embedding) in raw_chunks.into_iter().zip(embeddings) {
-            let embedding = embedding.ok_or_else(|| "missing RAG embedding result".to_string())?;
+        for (raw, unique_idx) in raw_chunks.into_iter().zip(chunk_to_unique) {
+            let embedding = embeddings[unique_idx]
+                .as_ref()
+                .ok_or_else(|| "missing RAG embedding result".to_string())?
+                .clone();
             flat_embeddings.extend_from_slice(&embedding);
             chunks.push(RagChunk {
                 source: raw.source,
@@ -316,6 +366,7 @@ impl RagIndex {
             });
             RagBuildTrace {
                 chunks: total,
+                unique_chunks: unique_total,
                 dim,
                 is_bert_family: ctx.config.is_bert_family,
                 total_tokens,
@@ -535,6 +586,8 @@ pub(crate) fn prepend_rag_context(chunks: &[&RagChunk], system_prompt: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
 
     fn make_chunk(source: &str, text: &str, emb: Vec<f32>) -> RagChunk {
         RagChunk {
@@ -589,5 +642,118 @@ mod tests {
     fn prepend_context_no_chunks() {
         let out = prepend_rag_context(&[], "original");
         assert_eq!(out, "original");
+    }
+
+    #[test]
+    fn dedup_plan_reuses_exact_prefixed_texts() {
+        let raw_chunks = vec![
+            chunker::RawChunk {
+                source: "a.md".to_string(),
+                text: "same".to_string(),
+            },
+            chunker::RawChunk {
+                source: "b.md".to_string(),
+                text: "same".to_string(),
+            },
+            chunker::RawChunk {
+                source: "c.md".to_string(),
+                text: "different".to_string(),
+            },
+        ];
+
+        let plan = build_chunk_dedup_plan(&raw_chunks, "search_document: ");
+
+        assert_eq!(plan.unique_texts.len(), 2);
+        assert_eq!(plan.chunk_to_unique, vec![0, 0, 1]);
+        assert_eq!(plan.unique_texts[0], "search_document: same");
+        assert_eq!(plan.unique_texts[1], "search_document: different");
+    }
+
+    fn count_source_files(dir: &Path) -> Result<usize, String> {
+        let mut total = 0usize;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            let entries = std::fs::read_dir(&path)
+                .map_err(|e| format!("cannot read directory '{}': {e}", path.display()))?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    format!(
+                        "cannot read directory entry under '{}': {e}",
+                        path.display()
+                    )
+                })?;
+                let child = entry.path();
+                if child.is_dir() {
+                    stack.push(child);
+                } else if let Some(ext) = child.extension().and_then(|s| s.to_str())
+                    && (ext == "md"
+                        || matches!(
+                            ext,
+                            "rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "go" | "c" | "h" | "java"
+                        ))
+                {
+                    total += 1;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    fn dedup_report_for_dir(
+        dir: &Path,
+        max_chars: usize,
+        document_prefix: &str,
+    ) -> Result<String, String> {
+        let raw_chunks = chunker::chunk_directory(dir, max_chars)?;
+        let plan = build_chunk_dedup_plan(&raw_chunks, document_prefix);
+        let total_chunks = raw_chunks.len();
+        let unique_chunks = plan.unique_texts.len();
+        let duplicate_chunks = total_chunks.saturating_sub(unique_chunks);
+        let duplicate_ratio = if total_chunks > 0 {
+            duplicate_chunks as f64 / total_chunks as f64
+        } else {
+            0.0
+        };
+        let mut reuse_counts: BTreeMap<usize, usize> = BTreeMap::new();
+        for &idx in &plan.chunk_to_unique {
+            *reuse_counts.entry(idx).or_insert(0) += 1;
+        }
+        let reused_texts = reuse_counts.values().filter(|&&count| count > 1).count();
+        let max_reuse = reuse_counts.values().copied().max().unwrap_or(0);
+        let source_files = count_source_files(dir)?;
+        Ok(format!(
+            "RAG_DEDUP source_dir={} source_files={} max_chars={} chunks={} unique_chunks={} duplicate_chunks={} duplicate_ratio={:.4} reused_texts={} max_reuse={}",
+            dir.display(),
+            source_files,
+            max_chars,
+            total_chunks,
+            unique_chunks,
+            duplicate_chunks,
+            duplicate_ratio,
+            reused_texts,
+            max_reuse
+        ))
+    }
+
+    fn dedup_source_dir_from_env() -> Result<PathBuf, String> {
+        std::env::var_os("RAG_DEDUP_SOURCE_DIR")
+            .map(PathBuf::from)
+            .ok_or_else(|| "RAG_DEDUP_SOURCE_DIR is not set".to_string())
+    }
+
+    #[test]
+    #[ignore]
+    fn report_source_chunk_dedup_1200() {
+        let dir = dedup_source_dir_from_env().expect("source dir env");
+        let line = dedup_report_for_dir(&dir, 1200, "").expect("dedup report");
+        eprintln!("{line}");
+    }
+
+    #[test]
+    #[ignore]
+    fn report_source_chunk_dedup_1800() {
+        let dir = dedup_source_dir_from_env().expect("source dir env");
+        let line = dedup_report_for_dir(&dir, 1800, "").expect("dedup report");
+        eprintln!("{line}");
     }
 }
