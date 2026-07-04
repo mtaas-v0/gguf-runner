@@ -5,4 +5,4 @@ mod rag;
 mod tools;
 mod vendors;
 
-pub use app::embed::{EmbeddedRuntime, Tool};
+pub use app::embed::{EmbeddedRuntime, GenerationStats, Tool};

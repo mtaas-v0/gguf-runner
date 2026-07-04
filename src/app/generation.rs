@@ -1351,6 +1351,7 @@ pub(crate) struct GenerationSettings {
     pub(crate) repeat_last_n: usize,
     pub(crate) max_tokens: usize,
     pub(crate) profiling_mode: bool,
+    pub(crate) show_timings: bool,
     pub(crate) show_tokens: bool,
     pub(crate) debug_mode: bool,
     pub(crate) think_mode: ThinkMode,
@@ -2404,6 +2405,7 @@ impl ModelRuntime {
             repeat_last_n: 64,
             max_tokens,
             profiling_mode: false,
+            show_timings: false,
             show_tokens: false,
             debug_mode,
             think_mode: if config.qwen_chat_template_uses_empty_think {
@@ -2496,6 +2498,7 @@ impl ModelRuntime {
             repeat_last_n: 64,
             max_tokens,
             profiling_mode: false,
+            show_timings: false,
             show_tokens: false,
             debug_mode: false,
             think_mode: if config.qwen_chat_template_uses_empty_think {
@@ -2722,6 +2725,7 @@ impl ModelRuntime {
             repeat_last_n: cli.repeat_last_n,
             max_tokens,
             profiling_mode: cli.profiling,
+            show_timings: cli.show_timings,
             show_tokens: cli.show_tokens,
             debug_mode,
             think_mode: effective_think_mode,

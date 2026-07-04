@@ -5,14 +5,14 @@ use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, re
 use crate::engine::profiling::{PROF_MATMUL_NS, prof_end, prof_start};
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::{
-    AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS, AARCH64_Q6K_MR4_STATUS,
-    AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows, use_aarch64_dotprod_q8,
-    use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
+    AARCH64_Q3K_MR4_STATUS, AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS,
+    AARCH64_Q6K_MR4_STATUS, AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows,
+    use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
-    X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, is_x86_amd, use_x86_avx_vnni,
-    use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_f16c, use_x86_qk_mr4,
+    X86_Q3K_MR4_STATUS, X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, is_x86_amd,
+    use_x86_avx_vnni, use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_f16c, use_x86_qk_mr4,
 };
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 use crate::engine::types::{
@@ -1953,6 +1953,83 @@ pub(crate) fn vec_dot_q3_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     sum
 }
 
+/// Four-row Q3_K dot product: computes `x · row_r` for four contiguous weight
+/// rows sharing the activation `x`. Numerically identical to calling
+/// [`vec_dot_q3_k`] on each row (same accumulation order), but the shared
+/// activation element `xv` is loaded once and applied to all four rows with four
+/// register accumulators — the loop LLVM autovectorizes into AVX/NEON FMAs. This
+/// is the portable MR4 microkernel for Q3_K; the runtime self-check
+/// (`validate_qk_mr4_once*`) verifies it against the scalar path on real tensors
+/// before enabling it.
+pub(crate) fn vec_dot_q3_k_4rows(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
+    let mut sums = [0.0f32; 4];
+
+    let sc_off = QK_K / 8 + QK_K / 4;
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+
+        let hmask: [&[u8]; 4] = std::array::from_fn(|r| &rows[r][off..off + QK_K / 8]);
+        let scales: [[i8; 16]; 4] =
+            std::array::from_fn(|r| q3_scales(&rows[r][off + sc_off..off + sc_off + 12]));
+        let d_all: [f32; 4] =
+            std::array::from_fn(|r| fp16_to_fp32(read_u16_le(rows[r], off + sc_off + 12)));
+
+        let mut q_off = off + QK_K / 8;
+        let mut is = 0usize;
+        let mut m: u8 = 1;
+        let mut block_sum = [0.0f32; 4];
+
+        for n_outer in (0..QK_K).step_by(128) {
+            let q: [&[u8]; 4] = std::array::from_fn(|r| &rows[r][q_off..q_off + 32]);
+            let mut shift = 0usize;
+            for j in 0..4 {
+                let dl: [f32; 4] =
+                    std::array::from_fn(|r| d_all[r] * (scales[r][is] as i32 - 32) as f32);
+                is += 1;
+                for l in 0..16 {
+                    let idx = n_outer + j * 32 + l;
+                    let xv = xb[idx];
+                    for r in 0..4 {
+                        let wv = ((q[r][l] >> shift) & 3) as i8
+                            - if (hmask[r][l] & m) != 0 { 0 } else { 4 };
+                        block_sum[r] += xv * dl[r] * wv as f32;
+                    }
+                }
+                let dl2: [f32; 4] =
+                    std::array::from_fn(|r| d_all[r] * (scales[r][is] as i32 - 32) as f32);
+                is += 1;
+                for l in 0..16 {
+                    let idx = n_outer + j * 32 + 16 + l;
+                    let xv = xb[idx];
+                    for r in 0..4 {
+                        let wv = ((q[r][l + 16] >> shift) & 3) as i8
+                            - if (hmask[r][l + 16] & m) != 0 { 0 } else { 4 };
+                        block_sum[r] += xv * dl2[r] * wv as f32;
+                    }
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q_off += 32;
+        }
+        for r in 0..4 {
+            sums[r] += block_sum[r];
+        }
+    }
+    sums
+}
+
 pub(crate) fn vec_dot_q4_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     let nb = n / QK_K;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
@@ -2653,6 +2730,7 @@ pub(crate) fn matmul_qk_mr4_chunk(
         let r2 = &mapped[row2_off..row2_off + row_size];
         let r3 = &mapped[row3_off..row3_off + row_size];
         let sums = match ttype {
+            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
@@ -2675,6 +2753,7 @@ pub(crate) fn matmul_qk_mr4_chunk(
         let row_off = data_offset + (base_row + i) * row_size;
         let row = &mapped[row_off..row_off + row_size];
         out[i] = match ttype {
+            GGML_TYPE_Q3_K => vec_dot_q3_k(x, row, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k(x, row, n),
@@ -2688,6 +2767,7 @@ pub(crate) fn matmul_qk_mr4_chunk(
 #[inline]
 pub(crate) fn mr4_status(ttype: i32) -> &'static AtomicU8 {
     match ttype {
+        GGML_TYPE_Q3_K => &AARCH64_Q3K_MR4_STATUS,
         GGML_TYPE_Q4_K => &AARCH64_Q4K_MR4_STATUS,
         GGML_TYPE_Q5_K => &AARCH64_Q5K_MR4_STATUS,
         GGML_TYPE_Q6_K => &AARCH64_Q6K_MR4_STATUS,
@@ -2718,12 +2798,19 @@ pub(crate) fn validate_qk_mr4_once(
     let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
 
     let mr4 = match ttype {
+        GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
         _ => unreachable!(),
     };
     let scalar = match ttype {
+        GGML_TYPE_Q3_K => [
+            vec_dot_q3_k(x, r0, n),
+            vec_dot_q3_k(x, r1, n),
+            vec_dot_q3_k(x, r2, n),
+            vec_dot_q3_k(x, r3, n),
+        ],
         GGML_TYPE_Q4_K => [
             vec_dot_q4_k(x, r0, n),
             vec_dot_q4_k(x, r1, n),
@@ -2780,7 +2867,10 @@ pub(crate) fn try_matmul_qk_mr4(
     if !use_aarch64_qk_mr4() {
         return false;
     }
-    if !matches!(ttype, GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K) {
+    if !matches!(
+        ttype,
+        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+    ) {
         return false;
     }
     if n < QK_K || !n.is_multiple_of(QK_K) {
@@ -4031,6 +4121,7 @@ pub(crate) fn matmul_qk_mr4_chunk_x86(
         let r2 = &mapped[row2_off..row2_off + row_size];
         let r3 = &mapped[row3_off..row3_off + row_size];
         let sums = match ttype {
+            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86(x, r0, r1, r2, r3, n),
@@ -4053,6 +4144,7 @@ pub(crate) fn matmul_qk_mr4_chunk_x86(
         let row_off = data_offset + (base_row + i) * row_size;
         let row = &mapped[row_off..row_off + row_size];
         out[i] = match ttype {
+            GGML_TYPE_Q3_K => vec_dot_q3_k(x, row, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k(x, row, n),
@@ -4066,6 +4158,7 @@ pub(crate) fn matmul_qk_mr4_chunk_x86(
 #[inline]
 pub(crate) fn mr4_status_x86(ttype: i32) -> &'static AtomicU8 {
     match ttype {
+        GGML_TYPE_Q3_K => &X86_Q3K_MR4_STATUS,
         GGML_TYPE_Q4_K => &X86_Q4K_MR4_STATUS,
         GGML_TYPE_Q5_K => &X86_Q5K_MR4_STATUS,
         GGML_TYPE_Q6_K => &X86_Q6K_MR4_STATUS,
@@ -4096,12 +4189,19 @@ pub(crate) fn validate_qk_mr4_once_x86(
     let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
 
     let mr4 = match ttype {
+        GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86(x, r0, r1, r2, r3, n),
         _ => unreachable!(),
     };
     let scalar = match ttype {
+        GGML_TYPE_Q3_K => [
+            vec_dot_q3_k(x, r0, n),
+            vec_dot_q3_k(x, r1, n),
+            vec_dot_q3_k(x, r2, n),
+            vec_dot_q3_k(x, r3, n),
+        ],
         GGML_TYPE_Q4_K => [
             vec_dot_q4_k(x, r0, n),
             vec_dot_q4_k(x, r1, n),
@@ -4158,7 +4258,10 @@ pub(crate) fn try_matmul_qk_mr4_x86(
     if !use_x86_qk_mr4() {
         return false;
     }
-    if !matches!(ttype, GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K) {
+    if !matches!(
+        ttype,
+        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+    ) {
         return false;
     }
     if n < QK_K || n % QK_K != 0 {
@@ -4361,7 +4464,40 @@ pub(crate) fn matmul_quantized(
             }
         }
         GGML_TYPE_Q2_K => run_rows!(vec_dot_q2_k),
-        GGML_TYPE_Q3_K => run_rows!(vec_dot_q3_k),
+        GGML_TYPE_Q3_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q3_K,
+                ) {
+                    run_rows!(vec_dot_q3_k);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_qk_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q3_K,
+                ) {
+                    run_rows!(vec_dot_q3_k);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q3_k);
+            }
+        }
         GGML_TYPE_Q4_K => {
             #[cfg(target_arch = "aarch64")]
             {
@@ -4597,7 +4733,40 @@ pub(crate) fn matmul_quantized_rows(
             }
         }
         GGML_TYPE_Q2_K => run_rows!(vec_dot_q2_k),
-        GGML_TYPE_Q3_K => run_rows!(vec_dot_q3_k),
+        GGML_TYPE_Q3_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q3_K,
+                ) {
+                    run_rows!(vec_dot_q3_k);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_qk_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q3_K,
+                ) {
+                    run_rows!(vec_dot_q3_k);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q3_k);
+            }
+        }
         GGML_TYPE_Q4_K => {
             #[cfg(target_arch = "aarch64")]
             {
@@ -5008,6 +5177,68 @@ mod tests {
 
         for (got, want) in batch_out.iter().zip(repeated_out.iter()) {
             assert!((got - want).abs() < 1e-6, "got={got} want={want}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod q3k_mr4_tests {
+    use super::*;
+    use crate::engine::types::GgmlType;
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut s = *state;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *state = s;
+        s
+    }
+
+    /// The 4-row Q3_K kernel must equal the reference single-row `vec_dot_q3_k`
+    /// on every row — this is exactly what the runtime self-check enforces, and
+    /// it de-risks the MR4 wiring without needing the model.
+    #[test]
+    fn q3k_4rows_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
+        let mut st = 0x9E3779B97F4A7C15u64;
+
+        for nb in [1usize, 2, 5] {
+            let n = nb * QK_K;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                // Force each super-block scale `d` (fp16 at block end) finite and
+                // positive so random bytes can't yield NaN/Inf and break the compare.
+                for i in 0..nb {
+                    let d_at = i * block_sz + QK_K / 8 + QK_K / 4 + 12;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[d_at] = (d16 & 0xff) as u8;
+                    row[d_at + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q3_k_4rows(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q3_k(&x, &rows[0], n),
+                vec_dot_q3_k(&x, &rows[1], n),
+                vec_dot_q3_k(&x, &rows[2], n),
+                vec_dot_q3_k(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
         }
     }
 }

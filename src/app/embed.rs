@@ -3,12 +3,31 @@
 // exports EmbeddedRuntime and does not re-export binary-only code.
 #![allow(dead_code)]
 
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
 
-use crate::app::events::{RuntimeEvent, RuntimeEventCallback};
+use crate::app::events::{RuntimeEvent, RuntimeEventCallback, RuntimeProgress};
 use crate::app::generation::ModelRuntime;
 use crate::vendors::{ChatMessage, ChatRole};
+
+/// Timing / throughput stats for one [`EmbeddedRuntime::generate_with_tools_streaming`]
+/// call, aggregated across any tool-call turns. Surfaced so an interactive caller can
+/// print a status line (prefill / decode token counts and the decode rate).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GenerationStats {
+    /// Prompt tokens processed (prefill), summed over all turns.
+    pub prefill_tokens: usize,
+    /// Tokens generated (decode), summed over all turns.
+    pub decode_tokens: usize,
+    /// Hidden-think tokens (included in `decode_tokens`), summed over all turns.
+    pub hidden_think_tokens: usize,
+    /// Decode throughput of the final turn, tokens/second (`None` if unmeasured).
+    pub tokens_per_second: Option<f64>,
+    /// KV-cache context used at the end of the final turn.
+    pub context_used: usize,
+    /// KV-cache context limit.
+    pub context_limit: usize,
+}
 
 /// A tool that can be called by the model during generation.
 ///
@@ -399,6 +418,103 @@ impl EmbeddedRuntime {
             }
         }
     }
+
+    /// Like [`generate_with_tools`](Self::generate_with_tools), but streams the
+    /// final natural-language answer to `on_token` **token-by-token as it is
+    /// produced**, and returns [`GenerationStats`] rather than a channel.
+    ///
+    /// Tool-call turns run silently: only the model's user-facing prose reaches
+    /// `on_token`. A `<tool_call>` block (and everything after it within a turn)
+    /// is suppressed, and a partial tag split across streamed fragments is never
+    /// emitted. This lets an interactive caller show output immediately instead
+    /// of blocking on the whole (possibly multi-turn) tool loop.
+    pub fn generate_with_tools_streaming(
+        &mut self,
+        history: &[(String, String)],
+        input: &str,
+        system_prompt: &str,
+        tools: &mut [&mut dyn Tool],
+        max_tool_calls: usize,
+        on_token: impl FnMut(&str) + Send + 'static,
+    ) -> Result<GenerationStats, String> {
+        let tool_system_prompt = build_tool_system_prompt(system_prompt, tools);
+
+        let mut extended_history: Vec<(String, String)> = history.to_vec();
+        let mut current_input = input.to_string();
+        let mut call_count = 0usize;
+        let mut stats = GenerationStats::default();
+
+        // One sink, reused across turns; only the final-answer turn (plus any
+        // leading prose before a tool call) actually forwards to it.
+        let sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>> =
+            Arc::new(Mutex::new(Box::new(on_token)));
+
+        loop {
+            let messages = build_messages(&extended_history, &current_input);
+            let turn = Arc::new(Mutex::new(TurnStream::new(Arc::clone(&sink))));
+
+            let cb_turn = Arc::clone(&turn);
+            let cb: RuntimeEventCallback = Arc::new(move |event: RuntimeEvent| {
+                if let Ok(mut t) = cb_turn.lock() {
+                    match event {
+                        RuntimeEvent::Output(text) => t.on_output(&text),
+                        RuntimeEvent::Progress(p) => t.last_progress = Some(p),
+                        _ => {}
+                    }
+                }
+            });
+
+            self.inner.set_runtime_event_callback(Some(cb));
+            let result = self
+                .inner
+                .generate_chat_messages_for_repl(&messages, &tool_system_prompt);
+            self.inner.set_runtime_event_callback(None);
+            result?;
+
+            let (raw, last_progress) = {
+                let mut t = turn.lock().unwrap();
+                t.finish();
+                (std::mem::take(&mut t.raw), t.last_progress.take())
+            };
+
+            if let Some(p) = last_progress {
+                stats.prefill_tokens += p.prefill_tokens;
+                stats.decode_tokens += p.decode_tokens;
+                stats.hidden_think_tokens += p.hidden_think_tokens;
+                stats.tokens_per_second = p.tokens_per_second;
+                stats.context_used = p.context_used;
+                stats.context_limit = p.context_limit;
+            }
+
+            match extract_tool_call(&raw) {
+                Some(call) => {
+                    if call_count >= max_tool_calls {
+                        return Err(format!(
+                            "max_tool_calls ({max_tool_calls}) reached before final response"
+                        ));
+                    }
+                    call_count += 1;
+
+                    let result = tools
+                        .iter_mut()
+                        .find(|t| t.name() == call.name)
+                        .map(|t| t.call(&call.arguments))
+                        .unwrap_or_else(|| Err(format!("unknown tool: {}", call.name)));
+                    let result_json = match result {
+                        Ok(v) => v,
+                        Err(e) => serde_json::json!({ "error": e }),
+                    };
+                    let tool_result_msg = format!(
+                        "<tool_response>\n{}\n</tool_response>",
+                        serde_json::to_string(&result_json).unwrap_or_else(|_| "{}".to_string())
+                    );
+                    extended_history.push((current_input.clone(), raw));
+                    current_input = tool_result_msg;
+                }
+                None => return Ok(stats),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +528,91 @@ impl EmbeddedRuntime {
 //   <tool_response>...</tool_response>
 // If the model produces no <tool_call> tag, the response is treated as the
 // final natural-language answer.
+
+const TOOL_CALL_OPEN: &str = "<tool_call>";
+
+/// Per-turn streaming filter for [`EmbeddedRuntime::generate_with_tools_streaming`].
+///
+/// Forwards the model's user-facing prose to the caller sink as it streams, while
+/// withholding a small trailing window so a `<tool_call>` tag straddling two
+/// fragments is never partially emitted. Once a complete `<tool_call>` open tag is
+/// seen, the remainder of the turn is suppressed (it is protocol, not an answer).
+struct TurnStream {
+    /// Full raw turn text, including any tool-call block (for `extract_tool_call`).
+    raw: String,
+    /// Not-yet-forwarded output (may hold a partial `<tool_call>` prefix).
+    buf: String,
+    /// Set once a `<tool_call>` open tag is seen: suppress the remainder.
+    suppressing: bool,
+    sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>>,
+    last_progress: Option<RuntimeProgress>,
+}
+
+impl TurnStream {
+    fn new(sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>>) -> Self {
+        Self {
+            raw: String::new(),
+            buf: String::new(),
+            suppressing: false,
+            sink,
+            last_progress: None,
+        }
+    }
+
+    fn on_output(&mut self, text: &str) {
+        self.raw.push_str(text);
+        if self.suppressing {
+            return;
+        }
+        self.buf.push_str(text);
+
+        // A complete tool-call tag: forward any prose before it, suppress the rest.
+        if let Some(pos) = self.buf.find(TOOL_CALL_OPEN) {
+            let prose = self.buf[..pos].to_string();
+            if !prose.trim().is_empty() {
+                self.emit(&prose);
+            }
+            self.suppressing = true;
+            self.buf.clear();
+            return;
+        }
+
+        // Forward everything except a trailing window that could still grow into
+        // a `<tool_call>` tag.
+        let keep = partial_tag_suffix_len(&self.buf);
+        if self.buf.len() > keep {
+            let cut = self.buf.len() - keep;
+            let flush: String = self.buf.drain(..cut).collect();
+            self.emit(&flush);
+        }
+    }
+
+    /// Flush any held-back prose at end of turn (no tool call materialized).
+    fn finish(&mut self) {
+        if !self.suppressing && !self.buf.is_empty() {
+            let rest = std::mem::take(&mut self.buf);
+            self.emit(&rest);
+        }
+    }
+
+    fn emit(&self, text: &str) {
+        if let Ok(mut guard) = self.sink.lock() {
+            let f: &mut (dyn FnMut(&str) + Send) = &mut **guard;
+            f(text);
+        }
+    }
+}
+
+/// Largest `k` in `1..TOOL_CALL_OPEN.len()` such that `buf` ends with the first
+/// `k` bytes of `<tool_call>` — how many trailing (ASCII) bytes might be the
+/// start of a tool-call tag and must be withheld. `0` if none.
+fn partial_tag_suffix_len(buf: &str) -> usize {
+    let max = (TOOL_CALL_OPEN.len() - 1).min(buf.len());
+    (1..=max)
+        .rev()
+        .find(|&k| buf.as_bytes().ends_with(&TOOL_CALL_OPEN.as_bytes()[..k]))
+        .unwrap_or(0)
+}
 
 struct ToolCallRequest {
     name: String,
@@ -604,4 +805,79 @@ fn build_messages(history: &[(String, String)], input: &str) -> Vec<ChatMessage>
         content: input.to_string(),
     });
     messages
+}
+
+#[cfg(test)]
+mod stream_filter_tests {
+    use super::*;
+
+    /// Feed `fragments` through a `TurnStream` and return `(emitted, suppressed)`.
+    fn run(fragments: &[&str]) -> (String, bool) {
+        let out = Arc::new(Mutex::new(String::new()));
+        let out_cb = Arc::clone(&out);
+        let sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>> =
+            Arc::new(Mutex::new(Box::new(move |s: &str| {
+                out_cb.lock().unwrap().push_str(s);
+            })));
+        let mut ts = TurnStream::new(sink);
+        for f in fragments {
+            ts.on_output(f);
+        }
+        ts.finish();
+        let emitted = out.lock().unwrap().clone();
+        (emitted, ts.suppressing)
+    }
+
+    #[test]
+    fn plain_prose_streams_fully() {
+        let (out, suppressed) = run(&["Hel", "lo, ", "world"]);
+        assert_eq!(out, "Hello, world");
+        assert!(!suppressed);
+    }
+
+    #[test]
+    fn pure_tool_call_is_suppressed() {
+        let (out, suppressed) = run(&["<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>"]);
+        assert_eq!(out, "");
+        assert!(suppressed);
+    }
+
+    #[test]
+    fn tool_call_split_across_fragments_is_suppressed() {
+        // The `<tool_call>` open tag straddles fragment boundaries; no partial
+        // tag must leak to the sink.
+        let (out, suppressed) = run(&["<to", "ol_c", "all>{\"name\":\"x\"}</tool_call>"]);
+        assert_eq!(out, "");
+        assert!(suppressed);
+    }
+
+    #[test]
+    fn prose_before_tool_call_streams_then_suppresses() {
+        let (out, suppressed) = run(&["Let me check. ", "<tool_call>{}</tool_call>"]);
+        assert_eq!(out, "Let me check. ");
+        assert!(suppressed);
+    }
+
+    #[test]
+    fn raw_retains_full_turn_for_extraction() {
+        let out = Arc::new(Mutex::new(String::new()));
+        let out_cb = Arc::clone(&out);
+        let sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>> =
+            Arc::new(Mutex::new(Box::new(move |s: &str| {
+                out_cb.lock().unwrap().push_str(s);
+            })));
+        let mut ts = TurnStream::new(sink);
+        ts.on_output("<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>");
+        ts.finish();
+        assert!(ts.raw.contains("<tool_call>"));
+        assert!(extract_tool_call(&ts.raw).is_some());
+    }
+
+    #[test]
+    fn partial_tag_suffix_len_holds_prefixes_only() {
+        assert_eq!(partial_tag_suffix_len("hello<tool_c"), 7); // "<tool_c"
+        assert_eq!(partial_tag_suffix_len("abc<"), 1);
+        assert_eq!(partial_tag_suffix_len("plain text"), 0);
+        assert_eq!(partial_tag_suffix_len(""), 0);
+    }
 }
