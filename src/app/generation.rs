@@ -3670,13 +3670,25 @@ impl ModelRuntime {
                             .zip(prompt_tokens.iter())
                             .take_while(|(a, b)| a == b)
                             .count();
+                        let window = |toks: &[i32]| -> String {
+                            let lo = lcp.saturating_sub(8);
+                            let hi = (lcp + 8).min(toks.len());
+                            toks[lo..hi]
+                                .iter()
+                                .filter_map(|&t| self.tokenizer.decode_token(t))
+                                .collect::<String>()
+                        };
                         eprintln!(
                             "Warning: prefill cache mismatch — diverges at token {lcp}/{} \
-                             (cached={:?} prompt={:?}, prompt_len={}); cold prefill",
+                             (cached={:?} prompt={:?}, prompt_len={}); cold prefill\n\
+                             cached text around divergence: {:?}\n\
+                             prompt text around divergence: {:?}",
                             pc.tokens.len(),
                             pc.tokens.get(lcp),
                             prompt_tokens.get(lcp),
                             prompt_tokens.len(),
+                            window(&pc.tokens),
+                            window(&prompt_tokens),
                         );
                     }
                     self.prefill_cache_warned = true;

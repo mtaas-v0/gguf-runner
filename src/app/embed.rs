@@ -794,14 +794,19 @@ pub fn build_tool_system_prompt_from_specs(base: &str, specs: &[(&str, &str)]) -
     // the model to use tools only when they're actually relevant to the query,
     // and to write a plain prose answer otherwise — without this, the model
     // tends to call tools eagerly for questions that don't need them.
+    // Explicit key order, not `serde_json::json!`: map key order there depends
+    // on the crate's `preserve_order` feature, which Cargo unifies per build
+    // graph — a build-script render and the runtime binary can disagree,
+    // silently breaking prefill-cache prefix matching. `to_string` on the
+    // individual strings is used only for escaping and is feature-independent.
     let tool_specs: Vec<String> = specs
         .iter()
         .map(|(name, description)| {
-            let spec = serde_json::json!({
-                "name": name,
-                "description": description,
-            });
-            serde_json::to_string(&spec).unwrap_or_default()
+            format!(
+                "{{\"name\":{},\"description\":{}}}",
+                serde_json::to_string(name).unwrap_or_default(),
+                serde_json::to_string(description).unwrap_or_default(),
+            )
         })
         .collect();
 
