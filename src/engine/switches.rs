@@ -128,6 +128,9 @@ pub(crate) static X86_Q6K_MR4_STATUS: AtomicU8 = AtomicU8::new(0);
 static LAYER_DEBUG_CFG: OnceLock<bool> = OnceLock::new();
 static LAYER_DEBUG_POS_CFG: OnceLock<Option<usize>> = OnceLock::new();
 static KV_CACHE_MODE_CFG: OnceLock<KvCacheMode> = OnceLock::new();
+static BATCH_PREFILL_CFG: OnceLock<bool> = OnceLock::new();
+static BATCH_PREFILL_EXACT_CFG: OnceLock<bool> = OnceLock::new();
+static BATCH_PREFILL_CHUNK_CFG: OnceLock<usize> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KvCacheMode {
@@ -202,6 +205,41 @@ pub(crate) fn par_qwen3next_min_heads() -> usize {
 #[inline]
 pub(crate) fn kv_cache_mode() -> KvCacheMode {
     *KV_CACHE_MODE_CFG.get_or_init(|| KvCacheMode::Turbo)
+}
+
+/// Batched prefill kill switch: on by default, `GGUF_BATCH_PREFILL=0` disables.
+#[inline]
+pub(crate) fn use_batch_prefill() -> bool {
+    *BATCH_PREFILL_CFG.get_or_init(|| {
+        std::env::var("GGUF_BATCH_PREFILL")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Debug mode: use the bitwise sequential-mirror batched matmul instead of
+/// the fast dequantize-once kernel (`GGUF_BATCH_PREFILL_EXACT=1`). Isolates
+/// whether a batched-vs-sequential output difference is structural (a bug —
+/// exact mode must match bitwise) or f32-rounding from the fast kernel.
+#[inline]
+pub(crate) fn batch_prefill_exact() -> bool {
+    *BATCH_PREFILL_EXACT_CFG.get_or_init(|| {
+        std::env::var("GGUF_BATCH_PREFILL_EXACT")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Tokens per batched-prefill chunk (`GGUF_BATCH_PREFILL_CHUNK`, default 64).
+#[inline]
+pub(crate) fn batch_prefill_chunk() -> usize {
+    *BATCH_PREFILL_CHUNK_CFG.get_or_init(|| {
+        std::env::var("GGUF_BATCH_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(64)
+    })
 }
 
 #[cfg(target_arch = "aarch64")]

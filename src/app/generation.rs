@@ -3723,6 +3723,57 @@ impl ModelRuntime {
                 ),
             );
         }
+
+        // Batched prefill: process all but the last prompt token in chunks so
+        // each weight tensor streams from memory once per chunk instead of
+        // once per token. Bit-identical to the sequential loop below (the
+        // batched matmuls mirror the per-token kernels exactly and the
+        // rope/KV/attention steps are the same shared helpers); the last
+        // prompt token stays on the sequential path so the logits and
+        // sampling flow are untouched.
+        if crate::engine::switches::use_batch_prefill()
+            && crate::engine::runtime::batch_prefill_supported(&self.config)
+            && prefill_injected_embeddings.is_empty()
+            && prompt_tokens.len() > 8
+        {
+            let prefill_end = prompt_tokens.len() - 1;
+            let chunk = crate::engine::switches::batch_prefill_chunk();
+            let mut scratch = crate::engine::runtime::PrefillScratch::new();
+            let mut base = 0usize;
+            while base < prefill_end {
+                let take = chunk.min(prefill_end - base);
+                let toks: Vec<usize> = prompt_tokens[base..base + take]
+                    .iter()
+                    .map(|&t| t as usize)
+                    .collect();
+                crate::engine::runtime::transformer_prefill_batch(
+                    &toks,
+                    base,
+                    &self.config,
+                    &mut state,
+                    &self.weights,
+                    self.gguf.mapped.as_slice(),
+                    &mut scratch,
+                )?;
+                base += take;
+                emit_progress_update(
+                    event_callback.as_ref(),
+                    RuntimeProgress {
+                        phase: RuntimePhase::Prefill,
+                        prefill_tokens: base,
+                        decode_tokens: 0,
+                        hidden_thinking: false,
+                        hidden_think_tokens: 0,
+                        tokens_per_second: None,
+                        context_used: base,
+                        context_limit: self.config.seq_len,
+                    },
+                );
+            }
+            pos = prefill_end;
+            token = prompt_tokens[prefill_end];
+        }
+
         while pos < total_limit {
             if token < 0 || token as usize >= self.config.vocab_size {
                 return Err(format!("token id out of bounds: {token}"));

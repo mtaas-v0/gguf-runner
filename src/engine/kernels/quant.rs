@@ -2030,6 +2030,121 @@ pub(crate) fn vec_dot_q3_k_4rows(
     sums
 }
 
+/// Q3_K 4-row dot for x86_64: AVX2/FMA kernel when available, portable
+/// fallback otherwise. Tolerance-level equivalent to four [`vec_dot_q3_k`]
+/// calls (SIMD lane accumulation reorders the sums); gated at runtime by
+/// `validate_qk_mr4_once_x86` like the other MR4 kernels.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vec_dot_q3_k_4rows_x86(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q3_k_4rows_x86_avx2(x, r0, r1, r2, r3, n);
+        }
+    }
+    vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n)
+}
+
+/// AVX2/FMA Q3_K 4-row kernel.
+///
+/// Mirrors the scalar [`vec_dot_q3_k`] control flow exactly — same
+/// per-superblock layout walk (hmask 32B, 2-bit planes in two 32B chunks,
+/// 16 six-bit scales, fp16 `d`), same `(q >> shift) & 3` minus
+/// `hmask-bit ? 0 : 4` weight decode — vectorized 16 elements at a time and
+/// sharing the activation loads across the four rows. Weight decode is
+/// integer-exact; only the FMA accumulation order differs from scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q3_k_4rows_x86_avx2(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
+    let sc_off = QK_K / 8 + QK_K / 4; // 96: hmask(32) + qs(64)... qs follows hmask
+
+    let zero = _mm_setzero_si128();
+    let low2 = _mm_set1_epi8(0x03);
+    let four = _mm_set1_epi8(4);
+    let mut acc = [_mm256_setzero_ps(); 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = i * QK_K;
+
+        // Per-row block constants: scales, d, hmask halves, all four 16-byte
+        // 2-bit chunks (chunk layout: [outer0 A, outer0 B, outer1 A, outer1 B]).
+        let mut scales = [[0i8; 16]; 4];
+        let mut d_all = [0.0f32; 4];
+        let mut hm = [[zero; 2]; 4];
+        let mut qc = [[zero; 4]; 4];
+        for r in 0..4 {
+            let row = rows[r];
+            scales[r] = q3_scales(&row[off + sc_off..off + sc_off + 12]);
+            d_all[r] = fp16_to_fp32(read_u16_le(row, off + sc_off + 12));
+            hm[r][0] = _mm_loadu_si128(row.as_ptr().add(off) as *const __m128i);
+            hm[r][1] = _mm_loadu_si128(row.as_ptr().add(off + 16) as *const __m128i);
+            qc[r][0] = _mm_loadu_si128(row.as_ptr().add(off + 32) as *const __m128i);
+            qc[r][1] = _mm_loadu_si128(row.as_ptr().add(off + 48) as *const __m128i);
+            qc[r][2] = _mm_loadu_si128(row.as_ptr().add(off + 64) as *const __m128i);
+            qc[r][3] = _mm_loadu_si128(row.as_ptr().add(off + 80) as *const __m128i);
+        }
+
+        let mut is = 0usize;
+        let mut mbit: u32 = 1;
+        for outer in 0..2usize {
+            for j in 0..4usize {
+                let shift_count = _mm_cvtsi32_si128((2 * j) as i32);
+                let mvec = _mm_set1_epi8(mbit as i8);
+                for g in 0..2usize {
+                    let x_base = xb + outer * 128 + j * 32 + g * 16;
+                    let xv0 = _mm256_loadu_ps(x.as_ptr().add(x_base));
+                    let xv1 = _mm256_loadu_ps(x.as_ptr().add(x_base + 8));
+                    for r in 0..4usize {
+                        // (q >> shift) & 3; cross-byte shift contamination
+                        // lands at bit >= 8-shift >= 2, masked off by 0x03.
+                        let q3 =
+                            _mm_and_si128(_mm_srl_epi16(qc[r][outer * 2 + g], shift_count), low2);
+                        // Subtract 4 where the hmask bit is NOT set.
+                        let hbit = _mm_and_si128(hm[r][g], mvec);
+                        let not_set = _mm_cmpeq_epi8(hbit, zero);
+                        let sub4 = _mm_and_si128(not_set, four);
+                        let wv = _mm_sub_epi8(q3, sub4);
+                        let w_lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wv));
+                        let w_hi =
+                            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(wv, 8)));
+                        let dl = d_all[r] * (scales[r][is] as i32 - 32) as f32;
+                        let dlv = _mm256_set1_ps(dl);
+                        acc[r] = _mm256_fmadd_ps(_mm256_mul_ps(w_lo, dlv), xv0, acc[r]);
+                        acc[r] = _mm256_fmadd_ps(_mm256_mul_ps(w_hi, dlv), xv1, acc[r]);
+                    }
+                    is += 1;
+                }
+                mbit <<= 1;
+            }
+        }
+    }
+
+    let mut sums = [0.0f32; 4];
+    for r in 0..4 {
+        let mut tmp = [0.0f32; 8];
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc[r]);
+        sums[r] = tmp.iter().sum();
+    }
+    sums
+}
+
 pub(crate) fn vec_dot_q4_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     let nb = n / QK_K;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
@@ -4121,7 +4236,7 @@ pub(crate) fn matmul_qk_mr4_chunk_x86(
         let r2 = &mapped[row2_off..row2_off + row_size];
         let r3 = &mapped[row3_off..row3_off + row_size];
         let sums = match ttype {
-            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86(x, r0, r1, r2, r3, n),
@@ -4189,7 +4304,7 @@ pub(crate) fn validate_qk_mr4_once_x86(
     let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
 
     let mr4 = match ttype {
-        GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86(x, r0, r1, r2, r3, n),
@@ -5146,6 +5261,362 @@ pub(crate) fn matmul_quantized_batch(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Exact batched matmul (batched prefill)
+// ---------------------------------------------------------------------------
+
+/// Whether [`matmul_quantized_batch_exact`] supports `ttype`. Types with
+/// arch-dependent activation-prequant paths (Q8_0) or float weights must use
+/// per-token [`matmul_quantized`] instead — the caller falls back per tensor.
+pub(crate) fn batch_exact_supported(ttype: GgmlType) -> bool {
+    matches!(
+        ttype.0,
+        GGML_TYPE_Q4_0
+            | GGML_TYPE_Q4_1
+            | GGML_TYPE_Q5_0
+            | GGML_TYPE_Q5_1
+            | GGML_TYPE_Q2_K
+            | GGML_TYPE_Q3_K
+            | GGML_TYPE_Q4_K
+            | GGML_TYPE_Q5_K
+            | GGML_TYPE_Q6_K
+            | GGML_TYPE_IQ4_NL
+    )
+}
+
+#[inline]
+fn batch_exact_vec_dot(ttype: i32, x: &[f32], row: &[u8], n: usize) -> f32 {
+    match ttype {
+        GGML_TYPE_Q4_0 => vec_dot_q4_0(x, row, n),
+        GGML_TYPE_Q4_1 => vec_dot_q4_1(x, row, n),
+        GGML_TYPE_Q5_0 => vec_dot_q5_0(x, row, n),
+        GGML_TYPE_Q5_1 => vec_dot_q5_1(x, row, n),
+        GGML_TYPE_Q2_K => vec_dot_q2_k(x, row, n),
+        GGML_TYPE_Q3_K => vec_dot_q3_k(x, row, n),
+        GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
+        GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
+        GGML_TYPE_Q6_K => vec_dot_q6_k(x, row, n),
+        GGML_TYPE_IQ4_NL => vec_dot_iq4_nl(x, row, n),
+        _ => unreachable!("batch_exact_vec_dot: unsupported type {ttype}"),
+    }
+}
+
+/// Same 4-row kernel selection as the sequential MR4 chunk functions, so the
+/// batched path is bit-identical per row block on each architecture.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn batch_exact_vec_dot_4rows(
+    ttype: i32,
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match ttype {
+            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86(x, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        match ttype {
+            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Batched quantized matmul with numerics **bit-identical** to calling
+/// [`matmul_quantized`] once per token.
+///
+/// It mirrors the per-token kernel dispatch exactly — including the MR4
+/// 4-row kernels, their per-type runtime validation gate, and the singles
+/// tail — so a greedy decode over a batched prefill matches the sequential
+/// path bit for bit. The bandwidth win comes from moving tokens into the
+/// inner loop: each weight row (or 4-row block) is streamed from memory once
+/// per batch instead of once per token.
+///
+/// `out` is token-major `[m × qw.rows]`, `inp` token-major `[m × qw.cols]`.
+/// `tmp` is caller-owned scratch (`qw.rows × m` floats), kept across calls.
+/// Callers must check [`batch_exact_supported`] first.
+pub(crate) fn matmul_quantized_batch_exact(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    tmp: &mut Vec<f32>,
+) -> Result<(), String> {
+    let d = n_rows;
+    let n = qw.cols;
+    let ttype = qw.ttype.0;
+    if !batch_exact_supported(qw.ttype) {
+        return Err(format!(
+            "matmul_quantized_batch_exact: unsupported type {ttype}"
+        ));
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_exact row window out of bounds".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if m == 1 {
+        // Mirrors the sequential per-token dispatch exactly for one token.
+        return if row_start == 0 && n_rows == qw.rows {
+            matmul_quantized(out, inp, qw, mapped)
+        } else {
+            matmul_quantized_rows(out, inp, qw, row_start, n_rows, mapped)
+        };
+    }
+    if out.len() < m * d || inp.len() < m * n {
+        return Err("matmul_quantized_batch_exact shape mismatch".to_string());
+    }
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = d
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    // Same MR4 eligibility as `matmul_quantized` (incl. the shared validation
+    // status), so row -> kernel assignment matches the sequential path.
+    #[cfg(target_arch = "x86_64")]
+    let use_mr4 = matches!(
+        ttype,
+        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+    ) && use_x86_qk_mr4()
+        && n >= QK_K
+        && n.is_multiple_of(QK_K)
+        && d >= 4
+        && validate_qk_mr4_once_x86(&inp[..n], mapped, data_offset, row_size, n, ttype);
+    #[cfg(target_arch = "aarch64")]
+    let use_mr4 = matches!(
+        ttype,
+        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+    ) && use_aarch64_qk_mr4()
+        && n >= QK_K
+        && n.is_multiple_of(QK_K)
+        && d >= 4
+        && validate_qk_mr4_once(&inp[..n], mapped, data_offset, row_size, n, ttype);
+    #[cfg(all(not(target_arch = "x86_64"), not(target_arch = "aarch64")))]
+    let use_mr4 = false;
+
+    if tmp.len() < d * m {
+        tmp.resize(d * m, 0.0);
+    }
+
+    // Row-major scratch (`tmp[r * m + b]`) so rayon splits it into contiguous
+    // per-row-chunk blocks; transposed to token-major `out` at the end.
+    let fill = |base_row: usize, block: &mut [f32]| {
+        let rows_here = block.len() / m;
+        let mut i = 0usize;
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if use_mr4 {
+            while i + 4 <= rows_here {
+                matmul_prefetch_row(mapped, data_offset, row_size, base_row + i, d);
+                let r0_off = data_offset + (base_row + i) * row_size;
+                let r1_off = r0_off + row_size;
+                let r2_off = r1_off + row_size;
+                let r3_off = r2_off + row_size;
+                let r0 = &mapped[r0_off..r0_off + row_size];
+                let r1 = &mapped[r1_off..r1_off + row_size];
+                let r2 = &mapped[r2_off..r2_off + row_size];
+                let r3 = &mapped[r3_off..r3_off + row_size];
+                for b in 0..m {
+                    let x = &inp[b * n..(b + 1) * n];
+                    let sums = batch_exact_vec_dot_4rows(ttype, x, r0, r1, r2, r3, n);
+                    block[i * m + b] = sums[0];
+                    block[(i + 1) * m + b] = sums[1];
+                    block[(i + 2) * m + b] = sums[2];
+                    block[(i + 3) * m + b] = sums[3];
+                }
+                i += 4;
+            }
+        }
+        #[cfg(all(not(target_arch = "x86_64"), not(target_arch = "aarch64")))]
+        let _ = use_mr4;
+        while i < rows_here {
+            matmul_prefetch_row(mapped, data_offset, row_size, base_row + i, d);
+            let row_off = data_offset + (base_row + i) * row_size;
+            let row = &mapped[row_off..row_off + row_size];
+            for b in 0..m {
+                block[i * m + b] = batch_exact_vec_dot(ttype, &inp[b * n..(b + 1) * n], row, n);
+            }
+            i += 1;
+        }
+    };
+
+    if d >= par_matmul_min_rows() {
+        let chunk_rows = par_matmul_chunk_rows();
+        tmp[..d * m]
+            .par_chunks_mut(chunk_rows * m)
+            .enumerate()
+            .for_each(|(chunk_idx, block)| fill(chunk_idx * chunk_rows, block));
+    } else {
+        fill(0, &mut tmp[..d * m]);
+    }
+
+    for b in 0..m {
+        for r in 0..d {
+            out[b * d + r] = tmp[r * m + b];
+        }
+    }
+    Ok(())
+}
+
+/// Fast batched quantized matmul: dequantizes each weight row **once** and
+/// dots it against all `m` tokens with the SIMD f32 kernel — amortizing the
+/// (dominant, for K-quants) bit-unpack cost across the batch.
+///
+/// Numerics are tolerance-level equivalent to [`matmul_quantized`], not
+/// bit-identical: the f32 dot uses a different accumulation order than the
+/// per-quant dots (the same class of difference the tolerance-validated MR4
+/// VNNI kernels already exhibit on x86). Use
+/// [`matmul_quantized_batch_exact`] when a bitwise sequential mirror is
+/// needed (debugging / structural validation).
+///
+/// `out` is token-major `[m × qw.rows]`, `inp` token-major `[m × qw.cols]`;
+/// `tmp` is caller-owned row-major scratch (`qw.rows × m` floats).
+/// Whether [`matmul_quantized_batch_fast`] handles `ttype`. Restricted to the
+/// K-quants, whose sequential dots compute the same per-element products
+/// (`x * scale * q`) — the fast kernel then only reorders the summation
+/// (~1e-6 relative). Types with specialized sequential kernels (Q8_0
+/// int8-prequant, F16 conversion kernels) diverge far more and are excluded;
+/// they take the bit-exact or per-token path instead.
+pub(crate) fn batch_fast_supported(ttype: GgmlType) -> bool {
+    matches!(
+        ttype.0,
+        GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+    )
+}
+
+pub(crate) fn matmul_quantized_batch_fast(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    tmp: &mut Vec<f32>,
+) -> Result<(), String> {
+    let d = n_rows;
+    let n = qw.cols;
+    if !batch_fast_supported(qw.ttype) {
+        return Err(format!(
+            "matmul_quantized_batch_fast: unsupported type {}",
+            qw.ttype.0
+        ));
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_fast row window out of bounds".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if m == 1 {
+        return if row_start == 0 && n_rows == qw.rows {
+            matmul_quantized(out, inp, qw, mapped)
+        } else {
+            matmul_quantized_rows(out, inp, qw, row_start, n_rows, mapped)
+        };
+    }
+    if out.len() < m * d || inp.len() < m * n {
+        return Err("matmul_quantized_batch_fast shape mismatch".to_string());
+    }
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = d
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    if tmp.len() < d * m {
+        tmp.resize(d * m, 0.0);
+    }
+
+    let prof_t0 = prof_start();
+    let fill = |dequant: &mut Vec<f32>, base_row: usize, block: &mut [f32]| -> Result<(), String> {
+        if dequant.len() < n {
+            dequant.resize(n, 0.0);
+        }
+        let rows_here = block.len() / m;
+        for i in 0..rows_here {
+            matmul_prefetch_row(mapped, data_offset, row_size, base_row + i, d);
+            let row_off = data_offset + (base_row + i) * row_size;
+            let row = &mapped[row_off..row_off + row_size];
+            dequantize_row_into(qw.ttype, row, &mut dequant[..n], n)?;
+            for b in 0..m {
+                block[i * m + b] = dot_f32_simd(&inp[b * n..(b + 1) * n], &dequant[..n]);
+            }
+        }
+        Ok(())
+    };
+
+    if d >= par_matmul_min_rows() {
+        let chunk_rows = par_matmul_chunk_rows();
+        let results: Vec<Result<(), String>> = tmp[..d * m]
+            .par_chunks_mut(chunk_rows * m)
+            .enumerate()
+            .map_init(Vec::new, |dequant, (chunk_idx, block)| {
+                fill(dequant, chunk_idx * chunk_rows, block)
+            })
+            .collect();
+        for r in results {
+            r?;
+        }
+    } else {
+        let mut dequant = Vec::new();
+        fill(&mut dequant, 0, &mut tmp[..d * m])?;
+    }
+
+    for b in 0..m {
+        for r in 0..d {
+            out[b * d + r] = tmp[r * m + b];
+        }
+    }
+    prof_end(&PROF_MATMUL_NS, prof_t0);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5198,6 +5669,45 @@ mod q3k_mr4_tests {
     /// The 4-row Q3_K kernel must equal the reference single-row `vec_dot_q3_k`
     /// on every row — this is exactly what the runtime self-check enforces, and
     /// it de-risks the MR4 wiring without needing the model.
+    /// On x86 the MR4 dispatch uses `vec_dot_q3_k_4rows_x86` (AVX2 kernel
+    /// when the CPU has it). Same oracle as the portable test: must match the
+    /// scalar reference within the MR4 gate tolerance. On non-AVX2 hosts the
+    /// wrapper falls back to the portable kernel and this reduces to that case.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q3k_4rows_x86_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
+        let mut st = 0xA5A5_5A5A_1234_8765u64;
+        for nb in [1usize, 3] {
+            let n = nb * QK_K;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d_at = i * block_sz + QK_K / 8 + QK_K / 4 + 12;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[d_at] = (d16 & 0xff) as u8;
+                    row[d_at + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+            let got = vec_dot_q3_k_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            for r in 0..4 {
+                let want = vec_dot_q3_k(&x, &rows[r], n);
+                let tol = 1e-4f32 * want.abs().max(1.0);
+                assert!(
+                    (got[r] - want).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {want}",
+                    got[r],
+                );
+            }
+        }
+    }
+
     #[test]
     fn q3k_4rows_matches_single_row() {
         let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
@@ -5238,6 +5748,102 @@ mod q3k_mr4_tests {
                     got[r],
                     want[r]
                 );
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod batch_exact_tests {
+    use super::*;
+    use crate::engine::types::{GgmlType, QuantizedTensor};
+
+    fn xs(state: &mut u64) -> u64 {
+        let mut s = *state;
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        *state = s;
+        s
+    }
+
+    /// fp16 scale byte offsets within one super-block, per type, so random
+    /// test weights can't produce Inf/NaN scales (which would break bitwise
+    /// comparison via NaN != NaN).
+    fn d16_offsets(ttype: i32, block_sz: usize) -> Vec<usize> {
+        match ttype {
+            GGML_TYPE_Q3_K => vec![QK_K / 8 + QK_K / 4 + 12],
+            GGML_TYPE_Q4_K | GGML_TYPE_Q5_K => vec![0, 2],
+            GGML_TYPE_Q6_K => vec![block_sz - 2],
+            _ => unreachable!(),
+        }
+    }
+
+    fn synth(ttype: i32, d_rows: usize, n: usize, st: &mut u64) -> (QuantizedTensor, Vec<u8>) {
+        let gt = GgmlType(ttype);
+        let block_sz = get_type_size(gt);
+        let row_size = get_row_size(n, gt);
+        let nb = n / QK_K;
+        let mut mapped = vec![0u8; d_rows * row_size];
+        for b in mapped.iter_mut() {
+            *b = (xs(st) & 0xff) as u8;
+        }
+        for r in 0..d_rows {
+            for blk in 0..nb {
+                for off in d16_offsets(ttype, block_sz) {
+                    let at = r * row_size + blk * block_sz + off;
+                    let d16: u16 = 0x3000 | (xs(st) as u16 & 0x03ff);
+                    mapped[at] = (d16 & 0xff) as u8;
+                    mapped[at + 1] = (d16 >> 8) as u8;
+                }
+            }
+        }
+        (
+            QuantizedTensor {
+                data_offset: 0,
+                ttype: gt,
+                rows: d_rows,
+                cols: n,
+            },
+            mapped,
+        )
+    }
+
+    /// The whole point of `matmul_quantized_batch_exact`: bitwise equality
+    /// with per-token `matmul_quantized`, across the MR4 4-block path, the
+    /// singles tail (rows % 4), the serial path (small d), and the rayon
+    /// path (large d).
+    #[test]
+    fn batch_exact_is_bitwise_equal_to_per_token() {
+        let mut st = 0xfeed_beef_dead_cafeu64;
+        let n = 2 * QK_K;
+        for &ttype in &[GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+            for &d_rows in &[3usize, 6, 400] {
+                let (qw, mapped) = synth(ttype, d_rows, n, &mut st);
+                for &m in &[1usize, 2, 5] {
+                    let inp: Vec<f32> = (0..m * n)
+                        .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                        .collect();
+                    let mut batch = vec![0.0f32; m * d_rows];
+                    let mut tmp = Vec::new();
+                    matmul_quantized_batch_exact(&mut batch, &inp, &qw, &mapped, m, 0, d_rows, &mut tmp)
+                        .unwrap();
+                    for b in 0..m {
+                        let mut single = vec![0.0f32; d_rows];
+                        matmul_quantized(&mut single, &inp[b * n..(b + 1) * n], &qw, &mapped)
+                            .unwrap();
+                        for r in 0..d_rows {
+                            assert_eq!(
+                                batch[b * d_rows + r].to_bits(),
+                                single[r].to_bits(),
+                                "ttype={ttype} d={d_rows} m={m} tok={b} row={r}: {} vs {}",
+                                batch[b * d_rows + r],
+                                single[r],
+                            );
+                        }
+                    }
+                }
             }
         }
     }
