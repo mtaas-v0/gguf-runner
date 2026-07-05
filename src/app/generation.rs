@@ -2770,8 +2770,7 @@ impl ModelRuntime {
     /// per-request token-prefix match provides the actual correctness guard.
     pub(crate) fn set_prefill_cache_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
         let pc = crate::app::prefill_cache::PrefixCache::parse(bytes)?;
-        let (len, fnv) =
-            crate::app::prefill_cache::model_fingerprint(self.gguf.mapped.as_slice());
+        let (len, fnv) = crate::app::prefill_cache::model_fingerprint(self.gguf.mapped.as_slice());
         if pc.model_len != len || pc.model_head_fnv != fnv {
             return Err("prefill cache: model fingerprint mismatch".to_string());
         }
@@ -2860,8 +2859,7 @@ impl ModelRuntime {
             }
         }
 
-        let (len, fnv) =
-            crate::app::prefill_cache::model_fingerprint(self.gguf.mapped.as_slice());
+        let (len, fnv) = crate::app::prefill_cache::model_fingerprint(self.gguf.mapped.as_slice());
         crate::app::prefill_cache::snapshot(&self.config, &state, &tokens, len, fnv)
     }
 
@@ -3639,14 +3637,15 @@ impl ModelRuntime {
         // prefix, restore its KV rows + SSM states instead of prefilling them.
         // Any mismatch (drift, config, format) falls back to a cold prefill.
         if prefill_injected_embeddings.is_empty() {
-            let inject_result = self.prefill_cache.as_ref().and_then(|pc| {
-                match pc.match_len(&prompt_tokens) {
-                    Some(kp) if kp < self.config.seq_len => {
-                        Some((kp, pc.inject(&self.config, &mut state)))
-                    }
-                    _ => None,
-                }
-            });
+            let inject_result =
+                self.prefill_cache
+                    .as_ref()
+                    .and_then(|pc| match pc.match_len(&prompt_tokens) {
+                        Some(kp) if kp < self.config.seq_len => {
+                            Some((kp, pc.inject(&self.config, &mut state)))
+                        }
+                        _ => None,
+                    });
             match inject_result {
                 Some((kp, Ok(()))) => {
                     pos = kp;

@@ -10,6 +10,11 @@ use crate::app::events::{RuntimeEvent, RuntimeEventCallback, RuntimeProgress};
 use crate::app::generation::ModelRuntime;
 use crate::vendors::{ChatMessage, ChatRole};
 
+/// Shared, mutable token sink forwarded to by a [`TurnStream`]. Boxed so any
+/// `FnMut(&str)` closure can be stored, `Mutex` for interior mutability across
+/// the runtime callback, and `Arc` so it can be reused across tool-call turns.
+type TokenSink = Arc<Mutex<Box<dyn FnMut(&str) + Send>>>;
+
 /// Timing / throughput stats for one [`EmbeddedRuntime::generate_with_tools_streaming`]
 /// call, aggregated across any tool-call turns. Surfaced so an interactive caller can
 /// print a status line (prefill / decode token counts and the decode rate).
@@ -461,8 +466,7 @@ impl EmbeddedRuntime {
 
         // One sink, reused across turns; only the final-answer turn (plus any
         // leading prose before a tool call) actually forwards to it.
-        let sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>> =
-            Arc::new(Mutex::new(Box::new(on_token)));
+        let sink: TokenSink = Arc::new(Mutex::new(Box::new(on_token)));
 
         loop {
             let messages = build_messages(&extended_history, &current_input);
@@ -559,12 +563,12 @@ struct TurnStream {
     buf: String,
     /// Set once a `<tool_call>` open tag is seen: suppress the remainder.
     suppressing: bool,
-    sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>>,
+    sink: TokenSink,
     last_progress: Option<RuntimeProgress>,
 }
 
 impl TurnStream {
-    fn new(sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>>) -> Self {
+    fn new(sink: TokenSink) -> Self {
         Self {
             raw: String::new(),
             buf: String::new(),
@@ -848,10 +852,9 @@ mod stream_filter_tests {
     fn run(fragments: &[&str]) -> (String, bool) {
         let out = Arc::new(Mutex::new(String::new()));
         let out_cb = Arc::clone(&out);
-        let sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>> =
-            Arc::new(Mutex::new(Box::new(move |s: &str| {
-                out_cb.lock().unwrap().push_str(s);
-            })));
+        let sink: TokenSink = Arc::new(Mutex::new(Box::new(move |s: &str| {
+            out_cb.lock().unwrap().push_str(s);
+        })));
         let mut ts = TurnStream::new(sink);
         for f in fragments {
             ts.on_output(f);
@@ -895,10 +898,9 @@ mod stream_filter_tests {
     fn raw_retains_full_turn_for_extraction() {
         let out = Arc::new(Mutex::new(String::new()));
         let out_cb = Arc::clone(&out);
-        let sink: Arc<Mutex<Box<dyn FnMut(&str) + Send>>> =
-            Arc::new(Mutex::new(Box::new(move |s: &str| {
-                out_cb.lock().unwrap().push_str(s);
-            })));
+        let sink: TokenSink = Arc::new(Mutex::new(Box::new(move |s: &str| {
+            out_cb.lock().unwrap().push_str(s);
+        })));
         let mut ts = TurnStream::new(sink);
         ts.on_output("<tool_call>{\"name\":\"x\",\"arguments\":{}}</tool_call>");
         ts.finish();

@@ -135,7 +135,13 @@ fn i8s_to_bytes(v: &[i8]) -> Vec<u8> {
 
 /// Copy `k` leading rows of each layer out of a flat `[n_layers*seq_len]`-row
 /// array with `elem_per_row` elements (or packed bytes) per row.
-fn gather_rows<T: Copy>(src: &[T], per_row: usize, seq_len: usize, n_layers: usize, k: usize) -> Vec<T> {
+fn gather_rows<T: Copy>(
+    src: &[T],
+    per_row: usize,
+    seq_len: usize,
+    n_layers: usize,
+    k: usize,
+) -> Vec<T> {
     let mut out = Vec::with_capacity(n_layers * k * per_row);
     for l in 0..n_layers {
         let start = l * seq_len * per_row;
@@ -240,10 +246,34 @@ pub(crate) fn snapshot(
             )));
         }
         KvCacheFormat::Turbo => {
-            w.section(&gather_rows(&s.key_cache_turbo_base, kv_dim / 4, seq_len, n_layers, k));
-            w.section(&gather_rows(&s.value_cache_turbo_base, kv_dim / 4, seq_len, n_layers, k));
-            w.section(&gather_rows(&s.key_cache_turbo_sign, kv_dim / 8, seq_len, n_layers, k));
-            w.section(&gather_rows(&s.value_cache_turbo_sign, kv_dim / 8, seq_len, n_layers, k));
+            w.section(&gather_rows(
+                &s.key_cache_turbo_base,
+                kv_dim / 4,
+                seq_len,
+                n_layers,
+                k,
+            ));
+            w.section(&gather_rows(
+                &s.value_cache_turbo_base,
+                kv_dim / 4,
+                seq_len,
+                n_layers,
+                k,
+            ));
+            w.section(&gather_rows(
+                &s.key_cache_turbo_sign,
+                kv_dim / 8,
+                seq_len,
+                n_layers,
+                k,
+            ));
+            w.section(&gather_rows(
+                &s.value_cache_turbo_sign,
+                kv_dim / 8,
+                seq_len,
+                n_layers,
+                k,
+            ));
             w.section(&f32s_to_bytes(&gather_rows(
                 &s.key_cache_scale,
                 n_kv_heads,
@@ -351,8 +381,7 @@ impl PrefixCache {
             || self.kv_dim != s.kv_dim
             || self.n_kv_heads != p.n_kv_heads.max(1)
             || self.kv_format != s.kv_cache_format
-            || self.q8_block_scales
-                != env_flag("GGUF_Q8_BLOCK_SCALES")
+            || self.q8_block_scales != env_flag("GGUF_Q8_BLOCK_SCALES")
         {
             return Err("prefill cache: model/config mismatch".to_string());
         }
@@ -375,22 +404,92 @@ impl PrefixCache {
                 scatter_rows(&mut s.value_cache_q8, &vq, kv_dim, seq_len, n_layers, k)?;
                 let ks = bytes_to_f32s(&self.sections[2])?;
                 let vs = bytes_to_f32s(&self.sections[3])?;
-                scatter_rows(&mut s.key_cache_scale, &ks, scale_per_row, seq_len, n_layers, k)?;
-                scatter_rows(&mut s.value_cache_scale, &vs, scale_per_row, seq_len, n_layers, k)?;
+                scatter_rows(
+                    &mut s.key_cache_scale,
+                    &ks,
+                    scale_per_row,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
+                scatter_rows(
+                    &mut s.value_cache_scale,
+                    &vs,
+                    scale_per_row,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
             }
             KvCacheFormat::Turbo => {
-                scatter_rows(&mut s.key_cache_turbo_base, &self.sections[0], kv_dim / 4, seq_len, n_layers, k)?;
-                scatter_rows(&mut s.value_cache_turbo_base, &self.sections[1], kv_dim / 4, seq_len, n_layers, k)?;
-                scatter_rows(&mut s.key_cache_turbo_sign, &self.sections[2], kv_dim / 8, seq_len, n_layers, k)?;
-                scatter_rows(&mut s.value_cache_turbo_sign, &self.sections[3], kv_dim / 8, seq_len, n_layers, k)?;
+                scatter_rows(
+                    &mut s.key_cache_turbo_base,
+                    &self.sections[0],
+                    kv_dim / 4,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
+                scatter_rows(
+                    &mut s.value_cache_turbo_base,
+                    &self.sections[1],
+                    kv_dim / 4,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
+                scatter_rows(
+                    &mut s.key_cache_turbo_sign,
+                    &self.sections[2],
+                    kv_dim / 8,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
+                scatter_rows(
+                    &mut s.value_cache_turbo_sign,
+                    &self.sections[3],
+                    kv_dim / 8,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
                 let ks = bytes_to_f32s(&self.sections[4])?;
                 let vs = bytes_to_f32s(&self.sections[5])?;
                 let kr = bytes_to_f32s(&self.sections[6])?;
                 let vr = bytes_to_f32s(&self.sections[7])?;
-                scatter_rows(&mut s.key_cache_scale, &ks, n_kv_heads, seq_len, n_layers, k)?;
-                scatter_rows(&mut s.value_cache_scale, &vs, n_kv_heads, seq_len, n_layers, k)?;
-                scatter_rows(&mut s.key_cache_residual_norm, &kr, n_kv_heads, seq_len, n_layers, k)?;
-                scatter_rows(&mut s.value_cache_residual_norm, &vr, n_kv_heads, seq_len, n_layers, k)?;
+                scatter_rows(
+                    &mut s.key_cache_scale,
+                    &ks,
+                    n_kv_heads,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
+                scatter_rows(
+                    &mut s.value_cache_scale,
+                    &vs,
+                    n_kv_heads,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
+                scatter_rows(
+                    &mut s.key_cache_residual_norm,
+                    &kr,
+                    n_kv_heads,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
+                scatter_rows(
+                    &mut s.value_cache_residual_norm,
+                    &vr,
+                    n_kv_heads,
+                    seq_len,
+                    n_layers,
+                    k,
+                )?;
             }
         }
 

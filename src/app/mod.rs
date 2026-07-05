@@ -257,8 +257,7 @@ pub(crate) fn run() -> Result<(), String> {
             let mut runtime = generation::ModelRuntime::load(&cli)?;
             if let Some(out) = &cli.render_prefill_cache {
                 let blob = runtime.render_prefill_cache_blob(&cli.system_prompt)?;
-                fs::write(out, &blob)
-                    .map_err(|e| format!("write prefill cache '{out}': {e}"))?;
+                fs::write(out, &blob).map_err(|e| format!("write prefill cache '{out}': {e}"))?;
                 eprintln!("prefill cache written: {out} ({} bytes)", blob.len());
             } else {
                 if let Some(f) = &cli.prefill_cache {

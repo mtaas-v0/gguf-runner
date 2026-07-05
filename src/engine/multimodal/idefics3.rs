@@ -491,7 +491,7 @@ impl Idefics3VisionEncoder {
         }
     }
 
-    fn vit_forward(&self, tokens: &mut Vec<f32>, n_tokens: usize) -> Result<(), String> {
+    fn vit_forward(&self, tokens: &mut [f32], n_tokens: usize) -> Result<(), String> {
         let mapped = self.gguf.mapped.as_slice();
         let dim = self.dim;
         let ff_dim = self.ff_dim;
