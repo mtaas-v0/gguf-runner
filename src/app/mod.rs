@@ -7,6 +7,7 @@ mod agent;
 pub mod embed;
 mod events;
 mod generation;
+pub(crate) mod prefill_cache;
 mod repl;
 
 use crate::cli::CliOperationMode;
@@ -254,7 +255,19 @@ pub(crate) fn run() -> Result<(), String> {
     match cli.mode {
         CliOperationMode::Oneshot => {
             let mut runtime = generation::ModelRuntime::load(&cli)?;
-            run_oneshot_mode(&mut runtime, &cli)?;
+            if let Some(out) = &cli.render_prefill_cache {
+                let blob = runtime.render_prefill_cache_blob(&cli.system_prompt)?;
+                fs::write(out, &blob)
+                    .map_err(|e| format!("write prefill cache '{out}': {e}"))?;
+                eprintln!("prefill cache written: {out} ({} bytes)", blob.len());
+            } else {
+                if let Some(f) = &cli.prefill_cache {
+                    let bytes =
+                        fs::read(f).map_err(|e| format!("read prefill cache '{f}': {e}"))?;
+                    runtime.set_prefill_cache_bytes(&bytes)?;
+                }
+                run_oneshot_mode(&mut runtime, &cli)?;
+            }
         }
         CliOperationMode::Repl => {
             run_repl_mode(&cli)?;

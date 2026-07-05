@@ -5,9 +5,9 @@ use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, re
 use crate::engine::profiling::{PROF_MATMUL_NS, prof_end, prof_start};
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::{
-    AARCH64_Q3K_MR4_STATUS, AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS,
-    AARCH64_Q6K_MR4_STATUS, AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows,
-    use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
+    AARCH64_Q3K_MR4_STATUS, AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS, AARCH64_Q6K_MR4_STATUS,
+    AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows, use_aarch64_dotprod_q8,
+    use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
@@ -2122,8 +2122,7 @@ unsafe fn vec_dot_q3_k_4rows_x86_avx2(
                         let sub4 = _mm_and_si128(not_set, four);
                         let wv = _mm_sub_epi8(q3, sub4);
                         let w_lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(wv));
-                        let w_hi =
-                            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(wv, 8)));
+                        let w_hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(wv, 8)));
                         let dl = d_all[r] * (scales[r][is] as i32 - 32) as f32;
                         let dlv = _mm256_set1_ps(dl);
                         acc[r] = _mm256_fmadd_ps(_mm256_mul_ps(w_lo, dlv), xv0, acc[r]);
@@ -5350,6 +5349,7 @@ fn batch_exact_vec_dot_4rows(
 /// `out` is token-major `[m × qw.rows]`, `inp` token-major `[m × qw.cols]`.
 /// `tmp` is caller-owned scratch (`qw.rows × m` floats), kept across calls.
 /// Callers must check [`batch_exact_supported`] first.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_quantized_batch_exact(
     out: &mut [f32],
     inp: &[f32],
@@ -5516,6 +5516,7 @@ pub(crate) fn batch_fast_supported(ttype: GgmlType) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_quantized_batch_fast(
     out: &mut [f32],
     inp: &[f32],
@@ -5753,7 +5754,6 @@ mod q3k_mr4_tests {
     }
 }
 
-
 #[cfg(test)]
 mod batch_exact_tests {
     use super::*;
@@ -5827,8 +5827,10 @@ mod batch_exact_tests {
                         .collect();
                     let mut batch = vec![0.0f32; m * d_rows];
                     let mut tmp = Vec::new();
-                    matmul_quantized_batch_exact(&mut batch, &inp, &qw, &mapped, m, 0, d_rows, &mut tmp)
-                        .unwrap();
+                    matmul_quantized_batch_exact(
+                        &mut batch, &inp, &qw, &mapped, m, 0, d_rows, &mut tmp,
+                    )
+                    .unwrap();
                     for b in 0..m {
                         let mut single = vec![0.0f32; d_rows];
                         matmul_quantized(&mut single, &inp[b * n..(b + 1) * n], &qw, &mapped)

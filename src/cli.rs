@@ -559,6 +559,14 @@ struct Cli {
     #[arg(long, default_value = "")]
     prompt: String,
 
+    /// Render a prefill-cache blob for --system-prompt and exit.
+    #[arg(long = "render-prefill-cache", value_name = "path")]
+    render_prefill_cache: Option<String>,
+
+    /// Load a prefill-cache blob before generation.
+    #[arg(long = "prefill-cache", value_name = "path")]
+    prefill_cache: Option<String>,
+
     #[arg(
         long = "show-features",
         help = "Print CPU features (compiled-in vs runtime) and exit"
@@ -861,6 +869,8 @@ struct Cli {
 pub(crate) struct CliOptions {
     pub(crate) model: String,
     pub(crate) prompt: String,
+    pub(crate) render_prefill_cache: Option<String>,
+    pub(crate) prefill_cache: Option<String>,
     pub(crate) images: Vec<String>,
     pub(crate) videos: Vec<String>,
     pub(crate) audios: Vec<String>,
@@ -949,6 +959,7 @@ impl CliOptions {
         let requested_tools_enabled = !allowed_tools.is_empty();
         if !cli.show_features
             && !cli.rag_build
+            && cli.render_prefill_cache.is_none()
             && matches!(mode, CliOperationMode::Oneshot)
             && cli.prompt.trim().is_empty()
         {
@@ -979,6 +990,8 @@ impl CliOptions {
         Ok(Self {
             model: cli.model,
             prompt: cli.prompt,
+            render_prefill_cache: cli.render_prefill_cache,
+            prefill_cache: cli.prefill_cache,
             images: cli.images,
             videos: cli.videos,
             audios: cli.audios,

@@ -227,6 +227,21 @@ impl EmbeddedRuntime {
     /// output after that block, there is no retry. Calling this method switches to
     /// `ThinkMode::Hidden` instead, which enables an automatic retry with thinking suppressed
     /// whenever the first pass yields empty output.
+    /// Load a prefill-cache blob (see `render_prefill_cache`). When a later
+    /// prompt starts with the cached token prefix, its KV/SSM state is
+    /// restored instead of prefilled; on any mismatch generation falls back
+    /// to a cold prefill.
+    pub fn load_prefill_cache(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.inner.set_prefill_cache_bytes(bytes)
+    }
+
+    /// Prefill the static prefix implied by `system_prompt` once and return a
+    /// serialized snapshot for [`load_prefill_cache`](Self::load_prefill_cache).
+    /// Intended for build-time rendering of static prompts.
+    pub fn render_prefill_cache(&mut self, system_prompt: &str) -> Result<Vec<u8>, String> {
+        self.inner.render_prefill_cache_blob(system_prompt)
+    }
+
     pub fn use_hidden_think_mode(&mut self) -> &mut Self {
         self.inner.set_think_mode_hidden();
         self
@@ -752,17 +767,35 @@ fn strip_xml_block(text: &str, tag: &str) -> String {
 }
 
 fn build_tool_system_prompt(base: &str, tools: &[&mut dyn Tool]) -> String {
+    let specs: Vec<(String, String)> = tools
+        .iter()
+        .map(|t| (t.name().to_string(), t.description().to_string()))
+        .collect();
+    let spec_refs: Vec<(&str, &str)> = specs
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_str()))
+        .collect();
+    build_tool_system_prompt_from_specs(base, &spec_refs)
+}
+
+/// Compose the tools system prompt from static `(name, description)` pairs.
+///
+/// Public so a consumer's build step can reproduce the exact runtime prompt
+/// text when rendering a prefill cache (see
+/// [`EmbeddedRuntime::render_prefill_cache`]) — both paths must be
+/// byte-identical or the cached token prefix will not match.
+pub fn build_tool_system_prompt_from_specs(base: &str, specs: &[(&str, &str)]) -> String {
     // Use the Qwen3 official `# Tools` block with <tools><tool>...</tool></tools>
     // JSON schemas, the format the model was trained on. The instructions tell
     // the model to use tools only when they're actually relevant to the query,
     // and to write a plain prose answer otherwise — without this, the model
     // tends to call tools eagerly for questions that don't need them.
-    let tool_specs: Vec<String> = tools
+    let tool_specs: Vec<String> = specs
         .iter()
-        .map(|t| {
+        .map(|(name, description)| {
             let spec = serde_json::json!({
-                "name": t.name(),
-                "description": t.description(),
+                "name": name,
+                "description": description,
             });
             serde_json::to_string(&spec).unwrap_or_default()
         })

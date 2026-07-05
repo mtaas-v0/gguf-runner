@@ -3,10 +3,10 @@
 use crate::engine::kernels::{
     accum, batch_exact_supported, dot_f32_simd, get_row_size, l2_norm, layernorm_inplace,
     matmul_f32_embeddings, matmul_quantized, matmul_quantized_batch_exact,
-    matmul_quantized_batch_fast, matmul_quantized_rows,
-    qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma, rmsnorm_inplace,
-    rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace, scale_slice_inplace,
-    select_topk_softmax, sigmoid_mul_inplace, silu_and_mul_inplace, softmax,
+    matmul_quantized_batch_fast, matmul_quantized_rows, qwen3next_linear_attention_autoregressive,
+    rmsnorm, rmsnorm_gemma, rmsnorm_inplace, rmsnorm_per_head_gemma_inplace,
+    sanitize_finite_inplace, scale_slice_inplace, select_topk_softmax, sigmoid_mul_inplace,
+    silu_and_mul_inplace, softmax,
 };
 use crate::engine::profiling::{PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS, prof_end, prof_start};
 use crate::engine::switches::{
@@ -1998,8 +1998,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                     // Scale slice for this KV head: blocks_per_head blocks starting at
                     // the head's block offset within the row.
                     let head_block_off = kv_head * blocks_per_head;
-                    let key_head_scales_ptr =
-                        unsafe { key_scales.as_ptr().add(head_block_off) };
+                    let key_head_scales_ptr = unsafe { key_scales.as_ptr().add(head_block_off) };
                     let value_head_scales_ptr =
                         unsafe { value_scales.as_ptr().add(head_block_off) };
                     let turbo_signs = if kv_format == KvCacheFormat::Turbo {
@@ -2024,10 +2023,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                     if fuse_qwen35_online_attn {
                         xb_head.fill(0.0);
                         if kv_format == KvCacheFormat::Turbo {
-                            turboquant_reset_residual_accum(
-                                turbo_residual_accum,
-                                head_size,
-                            );
+                            turboquant_reset_residual_accum(turbo_residual_accum, head_size);
                         }
                         let mut max_score = f32::NEG_INFINITY;
                         let mut score_sum = 0.0f32;
@@ -2203,10 +2199,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
 
                         xb_head.fill(0.0);
                         if kv_format == KvCacheFormat::Turbo {
-                            turboquant_reset_residual_accum(
-                                turbo_residual_accum,
-                                head_size,
-                            );
+                            turboquant_reset_residual_accum(turbo_residual_accum, head_size);
                         }
                         for (t, &a) in att_head.iter().enumerate() {
                             let t_row = layer_row_base + t;
@@ -2274,8 +2267,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
             let kv_head_offset = kv_head * head_size;
             let head_block_off = kv_head * blocks_per_head;
             let key_head_scales_ptr = unsafe { key_scales.as_ptr().add(head_block_off) };
-            let value_head_scales_ptr =
-                unsafe { value_scales.as_ptr().add(head_block_off) };
+            let value_head_scales_ptr = unsafe { value_scales.as_ptr().add(head_block_off) };
             let att_head_full = &mut att_all[h * p.seq_len..(h + 1) * p.seq_len];
             let att_head = &mut att_head_full[..=pos];
             let xb_head = &mut xb_all[hs..hs + head_size];
@@ -2322,17 +2314,11 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                                     )
                                 }
                             } else {
-                                dot_q8_row(
-                                    q_head,
-                                    key_cache_q8,
-                                    row_offset,
-                                    key_scales[t_row],
-                                )
+                                dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
                             }
                         }
                         KvCacheFormat::Turbo => {
-                            let aux_idx =
-                                turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
+                            let aux_idx = turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
                             dot_turboquant_head(
                                 &turbo_query_rotated[..head_size],
                                 &turbo_query_residual_proj[..head_size],
@@ -2389,8 +2375,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                             }
                         }
                         KvCacheFormat::Turbo => {
-                            let aux_idx =
-                                turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
+                            let aux_idx = turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
                             axpy_turboquant_head(
                                 xb_head,
                                 turbo_residual_accum,
@@ -2433,17 +2418,11 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                                     )
                                 }
                             } else {
-                                dot_q8_row(
-                                    q_head,
-                                    key_cache_q8,
-                                    row_offset,
-                                    key_scales[t_row],
-                                )
+                                dot_q8_row(q_head, key_cache_q8, row_offset, key_scales[t_row])
                             }
                         }
                         KvCacheFormat::Turbo => {
-                            let aux_idx =
-                                turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
+                            let aux_idx = turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
                             dot_turboquant_head(
                                 &turbo_query_rotated[..head_size],
                                 &turbo_query_residual_proj[..head_size],
@@ -2497,8 +2476,7 @@ pub(crate) fn attention_token(p: &Config, s: &mut RunState, l: usize, pos: usize
                             }
                         }
                         KvCacheFormat::Turbo => {
-                            let aux_idx =
-                                turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
+                            let aux_idx = turboquant_aux_index(t_row, kv_head, p.n_kv_heads);
                             axpy_turboquant_head(
                                 xb_head,
                                 turbo_residual_accum,
@@ -2639,6 +2617,7 @@ impl PrefillScratch {
 /// swaps in the bitwise sequential mirror for structural debugging. Types
 /// neither kernel supports fall back to per-token `matmul_quantized` (still
 /// correct, just without the batching win for that tensor).
+#[allow(clippy::too_many_arguments)]
 fn bmm_prefill(
     out: &mut [f32],
     inp: &[f32],
@@ -2971,12 +2950,13 @@ pub(crate) fn layer_attention_token(
                 )?;
                 if p.n_heads >= par_attn_min_heads() {
                     let hb_src = &s.hb[..2 * q_dim];
-                    s.q[..q_dim].par_chunks_mut(head_size).enumerate().for_each(
-                        |(h, q_dst)| {
+                    s.q[..q_dim]
+                        .par_chunks_mut(head_size)
+                        .enumerate()
+                        .for_each(|(h, q_dst)| {
                             let src_base = h * 2 * head_size;
                             q_dst.copy_from_slice(&hb_src[src_base..src_base + head_size]);
-                        },
-                    );
+                        });
                 } else {
                     for h in 0..p.n_heads {
                         let src_base = h * 2 * head_size;
@@ -2989,14 +2969,7 @@ pub(crate) fn layer_attention_token(
             } else if w.wq[l].rows == q_dim {
                 matmul_quantized(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], mapped)?;
             } else {
-                matmul_quantized_rows(
-                    &mut s.q[..q_dim],
-                    &s.xb[..dim],
-                    &w.wq[l],
-                    0,
-                    q_dim,
-                    mapped,
-                )?;
+                matmul_quantized_rows(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], 0, q_dim, mapped)?;
             }
             if w.wk[l].rows == kv_dim {
                 matmul_quantized(&mut s.k[..kv_dim], &s.xb[..dim], &w.wk[l], mapped)?;
@@ -3073,7 +3046,6 @@ pub(crate) fn layer_attention_token(
         apply_rope_qk(p, s, l, pos);
         kv_write_token(p, s, l, pos);
         attention_token(p, s, l, pos);
-
 
         if qwen3next_packed_q_gate {
             for h in 0..p.n_heads {

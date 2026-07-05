@@ -1477,6 +1477,8 @@ pub(crate) struct ModelRuntime {
     document_encoder: Option<DocumentEncoder>,
     rag_index: Option<RagIndex>,
     kv_cache_format_logged: bool,
+    prefill_cache: Option<crate::app::prefill_cache::PrefixCache>,
+    prefill_cache_warned: bool,
 }
 
 impl ModelRuntime {
@@ -2437,6 +2439,8 @@ impl ModelRuntime {
             document_encoder: None,
             rag_index: None,
             kv_cache_format_logged: false,
+            prefill_cache: None,
+            prefill_cache_warned: false,
         })
     }
 
@@ -2529,6 +2533,8 @@ impl ModelRuntime {
             document_encoder: None,
             rag_index: None,
             kv_cache_format_logged: false,
+            prefill_cache: None,
+            prefill_cache_warned: false,
         })
     }
 
@@ -2755,7 +2761,108 @@ impl ModelRuntime {
             document_encoder,
             rag_index,
             kv_cache_format_logged: false,
+            prefill_cache: None,
+            prefill_cache_warned: false,
         })
+    }
+
+    /// Load a serialized prefill cache. Validates the model fingerprint; the
+    /// per-request token-prefix match provides the actual correctness guard.
+    pub(crate) fn set_prefill_cache_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        let pc = crate::app::prefill_cache::PrefixCache::parse(bytes)?;
+        let (len, fnv) =
+            crate::app::prefill_cache::model_fingerprint(self.gguf.mapped.as_slice());
+        if pc.model_len != len || pc.model_head_fnv != fnv {
+            return Err("prefill cache: model fingerprint mismatch".to_string());
+        }
+        self.prefill_cache = Some(pc);
+        Ok(())
+    }
+
+    /// Render a prefill-cache blob for `system_prompt`.
+    ///
+    /// The static prefix is discovered template-agnostically: encode two
+    /// prompts that differ only in user text and take their token LCP —
+    /// exactly the tokens every future prompt with this system prompt shares.
+    /// That prefix is prefilled once and the resulting state serialized.
+    pub(crate) fn render_prefill_cache_blob(
+        &mut self,
+        system_prompt: &str,
+    ) -> Result<Vec<u8>, String> {
+        use crate::vendors::{ChatMessage, ChatRole};
+        let think_mode = self.settings.think_mode;
+        let a = crate::vendors::encode_chat_messages(
+            &mut self.tokenizer,
+            &self.config,
+            &[ChatMessage {
+                role: ChatRole::User,
+                content: "A".to_string(),
+            }],
+            system_prompt,
+            think_mode,
+        );
+        let b = crate::vendors::encode_chat_messages(
+            &mut self.tokenizer,
+            &self.config,
+            &[ChatMessage {
+                role: ChatRole::User,
+                content: "zq 9".to_string(),
+            }],
+            system_prompt,
+            think_mode,
+        );
+        let mut k = 0usize;
+        while k < a.len().min(b.len()) && a[k] == b[k] {
+            k += 1;
+        }
+        if k == 0 {
+            return Err("prefill cache: no shared static prefix".to_string());
+        }
+        if k >= self.config.seq_len {
+            return Err("prefill cache: static prefix exceeds context size".to_string());
+        }
+        let tokens = a[..k].to_vec();
+
+        let mut state = crate::engine::runtime::malloc_run_state(&self.config)?;
+        let use_batch = crate::engine::switches::use_batch_prefill()
+            && crate::engine::runtime::batch_prefill_supported(&self.config);
+        if use_batch {
+            let chunk = crate::engine::switches::batch_prefill_chunk();
+            let mut scratch = crate::engine::runtime::PrefillScratch::new();
+            let mut base = 0usize;
+            while base < tokens.len() {
+                let take = chunk.min(tokens.len() - base);
+                let toks: Vec<usize> = tokens[base..base + take]
+                    .iter()
+                    .map(|&t| t as usize)
+                    .collect();
+                crate::engine::runtime::transformer_prefill_batch(
+                    &toks,
+                    base,
+                    &self.config,
+                    &mut state,
+                    &self.weights,
+                    self.gguf.mapped.as_slice(),
+                    &mut scratch,
+                )?;
+                base += take;
+            }
+        } else {
+            for (pos, &t) in tokens.iter().enumerate() {
+                crate::engine::runtime::transformer_without_logits(
+                    t as usize,
+                    pos,
+                    &self.config,
+                    &mut state,
+                    &self.weights,
+                    self.gguf.mapped.as_slice(),
+                )?;
+            }
+        }
+
+        let (len, fnv) =
+            crate::app::prefill_cache::model_fingerprint(self.gguf.mapped.as_slice());
+        crate::app::prefill_cache::snapshot(&self.config, &state, &tokens, len, fnv)
     }
 
     pub(crate) fn generate_text(
@@ -3527,6 +3634,37 @@ impl ModelRuntime {
             );
             self.kv_cache_format_logged = true;
         }
+
+        // Prefill cache: when the encoded prompt starts with the cached static
+        // prefix, restore its KV rows + SSM states instead of prefilling them.
+        // Any mismatch (drift, config, format) falls back to a cold prefill.
+        if prefill_injected_embeddings.is_empty() {
+            let inject_result = self.prefill_cache.as_ref().and_then(|pc| {
+                match pc.match_len(&prompt_tokens) {
+                    Some(kp) if kp < self.config.seq_len => {
+                        Some((kp, pc.inject(&self.config, &mut state)))
+                    }
+                    _ => None,
+                }
+            });
+            match inject_result {
+                Some((kp, Ok(()))) => {
+                    pos = kp;
+                    token = prompt_tokens[kp];
+                    if debug_mode {
+                        emit_debug_line(
+                            event_callback.as_ref(),
+                            format!("Prefill cache: restored {kp} prefix tokens"),
+                        );
+                    }
+                }
+                Some((_, Err(e))) if !self.prefill_cache_warned => {
+                    eprintln!("Warning: prefill cache disabled: {e}");
+                    self.prefill_cache_warned = true;
+                }
+                _ => {}
+            }
+        }
         let sampling_seed = self
             .settings
             .sampling_seed
@@ -3739,7 +3877,7 @@ impl ModelRuntime {
             let prefill_end = prompt_tokens.len() - 1;
             let chunk = crate::engine::switches::batch_prefill_chunk();
             let mut scratch = crate::engine::runtime::PrefillScratch::new();
-            let mut base = 0usize;
+            let mut base = pos;
             while base < prefill_end {
                 let take = chunk.min(prefill_end - base);
                 let toks: Vec<usize> = prompt_tokens[base..base + take]

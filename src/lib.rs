@@ -5,4 +5,4 @@ mod rag;
 mod tools;
 mod vendors;
 
-pub use app::embed::{EmbeddedRuntime, GenerationStats, Tool};
+pub use app::embed::{EmbeddedRuntime, GenerationStats, Tool, build_tool_system_prompt_from_specs};
