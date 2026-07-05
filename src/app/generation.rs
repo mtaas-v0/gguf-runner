@@ -3651,7 +3651,9 @@ impl ModelRuntime {
                     pos = kp;
                     token = prompt_tokens[kp];
                     if !self.prefill_cache_warned {
-                        eprintln!("prefill cache: restored {kp} prefix tokens (skipping their prefill)");
+                        eprintln!(
+                            "prefill cache: restored {kp} prefix tokens (skipping their prefill)"
+                        );
                         self.prefill_cache_warned = true;
                     }
                 }
