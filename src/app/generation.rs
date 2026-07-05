@@ -3095,6 +3095,10 @@ impl ModelRuntime {
         self.settings.think_mode = ThinkMode::Hidden;
     }
 
+    pub(crate) fn set_think_mode_no(&mut self) {
+        self.settings.think_mode = ThinkMode::No;
+    }
+
     /// Override the model's effective context length.
     ///
     /// Clamps `config.seq_len` (and `settings.max_tokens` when it would

@@ -247,6 +247,16 @@ impl EmbeddedRuntime {
         self.inner.render_prefill_cache_blob(system_prompt)
     }
 
+    /// Disable thinking entirely (`<think></think>` pre-closed). Recommended
+    /// for tool-calling with small models: with thinking enabled they tend to
+    /// narrate the intended action inside/after the think block and end the
+    /// turn without ever emitting the `<tool_call>`, and long think blocks
+    /// starve the visible-answer token budget.
+    pub fn use_no_think_mode(&mut self) -> &mut Self {
+        self.inner.set_think_mode_no();
+        self
+    }
+
     pub fn use_hidden_think_mode(&mut self) -> &mut Self {
         self.inner.set_think_mode_hidden();
         self
