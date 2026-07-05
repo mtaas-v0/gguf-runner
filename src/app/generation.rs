@@ -3650,20 +3650,39 @@ impl ModelRuntime {
                 Some((kp, Ok(()))) => {
                     pos = kp;
                     token = prompt_tokens[kp];
-                    if debug_mode {
-                        emit_debug_line(
-                            event_callback.as_ref(),
-                            format!("Prefill cache: restored {kp} prefix tokens"),
-                        );
+                    if !self.prefill_cache_warned {
+                        eprintln!("prefill cache: restored {kp} prefix tokens (skipping their prefill)");
+                        self.prefill_cache_warned = true;
                     }
                 }
                 Some((_, Err(e))) if !self.prefill_cache_warned => {
                     eprintln!("Warning: prefill cache disabled: {e}");
                     self.prefill_cache_warned = true;
                 }
+                None if self.prefill_cache.is_some() && !self.prefill_cache_warned => {
+                    // Pinpoint the divergence so drift is diagnosable from logs.
+                    if let Some(pc) = self.prefill_cache.as_ref() {
+                        let lcp = pc
+                            .tokens
+                            .iter()
+                            .zip(prompt_tokens.iter())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        eprintln!(
+                            "Warning: prefill cache mismatch — diverges at token {lcp}/{} \
+                             (cached={:?} prompt={:?}, prompt_len={}); cold prefill",
+                            pc.tokens.len(),
+                            pc.tokens.get(lcp),
+                            prompt_tokens.get(lcp),
+                            prompt_tokens.len(),
+                        );
+                    }
+                    self.prefill_cache_warned = true;
+                }
                 _ => {}
             }
         }
+        let injected_prefix = pos;
         let sampling_seed = self
             .settings
             .sampling_seed
@@ -4595,7 +4614,7 @@ impl ModelRuntime {
             event_callback.as_ref(),
             RuntimeProgress {
                 phase: RuntimePhase::Ready,
-                prefill_tokens: prompt_tokens.len(),
+                prefill_tokens: prompt_tokens.len().saturating_sub(injected_prefix),
                 decode_tokens: generated_tokens.len(),
                 hidden_thinking: false,
                 hidden_think_tokens: hidden_think_token_count,
