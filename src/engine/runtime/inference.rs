@@ -1,12 +1,15 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::engine::kernels::{
-    accum, batch_exact_supported, dot_f32_simd, get_row_size, l2_norm, layernorm_inplace,
-    matmul_f32_embeddings, matmul_quantized, matmul_quantized_batch_exact,
-    matmul_quantized_batch_fast, matmul_quantized_rows, qwen3next_linear_attention_autoregressive,
-    rmsnorm, rmsnorm_gemma, rmsnorm_inplace, rmsnorm_per_head_gemma_inplace,
-    sanitize_finite_inplace, scale_slice_inplace, select_topk_softmax, sigmoid_mul_inplace,
-    silu_and_mul_inplace, softmax,
+    MatmulActivationScratch, accum, batch_exact_supported, dot_f32_simd, get_row_size, l2_norm,
+    layernorm_inplace, matmul_f32_embeddings, matmul_prepared_activation_supported,
+    matmul_quantized, matmul_quantized_batch_exact, matmul_quantized_batch_fast,
+    matmul_quantized_rows, matmul_quantized_rows_with_prepared_activation,
+    matmul_quantized_rows_with_scratch, matmul_quantized_with_prepared_activation,
+    matmul_quantized_with_scratch, prepare_matmul_activation,
+    qwen3next_linear_attention_autoregressive, rmsnorm, rmsnorm_gemma, rmsnorm_inplace,
+    rmsnorm_per_head_gemma_inplace, sanitize_finite_inplace, scale_slice_inplace,
+    select_topk_softmax, sigmoid_mul_inplace, silu_and_mul_inplace, softmax,
 };
 use crate::engine::profiling::{PROF_ATTN_NS, PROF_FFN_NS, PROF_MOE_NS, prof_end, prof_start};
 use crate::engine::switches::{
@@ -28,6 +31,15 @@ fn env_flag(name: &str) -> bool {
             matches!(s.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
+}
+
+fn all_prepared_activation_supported(tensors: &[&QuantizedTensor]) -> bool {
+    let Some(first) = tensors.first() else {
+        return false;
+    };
+    tensors
+        .iter()
+        .all(|tensor| tensor.cols == first.cols && matmul_prepared_activation_supported(tensor))
 }
 
 fn env_usize(name: &str) -> Option<usize> {
@@ -2696,6 +2708,8 @@ pub(crate) fn transformer_prefill_batch(
             .copy_from_slice(&w.token_embedding_table[tok * dim..(tok + 1) * dim]);
     }
 
+    let mut matmul_scratch = MatmulActivationScratch::new();
+
     for l in 0..p.n_layers {
         let is_ssm_layer = p.is_qwen3next && w.attn_qkv[l].rows > 0;
         if is_ssm_layer {
@@ -2710,7 +2724,7 @@ pub(crate) fn transformer_prefill_batch(
                     dim,
                     eps,
                 );
-                layer_attention_token(p, s, w, mapped, l, pos)?;
+                layer_attention_token(p, s, w, mapped, &mut matmul_scratch, l, pos)?;
                 accum(&mut scratch.x[i * dim..(i + 1) * dim], &s.xb2[..dim], dim);
             }
         } else {
@@ -2917,6 +2931,7 @@ pub(crate) fn layer_attention_token(
     s: &mut RunState,
     w: &TransformerWeights,
     mapped: &[u8],
+    matmul_scratch: &mut MatmulActivationScratch,
     l: usize,
     pos: usize,
 ) -> Result<(), String> {
@@ -2937,87 +2952,337 @@ pub(crate) fn layer_attention_token(
         let attn_prof = prof_start();
         let mut qwen3next_packed_q_gate = false;
         if p.is_qwen3next {
-            if w.wq[l].rows >= 2 * q_dim {
-                // Qwen3Next full-attn packs Q and gate interleaved per head:
-                // [q_head0, gate_head0, q_head1, gate_head1, ...]
-                matmul_quantized_rows(
-                    &mut s.hb[..2 * q_dim],
-                    &s.xb[..dim],
-                    &w.wq[l],
-                    0,
-                    2 * q_dim,
-                    mapped,
-                )?;
-                if p.n_heads >= par_attn_min_heads() {
-                    let hb_src = &s.hb[..2 * q_dim];
-                    s.q[..q_dim]
-                        .par_chunks_mut(head_size)
-                        .enumerate()
-                        .for_each(|(h, q_dst)| {
+            let use_prepared_qkv =
+                all_prepared_activation_supported(&[&w.wq[l], &w.wk[l], &w.wv[l]]);
+            let mut prepared_qkv_done = false;
+            if use_prepared_qkv
+                && let Some(prepared) =
+                    prepare_matmul_activation(&s.xb[..dim], &w.wq[l], matmul_scratch)
+            {
+                if w.wq[l].rows >= 2 * q_dim {
+                    // Qwen3Next full-attn packs Q and gate interleaved per head:
+                    // [q_head0, gate_head0, q_head1, gate_head1, ...]
+                    matmul_quantized_rows_with_prepared_activation(
+                        &mut s.hb[..2 * q_dim],
+                        &prepared,
+                        &w.wq[l],
+                        0,
+                        2 * q_dim,
+                        mapped,
+                    )?;
+                    if p.n_heads >= par_attn_min_heads() {
+                        let hb_src = &s.hb[..2 * q_dim];
+                        s.q[..q_dim].par_chunks_mut(head_size).enumerate().for_each(
+                            |(h, q_dst)| {
+                                let src_base = h * 2 * head_size;
+                                q_dst.copy_from_slice(&hb_src[src_base..src_base + head_size]);
+                            },
+                        );
+                    } else {
+                        for h in 0..p.n_heads {
                             let src_base = h * 2 * head_size;
-                            q_dst.copy_from_slice(&hb_src[src_base..src_base + head_size]);
-                        });
-                } else {
-                    for h in 0..p.n_heads {
-                        let src_base = h * 2 * head_size;
-                        let dst_base = h * head_size;
-                        s.q[dst_base..dst_base + head_size]
-                            .copy_from_slice(&s.hb[src_base..src_base + head_size]);
+                            let dst_base = h * head_size;
+                            s.q[dst_base..dst_base + head_size]
+                                .copy_from_slice(&s.hb[src_base..src_base + head_size]);
+                        }
                     }
+                    qwen3next_packed_q_gate = true;
+                } else if w.wq[l].rows == q_dim {
+                    matmul_quantized_with_prepared_activation(
+                        &mut s.q[..q_dim],
+                        &prepared,
+                        &w.wq[l],
+                        mapped,
+                    )?;
+                } else {
+                    matmul_quantized_rows_with_prepared_activation(
+                        &mut s.q[..q_dim],
+                        &prepared,
+                        &w.wq[l],
+                        0,
+                        q_dim,
+                        mapped,
+                    )?;
                 }
-                qwen3next_packed_q_gate = true;
-            } else if w.wq[l].rows == q_dim {
-                matmul_quantized(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], mapped)?;
-            } else {
-                matmul_quantized_rows(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], 0, q_dim, mapped)?;
+                if w.wk[l].rows == kv_dim {
+                    matmul_quantized_with_prepared_activation(
+                        &mut s.k[..kv_dim],
+                        &prepared,
+                        &w.wk[l],
+                        mapped,
+                    )?;
+                } else {
+                    matmul_quantized_rows_with_prepared_activation(
+                        &mut s.k[..kv_dim],
+                        &prepared,
+                        &w.wk[l],
+                        0,
+                        kv_dim,
+                        mapped,
+                    )?;
+                }
+                if w.wv[l].rows == kv_dim {
+                    matmul_quantized_with_prepared_activation(
+                        &mut s.v[..kv_dim],
+                        &prepared,
+                        &w.wv[l],
+                        mapped,
+                    )?;
+                } else {
+                    matmul_quantized_rows_with_prepared_activation(
+                        &mut s.v[..kv_dim],
+                        &prepared,
+                        &w.wv[l],
+                        0,
+                        kv_dim,
+                        mapped,
+                    )?;
+                }
+                prepared_qkv_done = true;
             }
-            if w.wk[l].rows == kv_dim {
-                matmul_quantized(&mut s.k[..kv_dim], &s.xb[..dim], &w.wk[l], mapped)?;
-            } else {
-                matmul_quantized_rows(
-                    &mut s.k[..kv_dim],
-                    &s.xb[..dim],
-                    &w.wk[l],
-                    0,
-                    kv_dim,
-                    mapped,
-                )?;
-            }
-            if w.wv[l].rows == kv_dim {
-                matmul_quantized(&mut s.v[..kv_dim], &s.xb[..dim], &w.wv[l], mapped)?;
-            } else {
-                matmul_quantized_rows(
-                    &mut s.v[..kv_dim],
-                    &s.xb[..dim],
-                    &w.wv[l],
-                    0,
-                    kv_dim,
-                    mapped,
-                )?;
+            if !prepared_qkv_done {
+                if w.wq[l].rows >= 2 * q_dim {
+                    // Qwen3Next full-attn packs Q and gate interleaved per head:
+                    // [q_head0, gate_head0, q_head1, gate_head1, ...]
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.hb[..2 * q_dim],
+                        &s.xb[..dim],
+                        &w.wq[l],
+                        0,
+                        2 * q_dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                    if p.n_heads >= par_attn_min_heads() {
+                        let hb_src = &s.hb[..2 * q_dim];
+                        s.q[..q_dim].par_chunks_mut(head_size).enumerate().for_each(
+                            |(h, q_dst)| {
+                                let src_base = h * 2 * head_size;
+                                q_dst.copy_from_slice(&hb_src[src_base..src_base + head_size]);
+                            },
+                        );
+                    } else {
+                        for h in 0..p.n_heads {
+                            let src_base = h * 2 * head_size;
+                            let dst_base = h * head_size;
+                            s.q[dst_base..dst_base + head_size]
+                                .copy_from_slice(&s.hb[src_base..src_base + head_size]);
+                        }
+                    }
+                    qwen3next_packed_q_gate = true;
+                } else if w.wq[l].rows == q_dim {
+                    matmul_quantized_with_scratch(
+                        &mut s.q[..q_dim],
+                        &s.xb[..dim],
+                        &w.wq[l],
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                } else {
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.q[..q_dim],
+                        &s.xb[..dim],
+                        &w.wq[l],
+                        0,
+                        q_dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                }
+                if w.wk[l].rows == kv_dim {
+                    matmul_quantized_with_scratch(
+                        &mut s.k[..kv_dim],
+                        &s.xb[..dim],
+                        &w.wk[l],
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                } else {
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.k[..kv_dim],
+                        &s.xb[..dim],
+                        &w.wk[l],
+                        0,
+                        kv_dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                }
+                if w.wv[l].rows == kv_dim {
+                    matmul_quantized_with_scratch(
+                        &mut s.v[..kv_dim],
+                        &s.xb[..dim],
+                        &w.wv[l],
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                } else {
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.v[..kv_dim],
+                        &s.xb[..dim],
+                        &w.wv[l],
+                        0,
+                        kv_dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                }
             }
         } else if p.is_bert_family && w.wq[l].rows == q_dim + 2 * kv_dim {
             // Fused QKV: Q rows [0, q_dim), K rows [q_dim, q_dim+kv_dim), V rows after.
-            matmul_quantized_rows(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], 0, q_dim, mapped)?;
-            matmul_quantized_rows(
+            if matmul_prepared_activation_supported(&w.wq[l]) {
+                if let Some(prepared) =
+                    prepare_matmul_activation(&s.xb[..dim], &w.wq[l], matmul_scratch)
+                {
+                    matmul_quantized_rows_with_prepared_activation(
+                        &mut s.q[..q_dim],
+                        &prepared,
+                        &w.wq[l],
+                        0,
+                        q_dim,
+                        mapped,
+                    )?;
+                    matmul_quantized_rows_with_prepared_activation(
+                        &mut s.k[..kv_dim],
+                        &prepared,
+                        &w.wq[l],
+                        q_dim,
+                        kv_dim,
+                        mapped,
+                    )?;
+                    matmul_quantized_rows_with_prepared_activation(
+                        &mut s.v[..kv_dim],
+                        &prepared,
+                        &w.wq[l],
+                        q_dim + kv_dim,
+                        kv_dim,
+                        mapped,
+                    )?;
+                } else {
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.q[..q_dim],
+                        &s.xb[..dim],
+                        &w.wq[l],
+                        0,
+                        q_dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.k[..kv_dim],
+                        &s.xb[..dim],
+                        &w.wq[l],
+                        q_dim,
+                        kv_dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                    matmul_quantized_rows_with_scratch(
+                        &mut s.v[..kv_dim],
+                        &s.xb[..dim],
+                        &w.wq[l],
+                        q_dim + kv_dim,
+                        kv_dim,
+                        mapped,
+                        matmul_scratch,
+                    )?;
+                }
+            } else {
+                matmul_quantized_rows_with_scratch(
+                    &mut s.q[..q_dim],
+                    &s.xb[..dim],
+                    &w.wq[l],
+                    0,
+                    q_dim,
+                    mapped,
+                    matmul_scratch,
+                )?;
+                matmul_quantized_rows_with_scratch(
+                    &mut s.k[..kv_dim],
+                    &s.xb[..dim],
+                    &w.wq[l],
+                    q_dim,
+                    kv_dim,
+                    mapped,
+                    matmul_scratch,
+                )?;
+                matmul_quantized_rows_with_scratch(
+                    &mut s.v[..kv_dim],
+                    &s.xb[..dim],
+                    &w.wq[l],
+                    q_dim + kv_dim,
+                    kv_dim,
+                    mapped,
+                    matmul_scratch,
+                )?;
+            }
+        } else if all_prepared_activation_supported(&[&w.wq[l], &w.wk[l], &w.wv[l]]) {
+            if let Some(prepared) =
+                prepare_matmul_activation(&s.xb[..dim], &w.wq[l], matmul_scratch)
+            {
+                matmul_quantized_with_prepared_activation(
+                    &mut s.q[..q_dim],
+                    &prepared,
+                    &w.wq[l],
+                    mapped,
+                )?;
+                matmul_quantized_with_prepared_activation(
+                    &mut s.k[..kv_dim],
+                    &prepared,
+                    &w.wk[l],
+                    mapped,
+                )?;
+                matmul_quantized_with_prepared_activation(
+                    &mut s.v[..kv_dim],
+                    &prepared,
+                    &w.wv[l],
+                    mapped,
+                )?;
+            } else {
+                matmul_quantized_with_scratch(
+                    &mut s.q[..q_dim],
+                    &s.xb[..dim],
+                    &w.wq[l],
+                    mapped,
+                    matmul_scratch,
+                )?;
+                matmul_quantized_with_scratch(
+                    &mut s.k[..kv_dim],
+                    &s.xb[..dim],
+                    &w.wk[l],
+                    mapped,
+                    matmul_scratch,
+                )?;
+                matmul_quantized_with_scratch(
+                    &mut s.v[..kv_dim],
+                    &s.xb[..dim],
+                    &w.wv[l],
+                    mapped,
+                    matmul_scratch,
+                )?;
+            }
+        } else {
+            matmul_quantized_with_scratch(
+                &mut s.q[..q_dim],
+                &s.xb[..dim],
+                &w.wq[l],
+                mapped,
+                matmul_scratch,
+            )?;
+            matmul_quantized_with_scratch(
                 &mut s.k[..kv_dim],
                 &s.xb[..dim],
-                &w.wq[l],
-                q_dim,
-                kv_dim,
+                &w.wk[l],
                 mapped,
+                matmul_scratch,
             )?;
-            matmul_quantized_rows(
+            matmul_quantized_with_scratch(
                 &mut s.v[..kv_dim],
                 &s.xb[..dim],
-                &w.wq[l],
-                q_dim + kv_dim,
-                kv_dim,
+                &w.wv[l],
                 mapped,
+                matmul_scratch,
             )?;
-        } else {
-            matmul_quantized(&mut s.q[..q_dim], &s.xb[..dim], &w.wq[l], mapped)?;
-            matmul_quantized(&mut s.k[..kv_dim], &s.xb[..dim], &w.wk[l], mapped)?;
-            matmul_quantized(&mut s.v[..kv_dim], &s.xb[..dim], &w.wv[l], mapped)?;
         }
 
         validate_bf16_projection_rows(
@@ -3058,7 +3323,13 @@ pub(crate) fn layer_attention_token(
             }
             sanitize_finite_inplace(&mut s.xb[..q_dim]);
         }
-        matmul_quantized(&mut s.xb2[..dim], &s.xb[..q_dim], &w.wo[l], mapped)?;
+        matmul_quantized_with_scratch(
+            &mut s.xb2[..dim],
+            &s.xb[..q_dim],
+            &w.wo[l],
+            mapped,
+            matmul_scratch,
+        )?;
         sanitize_finite_inplace(&mut s.xb2[..dim]);
         prof_end(&PROF_ATTN_NS, attn_prof);
     }
@@ -3084,6 +3355,7 @@ fn transformer_inner(
     let do_layer_debug =
         layer_debug_enabled() && layer_debug_pos().map_or(pos == 0, |p0| pos == p0);
     let mut deepstack_embedding: Option<&[f32]> = None;
+    let mut matmul_scratch = MatmulActivationScratch::new();
 
     if let TransformerInput::Embedding(input_embedding) = input {
         if input_embedding.len() == dim {
@@ -3133,7 +3405,7 @@ fn transformer_inner(
             );
         }
 
-        layer_attention_token(p, s, w, mapped, l, pos)?;
+        layer_attention_token(p, s, w, mapped, &mut matmul_scratch, l, pos)?;
 
         if do_layer_debug {
             eprintln!(
@@ -3194,11 +3466,12 @@ fn transformer_inner(
             let force_serial_routed =
                 p.is_qwen3next && env_flag("GGUF_QWEN3NEXT_SERIAL_ROUTED_EXPERTS");
             s.xb2[..dim].copy_from_slice(&s.xb[..dim]);
-            matmul_quantized(
+            matmul_quantized_with_scratch(
                 &mut s.moe_logits[..p.n_experts],
                 &s.xb2[..dim],
                 &w.moe_gate_inp[l],
                 mapped,
+                &mut matmul_scratch,
             )?;
             let n_selected = select_topk_softmax(
                 &s.moe_logits[..p.n_experts],
@@ -3237,26 +3510,34 @@ fn transformer_inner(
                         .par_chunks_mut(dim)
                         .zip(routed_selected.par_iter())
                         .map_init(
-                            || (vec![0.0f32; expert_hidden], vec![0.0f32; expert_hidden]),
-                            |(hb_local, hb2_local),
+                            || {
+                                (
+                                    vec![0.0f32; expert_hidden],
+                                    vec![0.0f32; expert_hidden],
+                                    MatmulActivationScratch::new(),
+                                )
+                            },
+                            |(hb_local, hb2_local, local_matmul_scratch),
                              (contrib, &(expert_idx, route_weight))|
                              -> Result<(), String> {
                                 let row_start_ffn = expert_idx * expert_hidden;
-                                matmul_quantized_rows(
+                                matmul_quantized_rows_with_scratch(
                                     &mut hb_local[..expert_hidden],
                                     xb2,
                                     gate_exps,
                                     row_start_ffn,
                                     expert_hidden,
                                     mapped,
+                                    local_matmul_scratch,
                                 )?;
-                                matmul_quantized_rows(
+                                matmul_quantized_rows_with_scratch(
                                     &mut hb2_local[..expert_hidden],
                                     xb2,
                                     up_exps,
                                     row_start_ffn,
                                     expert_hidden,
                                     mapped,
+                                    local_matmul_scratch,
                                 )?;
                                 silu_and_mul_inplace(
                                     &mut hb_local[..expert_hidden],
@@ -3264,13 +3545,14 @@ fn transformer_inner(
                                 );
 
                                 let row_start_down = expert_idx * dim;
-                                matmul_quantized_rows(
+                                matmul_quantized_rows_with_scratch(
                                     contrib,
                                     &hb_local[..expert_hidden],
                                     down_exps,
                                     row_start_down,
                                     dim,
                                     mapped,
+                                    local_matmul_scratch,
                                 )?;
                                 for v in contrib {
                                     *v *= route_weight;
@@ -3291,33 +3573,36 @@ fn transformer_inner(
                 } else {
                     for &(expert_idx, route_weight) in &routed_selected {
                         let row_start_ffn = expert_idx * expert_hidden;
-                        matmul_quantized_rows(
+                        matmul_quantized_rows_with_scratch(
                             &mut s.hb[..expert_hidden],
                             &s.xb2[..dim],
                             &w.moe_gate_exps[l],
                             row_start_ffn,
                             expert_hidden,
                             mapped,
+                            &mut matmul_scratch,
                         )?;
-                        matmul_quantized_rows(
+                        matmul_quantized_rows_with_scratch(
                             &mut s.hb2[..expert_hidden],
                             &s.xb2[..dim],
                             &w.moe_up_exps[l],
                             row_start_ffn,
                             expert_hidden,
                             mapped,
+                            &mut matmul_scratch,
                         )?;
 
                         silu_and_mul_inplace(&mut s.hb[..expert_hidden], &s.hb2[..expert_hidden]);
 
                         let row_start_down = expert_idx * dim;
-                        matmul_quantized_rows(
+                        matmul_quantized_rows_with_scratch(
                             &mut s.moe_tmp[..dim],
                             &s.hb[..expert_hidden],
                             &w.moe_down_exps[l],
                             row_start_down,
                             dim,
                             mapped,
+                            &mut matmul_scratch,
                         )?;
                         crate::engine::kernels::axpy_inplace(
                             &mut s.xb[..dim],
@@ -3338,22 +3623,115 @@ fn transformer_inner(
                 let gate_logit = dot_f32_simd(&s.xb2[..dim], shared_gate);
                 let gate = 1.0 / (1.0 + (-gate_logit).exp());
 
-                matmul_quantized(&mut s.hb[..shared_hidden], &s.xb2[..dim], &w.w1[l], mapped)?;
-                matmul_quantized(&mut s.hb2[..shared_hidden], &s.xb2[..dim], &w.w3[l], mapped)?;
+                if all_prepared_activation_supported(&[&w.w1[l], &w.w3[l]]) {
+                    if let Some(prepared) =
+                        prepare_matmul_activation(&s.xb2[..dim], &w.w1[l], &mut matmul_scratch)
+                    {
+                        matmul_quantized_with_prepared_activation(
+                            &mut s.hb[..shared_hidden],
+                            &prepared,
+                            &w.w1[l],
+                            mapped,
+                        )?;
+                        matmul_quantized_with_prepared_activation(
+                            &mut s.hb2[..shared_hidden],
+                            &prepared,
+                            &w.w3[l],
+                            mapped,
+                        )?;
+                    } else {
+                        matmul_quantized_with_scratch(
+                            &mut s.hb[..shared_hidden],
+                            &s.xb2[..dim],
+                            &w.w1[l],
+                            mapped,
+                            &mut matmul_scratch,
+                        )?;
+                        matmul_quantized_with_scratch(
+                            &mut s.hb2[..shared_hidden],
+                            &s.xb2[..dim],
+                            &w.w3[l],
+                            mapped,
+                            &mut matmul_scratch,
+                        )?;
+                    }
+                } else {
+                    matmul_quantized_with_scratch(
+                        &mut s.hb[..shared_hidden],
+                        &s.xb2[..dim],
+                        &w.w1[l],
+                        mapped,
+                        &mut matmul_scratch,
+                    )?;
+                    matmul_quantized_with_scratch(
+                        &mut s.hb2[..shared_hidden],
+                        &s.xb2[..dim],
+                        &w.w3[l],
+                        mapped,
+                        &mut matmul_scratch,
+                    )?;
+                }
                 silu_and_mul_inplace(&mut s.hb[..shared_hidden], &s.hb2[..shared_hidden]);
-                matmul_quantized(
+                matmul_quantized_with_scratch(
                     &mut s.moe_tmp[..dim],
                     &s.hb[..shared_hidden],
                     &w.w2[l],
                     mapped,
+                    &mut matmul_scratch,
                 )?;
                 crate::engine::kernels::axpy_inplace(&mut s.xb[..dim], gate, &s.moe_tmp[..dim]);
             }
             prof_end(&PROF_MOE_NS, moe_prof);
         } else {
             let ffn_prof = prof_start();
-            matmul_quantized(&mut s.hb[..hidden_dim], &s.xb[..dim], &w.w1[l], mapped)?;
-            matmul_quantized(&mut s.hb2[..hidden_dim], &s.xb[..dim], &w.w3[l], mapped)?;
+            if all_prepared_activation_supported(&[&w.w1[l], &w.w3[l]]) {
+                if let Some(prepared) =
+                    prepare_matmul_activation(&s.xb[..dim], &w.w1[l], &mut matmul_scratch)
+                {
+                    matmul_quantized_with_prepared_activation(
+                        &mut s.hb[..hidden_dim],
+                        &prepared,
+                        &w.w1[l],
+                        mapped,
+                    )?;
+                    matmul_quantized_with_prepared_activation(
+                        &mut s.hb2[..hidden_dim],
+                        &prepared,
+                        &w.w3[l],
+                        mapped,
+                    )?;
+                } else {
+                    matmul_quantized_with_scratch(
+                        &mut s.hb[..hidden_dim],
+                        &s.xb[..dim],
+                        &w.w1[l],
+                        mapped,
+                        &mut matmul_scratch,
+                    )?;
+                    matmul_quantized_with_scratch(
+                        &mut s.hb2[..hidden_dim],
+                        &s.xb[..dim],
+                        &w.w3[l],
+                        mapped,
+                        &mut matmul_scratch,
+                    )?;
+                }
+            } else {
+                matmul_quantized_with_scratch(
+                    &mut s.hb[..hidden_dim],
+                    &s.xb[..dim],
+                    &w.w1[l],
+                    mapped,
+                    &mut matmul_scratch,
+                )?;
+                matmul_quantized_with_scratch(
+                    &mut s.hb2[..hidden_dim],
+                    &s.xb[..dim],
+                    &w.w3[l],
+                    mapped,
+                    &mut matmul_scratch,
+                )?;
+            }
 
             if p.is_gemma3 {
                 for i in 0..hidden_dim {
@@ -3366,7 +3744,13 @@ fn transformer_inner(
                 silu_and_mul_inplace(&mut s.hb[..hidden_dim], &s.hb2[..hidden_dim]);
             }
 
-            matmul_quantized(&mut s.xb[..dim], &s.hb[..hidden_dim], &w.w2[l], mapped)?;
+            matmul_quantized_with_scratch(
+                &mut s.xb[..dim],
+                &s.hb[..hidden_dim],
+                &w.w2[l],
+                mapped,
+                &mut matmul_scratch,
+            )?;
             prof_end(&PROF_FFN_NS, ffn_prof);
         }
 
@@ -3434,7 +3818,13 @@ fn transformer_inner(
             dim,
         );
     } else {
-        matmul_quantized(&mut s.logits[..p.vocab_size], &s.x[..dim], &w.wcls, mapped)?;
+        matmul_quantized_with_scratch(
+            &mut s.logits[..p.vocab_size],
+            &s.x[..dim],
+            &w.wcls,
+            mapped,
+            &mut matmul_scratch,
+        )?;
     }
     sanitize_finite_inplace(&mut s.logits[..p.vocab_size]);
 

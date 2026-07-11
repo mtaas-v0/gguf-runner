@@ -5,14 +5,18 @@ use crate::engine::io::{bf16_to_fp32, fp16_to_fp32, read_f32_le, read_u16_le, re
 use crate::engine::profiling::{PROF_MATMUL_NS, prof_end, prof_start};
 #[cfg(target_arch = "aarch64")]
 use crate::engine::switches::{
-    AARCH64_Q3K_MR4_STATUS, AARCH64_Q4K_MR4_STATUS, AARCH64_Q5K_MR4_STATUS, AARCH64_Q6K_MR4_STATUS,
-    AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows, use_aarch64_dotprod_q8,
-    use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
+    AARCH64_IQ4_NL_MR4_STATUS, AARCH64_Q2K_MR4_STATUS, AARCH64_Q3K_MR4_STATUS,
+    AARCH64_Q4_0_MR4_STATUS, AARCH64_Q4_1_MR4_STATUS, AARCH64_Q4K_MR4_STATUS,
+    AARCH64_Q5_0_MR4_STATUS, AARCH64_Q5_1_MR4_STATUS, AARCH64_Q5K_MR4_STATUS,
+    AARCH64_Q6K_MR4_STATUS, AARCH64_Q8_0_MR2_STATUS, aarch64_matmul_prefetch_rows,
+    use_aarch64_dotprod_q8, use_aarch64_i8mm_q8, use_aarch64_qk_mr4,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::engine::switches::{
-    X86_Q3K_MR4_STATUS, X86_Q4K_MR4_STATUS, X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, is_x86_amd,
-    use_x86_avx_vnni, use_x86_avx2_fma, use_x86_avx512_vnni_q8, use_x86_f16c, use_x86_qk_mr4,
+    X86_IQ4_NL_MR4_STATUS, X86_Q2K_MR4_STATUS, X86_Q3K_MR4_STATUS, X86_Q4_0_MR4_STATUS,
+    X86_Q4_1_MR4_STATUS, X86_Q4K_MR4_STATUS, X86_Q5_0_MR4_STATUS, X86_Q5_1_MR4_STATUS,
+    X86_Q5K_MR4_STATUS, X86_Q6K_MR4_STATUS, is_x86_amd, use_x86_avx_vnni, use_x86_avx2_fma,
+    use_x86_avx512_vnni_q8, use_x86_f16c, use_x86_qk_mr4,
 };
 use crate::engine::switches::{par_matmul_chunk_rows, par_matmul_min_rows};
 use crate::engine::types::{
@@ -791,6 +795,57 @@ unsafe fn dot_q4_nibbles_pair_avx2_ptr(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3,avx2,fma")]
+unsafe fn dot_iq4_nl_nibbles_pair_avx2_ptr(
+    x_lo: *const f32,
+    x_hi: *const f32,
+    q: *const u8,
+    n: usize,
+) -> (f32, f32) {
+    let table = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+    let nib_mask = _mm_set1_epi8(0x0f);
+    let mut i = 0usize;
+    let mut acc_lo = _mm256_setzero_ps();
+    let mut acc_hi = _mm256_setzero_ps();
+
+    while i + 8 <= n {
+        let xv_lo = _mm256_loadu_ps(x_lo.add(i));
+        let xv_hi = _mm256_loadu_ps(x_hi.add(i));
+        let q8 = _mm_loadl_epi64(q.add(i) as *const __m128i);
+        let lo_idx = _mm_and_si128(q8, nib_mask);
+        let hi_idx = _mm_and_si128(_mm_srli_epi16(q8, 4), nib_mask);
+        let lo_vals = _mm_shuffle_epi8(table, lo_idx);
+        let hi_vals = _mm_shuffle_epi8(table, hi_idx);
+        let q_lo_f = cvt_i8x8_to_f32x8(lo_vals);
+        let q_hi_f = cvt_i8x8_to_f32x8(hi_vals);
+        acc_lo = _mm256_fmadd_ps(xv_lo, q_lo_f, acc_lo);
+        acc_hi = _mm256_fmadd_ps(xv_hi, q_hi_f, acc_hi);
+        i += 8;
+    }
+
+    let mut sum_lo = hsum256_ps(acc_lo);
+    let mut sum_hi = hsum256_ps(acc_hi);
+    while i < n {
+        let qv = *q.add(i);
+        sum_lo += *x_lo.add(i) * KVALUES_IQ4NL[(qv & 0x0f) as usize] as f32;
+        sum_hi += *x_hi.add(i) * KVALUES_IQ4NL[(qv >> 4) as usize] as f32;
+        i += 1;
+    }
+    (sum_lo, sum_hi)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn sum_f32_32_avx2_ptr(x: *const f32) -> f32 {
+    let mut acc = _mm256_setzero_ps();
+    acc = _mm256_add_ps(acc, _mm256_loadu_ps(x));
+    acc = _mm256_add_ps(acc, _mm256_loadu_ps(x.add(8)));
+    acc = _mm256_add_ps(acc, _mm256_loadu_ps(x.add(16)));
+    acc = _mm256_add_ps(acc, _mm256_loadu_ps(x.add(24)));
+    hsum256_ps(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dot_f32_simd_ptr(a: *const f32, b: *const f32, n: usize) -> f32 {
     if use_x86_avx2_fma() {
@@ -1168,6 +1223,276 @@ pub(crate) fn vec_dot_q4_1(x: &[f32], w: &[u8], n: usize) -> f32 {
     sum
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sum_f32_32_neon_ptr(x: *const f32) -> f32 {
+    let mut acc = vdupq_n_f32(0.0);
+    acc = vaddq_f32(acc, vld1q_f32(x));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(4)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(8)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(12)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(16)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(20)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(24)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(28)));
+    vaddvq_f32(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_q4_nibbles_pair_16_neon_ptr(
+    x_lo: *const f32,
+    x_hi: *const f32,
+    q: *const u8,
+) -> (f32, f32) {
+    let qv = vld1q_u8(q);
+    let lo8 = vandq_u8(qv, vdupq_n_u8(0x0f));
+    let hi8 = vshrq_n_u8(qv, 4);
+
+    let lo16_lo = vmovl_u8(vget_low_u8(lo8));
+    let lo16_hi = vmovl_u8(vget_high_u8(lo8));
+    let hi16_lo = vmovl_u8(vget_low_u8(hi8));
+    let hi16_hi = vmovl_u8(vget_high_u8(hi8));
+
+    let lo_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16_lo)));
+    let lo_f1 = vcvtq_f32_u32(vmovl_high_u16(lo16_lo));
+    let lo_f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo16_hi)));
+    let lo_f3 = vcvtq_f32_u32(vmovl_high_u16(lo16_hi));
+
+    let hi_f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16_lo)));
+    let hi_f1 = vcvtq_f32_u32(vmovl_high_u16(hi16_lo));
+    let hi_f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi16_hi)));
+    let hi_f3 = vcvtq_f32_u32(vmovl_high_u16(hi16_hi));
+
+    let mut acc_lo = vdupq_n_f32(0.0);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo), lo_f0);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo.add(4)), lo_f1);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo.add(8)), lo_f2);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo.add(12)), lo_f3);
+
+    let mut acc_hi = vdupq_n_f32(0.0);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi), hi_f0);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi.add(4)), hi_f1);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi.add(8)), hi_f2);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi.add(12)), hi_f3);
+
+    (vaddvq_f32(acc_lo), vaddvq_f32(acc_hi))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_iq4_nl_nibbles_16_neon_ptr(
+    x_lo: *const f32,
+    x_hi: *const f32,
+    q: *const u8,
+) -> (f32, f32) {
+    let table = vld1q_s8(KVALUES_IQ4NL.as_ptr());
+    let qv = vld1q_u8(q);
+    let lo_idx = vandq_u8(qv, vdupq_n_u8(0x0f));
+    let hi_idx = vshrq_n_u8(qv, 4);
+    let lo_vals = vqtbl1q_s8(table, lo_idx);
+    let hi_vals = vqtbl1q_s8(table, hi_idx);
+
+    let lo16_lo = vmovl_s8(vget_low_s8(lo_vals));
+    let lo16_hi = vmovl_s8(vget_high_s8(lo_vals));
+    let hi16_lo = vmovl_s8(vget_low_s8(hi_vals));
+    let hi16_hi = vmovl_s8(vget_high_s8(hi_vals));
+
+    let lo_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_lo)));
+    let lo_f1 = vcvtq_f32_s32(vmovl_high_s16(lo16_lo));
+    let lo_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_hi)));
+    let lo_f3 = vcvtq_f32_s32(vmovl_high_s16(lo16_hi));
+
+    let hi_f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_lo)));
+    let hi_f1 = vcvtq_f32_s32(vmovl_high_s16(hi16_lo));
+    let hi_f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_hi)));
+    let hi_f3 = vcvtq_f32_s32(vmovl_high_s16(hi16_hi));
+
+    let mut acc_lo = vdupq_n_f32(0.0);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo), lo_f0);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo.add(4)), lo_f1);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo.add(8)), lo_f2);
+    acc_lo = vfmaq_f32(acc_lo, vld1q_f32(x_lo.add(12)), lo_f3);
+
+    let mut acc_hi = vdupq_n_f32(0.0);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi), hi_f0);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi.add(4)), hi_f1);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi.add(8)), hi_f2);
+    acc_hi = vfmaq_f32(acc_hi, vld1q_f32(x_hi.add(12)), hi_f3);
+
+    (vaddvq_f32(acc_lo), vaddvq_f32(acc_hi))
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn vec_dot_q4_0_4rows(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK4_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_0));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK4_0;
+        let x_ptr = unsafe { x.as_ptr().add(x_base) };
+        let x_sum = unsafe { sum_f32_32_neon_ptr(x_ptr) };
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let q = rows[r][off + 2..off + 2 + QK4_0 / 2].as_ptr();
+            let (lo, hi) =
+                unsafe { dot_q4_nibbles_pair_16_neon_ptr(x_ptr, x_ptr.add(QK4_0 / 2), q) };
+            sums[r] += (lo + hi - 8.0 * x_sum) * d;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn vec_dot_q4_1_4rows(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK4_1;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_1));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK4_1;
+        let x_ptr = unsafe { x.as_ptr().add(x_base) };
+        let x_sum = unsafe { sum_f32_32_neon_ptr(x_ptr) };
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let m = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            let q = rows[r][off + 4..off + 4 + QK4_1 / 2].as_ptr();
+            let (lo, hi) =
+                unsafe { dot_q4_nibbles_pair_16_neon_ptr(x_ptr, x_ptr.add(QK4_1 / 2), q) };
+            sums[r] += (lo + hi) * d + x_sum * m;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vec_dot_q4_0_4rows_x86(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q4_0_4rows_x86_avx2(x, w0, w1, w2, w3, n);
+        }
+    }
+    [
+        vec_dot_q4_0(x, w0, n),
+        vec_dot_q4_0(x, w1, n),
+        vec_dot_q4_0(x, w2, n),
+        vec_dot_q4_0(x, w3, n),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q4_0_4rows_x86_avx2(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK4_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_0));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK4_0;
+        let x_ptr = x.as_ptr().add(x_base);
+        let x_sum = sum_f32_32_avx2_ptr(x_ptr);
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let q = rows[r][off + 2..off + 2 + QK4_0 / 2].as_ptr();
+            let (lo, hi) = dot_q4_nibbles_pair_avx2_ptr(x_ptr, x_ptr.add(QK4_0 / 2), q, QK4_0 / 2);
+            sums[r] += (lo + hi - 8.0 * x_sum) * d;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vec_dot_q4_1_4rows_x86(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q4_1_4rows_x86_avx2(x, w0, w1, w2, w3, n);
+        }
+    }
+    [
+        vec_dot_q4_1(x, w0, n),
+        vec_dot_q4_1(x, w1, n),
+        vec_dot_q4_1(x, w2, n),
+        vec_dot_q4_1(x, w3, n),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q4_1_4rows_x86_avx2(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK4_1;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_1));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK4_1;
+        let x_ptr = x.as_ptr().add(x_base);
+        let x_sum = sum_f32_32_avx2_ptr(x_ptr);
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let m = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            let q = rows[r][off + 4..off + 4 + QK4_1 / 2].as_ptr();
+            let (lo, hi) = dot_q4_nibbles_pair_avx2_ptr(x_ptr, x_ptr.add(QK4_1 / 2), q, QK4_1 / 2);
+            sums[r] += (lo + hi) * d + x_sum * m;
+        }
+    }
+
+    sums
+}
+
 pub(crate) fn vec_dot_q5_0(x: &[f32], w: &[u8], n: usize) -> f32 {
     let nb = n / QK5_0;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_0));
@@ -1215,6 +1540,199 @@ pub(crate) fn vec_dot_q5_1(x: &[f32], w: &[u8], n: usize) -> f32 {
         sum += block_sum * d + x_sum * m;
     }
     sum
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn dot_q5_high_bits_32_ptr(x: *const f32, qh: u32) -> f32 {
+    let mut sum = 0.0f32;
+    for j in 0..16 {
+        if ((qh >> j) & 1) != 0 {
+            sum += *x.add(j);
+        }
+        if ((qh >> (j + 16)) & 1) != 0 {
+            sum += *x.add(j + 16);
+        }
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn vec_dot_q5_0_4rows(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK5_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_0));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK5_0;
+        let x_ptr = unsafe { x.as_ptr().add(x_base) };
+        let x_sum = unsafe { sum_f32_32_neon_ptr(x_ptr) };
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let qh = read_u32_le(rows[r], off + 2);
+            let q = rows[r][off + 6..off + 6 + QK5_0 / 2].as_ptr();
+            let (lo, hi) =
+                unsafe { dot_q4_nibbles_pair_16_neon_ptr(x_ptr, x_ptr.add(QK5_0 / 2), q) };
+            let high = unsafe { dot_q5_high_bits_32_ptr(x_ptr, qh) };
+            sums[r] += (lo + hi + 16.0 * high - 16.0 * x_sum) * d;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn vec_dot_q5_1_4rows(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK5_1;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_1));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK5_1;
+        let x_ptr = unsafe { x.as_ptr().add(x_base) };
+        let x_sum = unsafe { sum_f32_32_neon_ptr(x_ptr) };
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let m = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            let qh = read_u32_le(rows[r], off + 4);
+            let q = rows[r][off + 8..off + 8 + QK5_1 / 2].as_ptr();
+            let (lo, hi) =
+                unsafe { dot_q4_nibbles_pair_16_neon_ptr(x_ptr, x_ptr.add(QK5_1 / 2), q) };
+            let high = unsafe { dot_q5_high_bits_32_ptr(x_ptr, qh) };
+            sums[r] += (lo + hi + 16.0 * high) * d + x_sum * m;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vec_dot_q5_0_4rows_x86(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q5_0_4rows_x86_avx2(x, w0, w1, w2, w3, n);
+        }
+    }
+    [
+        vec_dot_q5_0(x, w0, n),
+        vec_dot_q5_0(x, w1, n),
+        vec_dot_q5_0(x, w2, n),
+        vec_dot_q5_0(x, w3, n),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q5_0_4rows_x86_avx2(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK5_0;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_0));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK5_0;
+        let x_ptr = x.as_ptr().add(x_base);
+        let x_sum = sum_f32_32_avx2_ptr(x_ptr);
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let qh = read_u32_le(rows[r], off + 2);
+            let q = rows[r][off + 6..off + 6 + QK5_0 / 2].as_ptr();
+            let (lo, hi) = dot_q4_nibbles_pair_avx2_ptr(x_ptr, x_ptr.add(QK5_0 / 2), q, QK5_0 / 2);
+            let high = dot_q5_high_bits_32_ptr(x_ptr, qh);
+            sums[r] += (lo + hi + 16.0 * high - 16.0 * x_sum) * d;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vec_dot_q5_1_4rows_x86(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q5_1_4rows_x86_avx2(x, w0, w1, w2, w3, n);
+        }
+    }
+    [
+        vec_dot_q5_1(x, w0, n),
+        vec_dot_q5_1(x, w1, n),
+        vec_dot_q5_1(x, w2, n),
+        vec_dot_q5_1(x, w3, n),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q5_1_4rows_x86_avx2(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK5_1;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_1));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK5_1;
+        let x_ptr = x.as_ptr().add(x_base);
+        let x_sum = sum_f32_32_avx2_ptr(x_ptr);
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let m = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            let qh = read_u32_le(rows[r], off + 4);
+            let q = rows[r][off + 8..off + 8 + QK5_1 / 2].as_ptr();
+            let (lo, hi) = dot_q4_nibbles_pair_avx2_ptr(x_ptr, x_ptr.add(QK5_1 / 2), q, QK5_1 / 2);
+            let high = dot_q5_high_bits_32_ptr(x_ptr, qh);
+            sums[r] += (lo + hi + 16.0 * high) * d + x_sum * m;
+        }
+    }
+
+    sums
 }
 
 pub(crate) fn vec_dot_q8_0(x: &[f32], w: &[u8], n: usize) -> f32 {
@@ -1317,40 +1835,189 @@ fn quantize_f32_block_i8_32(src: &[f32], dst: &mut [i8; QK8_0]) -> f32 {
     abs_max / 127.0
 }
 
-struct Q8ActivationPrequant {
-    scales: Vec<f32>,
-    #[cfg(target_arch = "aarch64")]
-    xq_i8: Vec<i8>,
+pub(crate) struct MatmulActivationScratch {
+    q8_scales: Vec<f32>,
     #[cfg(target_arch = "x86_64")]
-    xq_u8: Vec<u8>,
+    q8_f32_sums: Vec<f32>,
+    #[cfg(target_arch = "x86_64")]
+    q8_f32_sums_lo: Vec<f32>,
+    #[cfg(target_arch = "x86_64")]
+    q8_f32_sums_hi: Vec<f32>,
+    #[cfg(target_arch = "x86_64")]
+    q8_i8_sums_lo: Vec<i32>,
+    #[cfg(target_arch = "x86_64")]
+    q8_i8_sums_hi: Vec<i32>,
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    q8_x_i8: Vec<i8>,
+    #[cfg(target_arch = "x86_64")]
+    q8_x_u8: Vec<u8>,
 }
 
-fn prequantize_activation_q8(x: &[f32], n: usize) -> Q8ActivationPrequant {
-    let nb = n / QK8_0;
-    let mut scales = vec![0.0f32; nb];
-    #[cfg(target_arch = "aarch64")]
-    let mut xq_i8 = vec![0i8; n];
+impl MatmulActivationScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            q8_scales: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            q8_f32_sums: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            q8_f32_sums_lo: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            q8_f32_sums_hi: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            q8_i8_sums_lo: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            q8_i8_sums_hi: Vec::new(),
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            q8_x_i8: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            q8_x_u8: Vec::new(),
+        }
+    }
+}
+
+impl Default for MatmulActivationScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub(crate) struct Q8ActivationPrequant<'a> {
+    scales: &'a [f32],
     #[cfg(target_arch = "x86_64")]
-    let mut xq_u8 = vec![0u8; n];
+    f32_sums: &'a [f32],
+    #[cfg(target_arch = "x86_64")]
+    f32_sums_lo: &'a [f32],
+    #[cfg(target_arch = "x86_64")]
+    f32_sums_hi: &'a [f32],
+    #[cfg(target_arch = "x86_64")]
+    i8_sums_lo: &'a [i32],
+    #[cfg(target_arch = "x86_64")]
+    i8_sums_hi: &'a [i32],
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    xq_i8: &'a [i8],
+    #[cfg(target_arch = "x86_64")]
+    xq_u8: &'a [u8],
+}
+
+pub(crate) struct MatmulPreparedActivation<'a> {
+    x: &'a [f32],
+    n: usize,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    q8: Q8ActivationPrequant<'a>,
+}
+
+fn prequantize_activation_q8<'a>(
+    x: &[f32],
+    n: usize,
+    scratch: &'a mut MatmulActivationScratch,
+) -> Q8ActivationPrequant<'a> {
+    let nb = n / QK8_0;
+    if scratch.q8_scales.len() < nb {
+        scratch.q8_scales.resize(nb, 0.0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if scratch.q8_f32_sums.len() < nb {
+        scratch.q8_f32_sums.resize(nb, 0.0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if scratch.q8_f32_sums_lo.len() < nb {
+        scratch.q8_f32_sums_lo.resize(nb, 0.0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if scratch.q8_f32_sums_hi.len() < nb {
+        scratch.q8_f32_sums_hi.resize(nb, 0.0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if scratch.q8_i8_sums_lo.len() < nb {
+        scratch.q8_i8_sums_lo.resize(nb, 0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if scratch.q8_i8_sums_hi.len() < nb {
+        scratch.q8_i8_sums_hi.resize(nb, 0);
+    }
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if scratch.q8_x_i8.len() < n {
+        scratch.q8_x_i8.resize(n, 0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if scratch.q8_x_u8.len() < n {
+        scratch.q8_x_u8.resize(n, 0);
+    }
     let mut xq_block = [0i8; QK8_0];
     for i in 0..nb {
         let base = i * QK8_0;
-        let scale = quantize_f32_block_i8_32(&x[base..base + QK8_0], &mut xq_block);
-        scales[i] = scale;
-        #[cfg(target_arch = "aarch64")]
-        xq_i8[base..base + QK8_0].copy_from_slice(&xq_block);
+        let xb = &x[base..base + QK8_0];
+        let scale = quantize_f32_block_i8_32(xb, &mut xq_block);
+        scratch.q8_scales[i] = scale;
+        #[cfg(target_arch = "x86_64")]
+        {
+            scratch.q8_f32_sums[i] = xb.iter().copied().sum::<f32>();
+            scratch.q8_f32_sums_lo[i] = xb[..16].iter().copied().sum::<f32>();
+            scratch.q8_f32_sums_hi[i] = xb[16..].iter().copied().sum::<f32>();
+            scratch.q8_i8_sums_lo[i] = xq_block[..16].iter().map(|&v| v as i32).sum::<i32>();
+            scratch.q8_i8_sums_hi[i] = xq_block[16..].iter().map(|&v| v as i32).sum::<i32>();
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        scratch.q8_x_i8[base..base + QK8_0].copy_from_slice(&xq_block);
         #[cfg(target_arch = "x86_64")]
         for j in 0..QK8_0 {
-            xq_u8[base + j] = (xq_block[j] as i32 + 128) as u8;
+            scratch.q8_x_u8[base + j] = (xq_block[j] as i32 + 128) as u8;
         }
     }
     Q8ActivationPrequant {
-        scales,
-        #[cfg(target_arch = "aarch64")]
-        xq_i8,
+        scales: &scratch.q8_scales[..nb],
         #[cfg(target_arch = "x86_64")]
-        xq_u8,
+        f32_sums: &scratch.q8_f32_sums[..nb],
+        #[cfg(target_arch = "x86_64")]
+        f32_sums_lo: &scratch.q8_f32_sums_lo[..nb],
+        #[cfg(target_arch = "x86_64")]
+        f32_sums_hi: &scratch.q8_f32_sums_hi[..nb],
+        #[cfg(target_arch = "x86_64")]
+        i8_sums_lo: &scratch.q8_i8_sums_lo[..nb],
+        #[cfg(target_arch = "x86_64")]
+        i8_sums_hi: &scratch.q8_i8_sums_hi[..nb],
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        xq_i8: &scratch.q8_x_i8[..n],
+        #[cfg(target_arch = "x86_64")]
+        xq_u8: &scratch.q8_x_u8[..n],
     }
+}
+
+pub(crate) fn matmul_prepared_activation_supported(qw: &QuantizedTensor) -> bool {
+    let n = qw.cols;
+    #[cfg(target_arch = "x86_64")]
+    {
+        match qw.ttype.0 {
+            GGML_TYPE_Q8_0 => {
+                !use_x86_avx2_fma()
+                    && n >= QK8_0
+                    && n.is_multiple_of(QK8_0)
+                    && (use_x86_avx512_vnni_q8() || use_x86_avx_vnni())
+            }
+            GGML_TYPE_Q2_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K => {
+                n >= QK_K && n.is_multiple_of(QK_K) && x86_qk_mr4_uses_prequant(qw.ttype.0)
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = n;
+        false
+    }
+}
+
+pub(crate) fn prepare_matmul_activation<'a>(
+    x: &'a [f32],
+    qw: &QuantizedTensor,
+    scratch: &'a mut MatmulActivationScratch,
+) -> Option<MatmulPreparedActivation<'a>> {
+    let n = qw.cols;
+    if x.len() < n || !matmul_prepared_activation_supported(qw) {
+        return None;
+    }
+    let q8 = prequantize_activation_q8(&x[..n], n, scratch);
+    Some(MatmulPreparedActivation { x: &x[..n], n, q8 })
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1798,7 +2465,8 @@ fn validate_q8_mr2_once(
 
     let r0 = &mapped[data_offset..data_offset + row_size];
     let r1 = &mapped[data_offset + row_size..data_offset + 2 * row_size];
-    let preq = prequantize_activation_q8(x, n);
+    let mut scratch = MatmulActivationScratch::new();
+    let preq = prequantize_activation_q8(x, n, &mut scratch);
     let (mr2_0, mr2_1) = unsafe { vec_dot_q8_0_2rows_i8mm_prequant(&preq, r0, r1, n) };
     // Use quantized scalar reference (same algorithm as i8mm) so integer dot products match.
     let ref_0 = vec_dot_q8_0_quantized_ref(x, r0, n);
@@ -1816,13 +2484,14 @@ fn validate_q8_mr2_once(
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) fn try_matmul_q8_mr2(
+pub(crate) fn try_matmul_q8_mr2_with_scratch(
     xout: &mut [f32],
     x: &[f32],
     mapped: &[u8],
     data_offset: usize,
     row_size: usize,
     n: usize,
+    scratch: &mut MatmulActivationScratch,
 ) -> bool {
     if !use_aarch64_i8mm_q8() {
         return false;
@@ -1837,7 +2506,7 @@ pub(crate) fn try_matmul_q8_mr2(
     if !validate_q8_mr2_once(x, mapped, data_offset, row_size, n) {
         return false;
     }
-    let preq = prequantize_activation_q8(x, n);
+    let preq = prequantize_activation_q8(x, n, scratch);
     let chunk_rows = par_matmul_chunk_rows();
     if d >= par_matmul_min_rows() {
         xout.par_chunks_mut(chunk_rows)
@@ -1907,6 +2576,255 @@ pub(crate) fn vec_dot_q2_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     sum
 }
 
+/// Four-row Q2_K dot product. This mirrors [`vec_dot_q2_k`] accumulation order
+/// per row, but decodes four rows while sharing activation loads and row
+/// scheduling through the MR4 matmul path.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+pub(crate) fn vec_dot_q2_k_4rows(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = &x[i * QK_K..(i + 1) * QK_K];
+        let scales: [&[u8]; 4] = std::array::from_fn(|r| &rows[r][off..off + QK_K / 16]);
+        let mut q_off = [off + QK_K / 16; 4];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4 + 2));
+        }
+
+        let mut is = 0usize;
+        for n_outer in (0..QK_K).step_by(128) {
+            let q: [&[u8]; 4] = std::array::from_fn(|r| &rows[r][q_off[r]..q_off[r] + 32]);
+            let mut shift = 0;
+            for j in 0..4 {
+                for r in 0..4 {
+                    let sc = scales[r][is];
+                    let dl = d[r] * (sc & 0x0f) as f32;
+                    let ml = dmin[r] * (sc >> 4) as f32;
+                    for l in 0..16 {
+                        let idx = n_outer + j * 32 + l;
+                        let wv = dl * ((q[r][l] >> shift) & 0x03) as f32 - ml;
+                        sums[r] += xb[idx] * wv;
+                    }
+
+                    let sc2 = scales[r][is + 1];
+                    let dl2 = d[r] * (sc2 & 0x0f) as f32;
+                    let ml2 = dmin[r] * (sc2 >> 4) as f32;
+                    for l in 0..16 {
+                        let idx = n_outer + j * 32 + 16 + l;
+                        let wv = dl2 * ((q[r][l + 16] >> shift) & 0x03) as f32 - ml2;
+                        sums[r] += xb[idx] * wv;
+                    }
+                }
+                is += 2;
+                shift += 2;
+            }
+            for q_row_off in &mut q_off {
+                *q_row_off += 32;
+            }
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_q2_k_16_neon(x: *const f32, q: *const u8, shift: usize) -> f32 {
+    let low2 = vdupq_n_u8(0x03);
+    let qv = vld1q_u8(q);
+    let q2 = match shift {
+        0 => vandq_u8(qv, low2),
+        2 => vandq_u8(vshrq_n_u8(qv, 2), low2),
+        4 => vandq_u8(vshrq_n_u8(qv, 4), low2),
+        6 => vandq_u8(vshrq_n_u8(qv, 6), low2),
+        _ => unreachable!(),
+    };
+
+    let q16lo = vmovl_u8(vget_low_u8(q2));
+    let q16hi = vmovl_u8(vget_high_u8(q2));
+    let q0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q16lo)));
+    let q1 = vcvtq_f32_u32(vmovl_high_u16(q16lo));
+    let q2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(q16hi)));
+    let q3 = vcvtq_f32_u32(vmovl_high_u16(q16hi));
+
+    let mut acc = vfmaq_f32(vdupq_n_f32(0.0), vld1q_f32(x), q0);
+    acc = vfmaq_f32(acc, vld1q_f32(x.add(4)), q1);
+    acc = vfmaq_f32(acc, vld1q_f32(x.add(8)), q2);
+    acc = vfmaq_f32(acc, vld1q_f32(x.add(12)), q3);
+    vaddvq_f32(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sum_f32_16_neon_ptr(x: *const f32) -> f32 {
+    let mut acc = vdupq_n_f32(0.0);
+    acc = vaddq_f32(acc, vld1q_f32(x));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(4)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(8)));
+    acc = vaddq_f32(acc, vld1q_f32(x.add(12)));
+    vaddvq_f32(acc)
+}
+
+/// Q2_K 4-row dot for aarch64.
+///
+/// Decodes each 16-value two-bit group with NEON and applies the Q2_K
+/// scale/min metadata exactly as the scalar [`vec_dot_q2_k`] path does. The
+/// MR4 runtime gate validates this against four scalar rows before use.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn vec_dot_q2_k_4rows_aarch64(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = i * QK_K;
+        let scales: [&[u8]; 4] = std::array::from_fn(|r| &rows[r][off..off + QK_K / 16]);
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4 + 2));
+        }
+
+        let mut is = 0usize;
+        for outer in 0..2usize {
+            let q_base = off + QK_K / 16 + outer * 32;
+            for j in 0..4usize {
+                let shift = j * 2;
+                for g in 0..2usize {
+                    let x_base = xb + outer * 128 + j * 32 + g * 16;
+                    let x_ptr = unsafe { x.as_ptr().add(x_base) };
+                    let x_sum = unsafe { sum_f32_16_neon_ptr(x_ptr) };
+                    let q_group = q_base + g * 16;
+                    for r in 0..4usize {
+                        let dot = unsafe {
+                            dot_q2_k_16_neon(x_ptr, rows[r].as_ptr().add(q_group), shift)
+                        };
+                        let sc = scales[r][is + g];
+                        let dl = d[r] * (sc & 0x0f) as f32;
+                        let ml = dmin[r] * (sc >> 4) as f32;
+                        sums[r] += dl * dot - ml * x_sum;
+                    }
+                }
+                is += 2;
+            }
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vec_dot_q2_k_4rows_x86(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_q2_k_4rows_x86_avx2(x, w0, w1, w2, w3, n);
+        }
+    }
+    vec_dot_q2_k_4rows(x, w0, w1, w2, w3, n)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn vec_dot_q2_k_4rows_x86_avx2(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+    let mask = _mm_set1_epi8(0x03);
+    let mut acc = [_mm256_setzero_ps(); 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let x_base_block = i * QK_K;
+        let scales: [&[u8]; 4] = std::array::from_fn(|r| &rows[r][off..off + QK_K / 16]);
+        let mut q_off = [off + QK_K / 16; 4];
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4 + 2));
+        }
+
+        let mut is = 0usize;
+        for n_outer in (0..QK_K).step_by(128) {
+            let q: [&[u8]; 4] = std::array::from_fn(|r| &rows[r][q_off[r]..q_off[r] + 32]);
+            let mut shift = 0i32;
+            for j in 0..4usize {
+                let shift_count = _mm_cvtsi32_si128(shift);
+                for g in 0..2usize {
+                    let x_base = x_base_block + n_outer + j * 32 + g * 16;
+                    let xv0 = _mm256_loadu_ps(x.as_ptr().add(x_base));
+                    let xv1 = _mm256_loadu_ps(x.as_ptr().add(x_base + 8));
+                    for r in 0..4usize {
+                        let sc = scales[r][is + g];
+                        let dl = _mm256_set1_ps(d[r] * (sc & 0x0f) as f32);
+                        let ml = _mm256_set1_ps(dmin[r] * (sc >> 4) as f32);
+                        let qv = _mm_loadu_si128(q[r].as_ptr().add(g * 16) as *const __m128i);
+                        let q2 = _mm_and_si128(_mm_srl_epi16(qv, shift_count), mask);
+                        let q_lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(q2));
+                        let q_hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(q2, 8)));
+                        let w_lo = _mm256_sub_ps(_mm256_mul_ps(q_lo, dl), ml);
+                        let w_hi = _mm256_sub_ps(_mm256_mul_ps(q_hi, dl), ml);
+                        acc[r] = _mm256_fmadd_ps(xv0, w_lo, acc[r]);
+                        acc[r] = _mm256_fmadd_ps(xv1, w_hi, acc[r]);
+                    }
+                }
+                is += 2;
+                shift += 2;
+            }
+            for q_row_off in &mut q_off {
+                *q_row_off += 32;
+            }
+        }
+    }
+
+    let mut sums = [0.0f32; 4];
+    for r in 0..4 {
+        sums[r] = hsum256_ps(acc[r]);
+    }
+    sums
+}
+
 pub(crate) fn vec_dot_q3_k(x: &[f32], w: &[u8], n: usize) -> f32 {
     let nb = n / QK_K;
     let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
@@ -1957,10 +2875,11 @@ pub(crate) fn vec_dot_q3_k(x: &[f32], w: &[u8], n: usize) -> f32 {
 /// rows sharing the activation `x`. Numerically identical to calling
 /// [`vec_dot_q3_k`] on each row (same accumulation order), but the shared
 /// activation element `xv` is loaded once and applied to all four rows with four
-/// register accumulators — the loop LLVM autovectorizes into AVX/NEON FMAs. This
-/// is the portable MR4 microkernel for Q3_K; the runtime self-check
+/// register accumulators. This is the portable MR4 microkernel for Q3_K; the
+/// runtime self-check
 /// (`validate_qk_mr4_once*`) verifies it against the scalar path on real tensors
-/// before enabling it.
+/// before enabling it where architecture-specific wrappers use this fallback.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 pub(crate) fn vec_dot_q3_k_4rows(
     x: &[f32],
     w0: &[u8],
@@ -2025,6 +2944,114 @@ pub(crate) fn vec_dot_q3_k_4rows(
         }
         for r in 0..4 {
             sums[r] += block_sum[r];
+        }
+    }
+    sums
+}
+
+/// NEON Q3_K 16-element dot helper.
+///
+/// Decodes one 16-byte Q3_K low-bit lane with the matching hmask lane:
+/// `(q >> shift) & 3` minus 4 when the current hmask bit is clear, then
+/// accumulates `x[0..16] · decoded`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn dot_q3_k_16_neon(
+    x: *const f32,
+    q: *const u8,
+    hmask: *const u8,
+    shift: usize,
+    m: u8,
+) -> f32 {
+    let low2 = vdupq_n_u8(0x03);
+    let qv = vld1q_u8(q);
+    let q2 = match shift {
+        0 => vandq_u8(qv, low2),
+        2 => vandq_u8(vshrq_n_u8(qv, 2), low2),
+        4 => vandq_u8(vshrq_n_u8(qv, 4), low2),
+        6 => vandq_u8(vshrq_n_u8(qv, 6), low2),
+        _ => unreachable!(),
+    };
+
+    let hbit = vandq_u8(vld1q_u8(hmask), vdupq_n_u8(m));
+    let not_set = vceqq_u8(hbit, vdupq_n_u8(0));
+    let sub4 = vandq_u8(not_set, vdupq_n_u8(4));
+    let wv = vsubq_s8(vreinterpretq_s8_u8(q2), vreinterpretq_s8_u8(sub4));
+
+    let s16lo = vmovl_s8(vget_low_s8(wv));
+    let s16hi = vmovl_s8(vget_high_s8(wv));
+    let w0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16lo)));
+    let w1 = vcvtq_f32_s32(vmovl_high_s16(s16lo));
+    let w2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(s16hi)));
+    let w3 = vcvtq_f32_s32(vmovl_high_s16(s16hi));
+
+    let mut acc = vfmaq_f32(vdupq_n_f32(0.0), vld1q_f32(x), w0);
+    acc = vfmaq_f32(acc, vld1q_f32(x.add(4)), w1);
+    acc = vfmaq_f32(acc, vld1q_f32(x.add(8)), w2);
+    acc = vfmaq_f32(acc, vld1q_f32(x.add(12)), w3);
+    vaddvq_f32(acc)
+}
+
+/// Q3_K 4-row dot for aarch64.
+///
+/// This is the NEON counterpart to the x86 AVX2 kernel: it follows the scalar
+/// Q3_K block walk exactly, but decodes each 16-value group with NEON and shares
+/// the activation stream across four contiguous rows. The runtime MR4 gate
+/// validates it against four scalar [`vec_dot_q3_k`] calls before use.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) fn vec_dot_q3_k_4rows_aarch64(
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
+    let sc_off = QK_K / 8 + QK_K / 4;
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let xb = i * QK_K;
+
+        let mut scales = [[0i8; 16]; 4];
+        let mut d_all = [0.0f32; 4];
+        for r in 0..4 {
+            scales[r] = q3_scales(&rows[r][off + sc_off..off + sc_off + 12]);
+            d_all[r] = fp16_to_fp32(read_u16_le(rows[r], off + sc_off + 12));
+        }
+
+        let mut is = 0usize;
+        let mut m = 1u8;
+        for outer in 0..2usize {
+            let q_base = off + QK_K / 8 + outer * 32;
+            for j in 0..4usize {
+                let shift = j * 2;
+                for g in 0..2usize {
+                    let x_base = xb + outer * 128 + j * 32 + g * 16;
+                    let q_group = q_base + g * 16;
+                    let h_group = off + g * 16;
+                    for r in 0..4usize {
+                        let dot = unsafe {
+                            dot_q3_k_16_neon(
+                                x.as_ptr().add(x_base),
+                                rows[r].as_ptr().add(q_group),
+                                rows[r].as_ptr().add(h_group),
+                                shift,
+                                m,
+                            )
+                        };
+                        let dl = d_all[r] * (scales[r][is] as i32 - 32) as f32;
+                        sums[r] += dl * dot;
+                    }
+                    is += 1;
+                }
+                m <<= 1;
+            }
         }
     }
     sums
@@ -2844,7 +3871,8 @@ pub(crate) fn matmul_qk_mr4_chunk(
         let r2 = &mapped[row2_off..row2_off + row_size];
         let r3 = &mapped[row3_off..row3_off + row_size];
         let sums = match ttype {
-            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_aarch64(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_aarch64(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
@@ -2867,6 +3895,7 @@ pub(crate) fn matmul_qk_mr4_chunk(
         let row_off = data_offset + (base_row + i) * row_size;
         let row = &mapped[row_off..row_off + row_size];
         out[i] = match ttype {
+            GGML_TYPE_Q2_K => vec_dot_q2_k(x, row, n),
             GGML_TYPE_Q3_K => vec_dot_q3_k(x, row, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
@@ -2878,9 +3907,235 @@ pub(crate) fn matmul_qk_mr4_chunk(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn matmul_legacy_q4_q5_iq4_mr4_chunk_aarch64(
+    out: &mut [f32],
+    base_row: usize,
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) {
+    let total_rows = out.len();
+    let mut i = 0usize;
+    while i + 4 <= out.len() {
+        aarch64_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
+        let row0_off = data_offset + (base_row + i) * row_size;
+        let row1_off = row0_off + row_size;
+        let row2_off = row1_off + row_size;
+        let row3_off = row2_off + row_size;
+        let r0 = &mapped[row0_off..row0_off + row_size];
+        let r1 = &mapped[row1_off..row1_off + row_size];
+        let r2 = &mapped[row2_off..row2_off + row_size];
+        let r3 = &mapped[row3_off..row3_off + row_size];
+        let sums = match ttype {
+            GGML_TYPE_Q4_0 => vec_dot_q4_0_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_1 => vec_dot_q4_1_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_0 => vec_dot_q5_0_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_1 => vec_dot_q5_1_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_IQ4_NL => vec_dot_iq4_nl_4rows(x, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        };
+        out[i] = sums[0];
+        out[i + 1] = sums[1];
+        out[i + 2] = sums[2];
+        out[i + 3] = sums[3];
+        i += 4;
+    }
+    while i < out.len() {
+        aarch64_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
+        let row_off = data_offset + (base_row + i) * row_size;
+        let row = &mapped[row_off..row_off + row_size];
+        out[i] = match ttype {
+            GGML_TYPE_Q4_0 => vec_dot_q4_0(x, row, n),
+            GGML_TYPE_Q4_1 => vec_dot_q4_1(x, row, n),
+            GGML_TYPE_Q5_0 => vec_dot_q5_0(x, row, n),
+            GGML_TYPE_Q5_1 => vec_dot_q5_1(x, row, n),
+            GGML_TYPE_IQ4_NL => vec_dot_iq4_nl(x, row, n),
+            _ => unreachable!(),
+        };
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn legacy_q4_q5_iq4_mr4_status_aarch64(ttype: i32) -> &'static AtomicU8 {
+    match ttype {
+        GGML_TYPE_Q4_0 => &AARCH64_Q4_0_MR4_STATUS,
+        GGML_TYPE_Q4_1 => &AARCH64_Q4_1_MR4_STATUS,
+        GGML_TYPE_Q5_0 => &AARCH64_Q5_0_MR4_STATUS,
+        GGML_TYPE_Q5_1 => &AARCH64_Q5_1_MR4_STATUS,
+        GGML_TYPE_IQ4_NL => &AARCH64_IQ4_NL_MR4_STATUS,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn validate_legacy_q4_q5_iq4_mr4_once_aarch64(
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) -> bool {
+    let status = legacy_q4_q5_iq4_mr4_status_aarch64(ttype);
+    match status.load(AtomicOrdering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+
+    let r0 = &mapped[data_offset..data_offset + row_size];
+    let r1 = &mapped[data_offset + row_size..data_offset + 2 * row_size];
+    let r2 = &mapped[data_offset + 2 * row_size..data_offset + 3 * row_size];
+    let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
+
+    let mr4 = match ttype {
+        GGML_TYPE_Q4_0 => vec_dot_q4_0_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q4_1 => vec_dot_q4_1_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q5_0 => vec_dot_q5_0_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q5_1 => vec_dot_q5_1_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_IQ4_NL => vec_dot_iq4_nl_4rows(x, r0, r1, r2, r3, n),
+        _ => unreachable!(),
+    };
+    let scalar = match ttype {
+        GGML_TYPE_Q4_0 => [
+            vec_dot_q4_0(x, r0, n),
+            vec_dot_q4_0(x, r1, n),
+            vec_dot_q4_0(x, r2, n),
+            vec_dot_q4_0(x, r3, n),
+        ],
+        GGML_TYPE_Q4_1 => [
+            vec_dot_q4_1(x, r0, n),
+            vec_dot_q4_1(x, r1, n),
+            vec_dot_q4_1(x, r2, n),
+            vec_dot_q4_1(x, r3, n),
+        ],
+        GGML_TYPE_Q5_0 => [
+            vec_dot_q5_0(x, r0, n),
+            vec_dot_q5_0(x, r1, n),
+            vec_dot_q5_0(x, r2, n),
+            vec_dot_q5_0(x, r3, n),
+        ],
+        GGML_TYPE_Q5_1 => [
+            vec_dot_q5_1(x, r0, n),
+            vec_dot_q5_1(x, r1, n),
+            vec_dot_q5_1(x, r2, n),
+            vec_dot_q5_1(x, r3, n),
+        ],
+        GGML_TYPE_IQ4_NL => [
+            vec_dot_iq4_nl(x, r0, n),
+            vec_dot_iq4_nl(x, r1, n),
+            vec_dot_iq4_nl(x, r2, n),
+            vec_dot_iq4_nl(x, r3, n),
+        ],
+        _ => unreachable!(),
+    };
+
+    let mut ok = true;
+    for i in 0..4 {
+        let a = mr4[i];
+        let b = scalar[i];
+        let tol = 1e-4f32 * b.abs().max(1.0);
+        if (a - b).abs() > tol {
+            ok = false;
+            break;
+        }
+    }
+
+    status.store(if ok { 1 } else { 2 }, AtomicOrdering::Relaxed);
+    if !ok && kernel_validation_warnings_enabled() {
+        eprintln!(
+            "Warning: disabling aarch64 legacy Q4/Q5/IQ4_NL MR4 kernel for type {} due to validation mismatch",
+            ttype
+        );
+    }
+    ok
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+    xout: &mut [f32],
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) -> bool {
+    if !use_aarch64_qk_mr4() {
+        return false;
+    }
+    if !matches!(
+        ttype,
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_IQ4_NL
+    ) {
+        return false;
+    }
+    if n < QK4_0 || !n.is_multiple_of(QK4_0) || xout.len() < 4 {
+        return false;
+    }
+    if !validate_legacy_q4_q5_iq4_mr4_once_aarch64(x, mapped, data_offset, row_size, n, ttype) {
+        return false;
+    }
+
+    let chunk_rows = par_matmul_chunk_rows();
+    if xout.len() >= par_matmul_min_rows() {
+        xout.par_chunks_mut(chunk_rows)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_row = chunk_idx * chunk_rows;
+                matmul_legacy_q4_q5_iq4_mr4_chunk_aarch64(
+                    chunk,
+                    base_row,
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    ttype,
+                );
+            });
+    } else {
+        matmul_legacy_q4_q5_iq4_mr4_chunk_aarch64(
+            xout,
+            0,
+            x,
+            mapped,
+            data_offset,
+            row_size,
+            n,
+            ttype,
+        );
+    }
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn mr4_status(ttype: i32) -> &'static AtomicU8 {
     match ttype {
+        GGML_TYPE_Q2_K => &AARCH64_Q2K_MR4_STATUS,
         GGML_TYPE_Q3_K => &AARCH64_Q3K_MR4_STATUS,
         GGML_TYPE_Q4_K => &AARCH64_Q4K_MR4_STATUS,
         GGML_TYPE_Q5_K => &AARCH64_Q5K_MR4_STATUS,
@@ -2912,13 +4167,20 @@ pub(crate) fn validate_qk_mr4_once(
     let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
 
     let mr4 = match ttype {
-        GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_aarch64(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_aarch64(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
         _ => unreachable!(),
     };
     let scalar = match ttype {
+        GGML_TYPE_Q2_K => [
+            vec_dot_q2_k(x, r0, n),
+            vec_dot_q2_k(x, r1, n),
+            vec_dot_q2_k(x, r2, n),
+            vec_dot_q2_k(x, r3, n),
+        ],
         GGML_TYPE_Q3_K => [
             vec_dot_q3_k(x, r0, n),
             vec_dot_q3_k(x, r1, n),
@@ -2983,7 +4245,7 @@ pub(crate) fn try_matmul_qk_mr4(
     }
     if !matches!(
         ttype,
-        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+        GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
     ) {
         return false;
     }
@@ -4204,6 +5466,441 @@ unsafe fn vec_dot_q5_k_4rows_x86_avx512vnni(
 }
 
 #[cfg(target_arch = "x86_64")]
+type X86DotU8I8x32 = unsafe fn(*const u8, *const i8) -> i32;
+
+#[cfg(target_arch = "x86_64")]
+type X86DotU8I8x16 = unsafe fn(*const u8, *const i8) -> i32;
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn q8_prequant_block(preq: &Q8ActivationPrequant<'_>, block: usize) -> (*const i8, f32, f32) {
+    let ptr = unsafe { preq.xq_i8.as_ptr().add(block * QK8_0) };
+    (ptr, preq.scales[block], preq.f32_sums[block])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn vec_dot_q2_k_4rows_x86_vnni_prequant_impl(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+    dot16: X86DotU8I8x16,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let block_base = i * (QK_K / QK8_0);
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut q_off = [0usize; 4];
+
+        for r in 0..4 {
+            scales[r] = &rows[r][off..off + QK_K / 16];
+            q_off[r] = off + QK_K / 16;
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 16 + QK_K / 4 + 2));
+        }
+
+        let mut is = 0usize;
+        for n_outer in (0..QK_K).step_by(128) {
+            for j in 0..4usize {
+                let shift = j * 2;
+                for g in 0..2usize {
+                    let elem_base = n_outer + j * 32 + g * 16;
+                    let x_block = block_base + elem_base / QK8_0;
+                    let x_half_hi = (elem_base % QK8_0) == 16;
+                    let xq = preq
+                        .xq_i8
+                        .as_ptr()
+                        .add(x_block * QK8_0 + if x_half_hi { 16 } else { 0 });
+                    let x_scale = preq.scales[x_block];
+                    let x_f32_sum = if x_half_hi {
+                        preq.f32_sums_hi[x_block]
+                    } else {
+                        preq.f32_sums_lo[x_block]
+                    };
+
+                    for r in 0..4 {
+                        let sc = scales[r][is + g];
+                        let dl = d[r] * (sc & 0x0f) as f32;
+                        let ml = dmin[r] * (sc >> 4) as f32;
+                        let q = &rows[r][q_off[r] + g * 16..q_off[r] + g * 16 + 16];
+                        let mut q2 = [0u8; 16];
+                        for l in 0..16 {
+                            q2[l] = (q[l] >> shift) & 0x03;
+                        }
+                        let dot = if x_scale == 0.0 {
+                            0.0
+                        } else {
+                            dot16(q2.as_ptr(), xq) as f32 * x_scale
+                        };
+                        sums[r] += dl * dot - ml * x_f32_sum;
+                    }
+                }
+                is += 2;
+            }
+            for q_row_off in &mut q_off {
+                *q_row_off += 32;
+            }
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn vec_dot_q4_k_4rows_x86_vnni_prequant_impl(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+    dot32: X86DotU8I8x32,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let block_base = i * (QK_K / QK8_0);
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut q_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            q_off[r] = off + 16;
+        }
+
+        let mut is = 0usize;
+        for j in (0..QK_K).step_by(64) {
+            let (x0_q, x0_scale, x0_sum) = q8_prequant_block(preq, block_base + j / QK8_0);
+            let (x1_q, x1_scale, x1_sum) = q8_prequant_block(preq, block_base + j / QK8_0 + 1);
+
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                let a_lo = d[r] * sc1 as f32;
+                let b_lo = dmin[r] * m1 as f32;
+                let a_hi = d[r] * sc2 as f32;
+                let b_hi = dmin[r] * m2 as f32;
+
+                let q = &rows[r][q_off[r]..q_off[r] + QK8_0];
+                let mut q_lo = [0u8; QK8_0];
+                let mut q_hi = [0u8; QK8_0];
+                unpack_q4_nibbles_32(q, &mut q_lo, &mut q_hi);
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    dot32(q_lo.as_ptr(), x0_q) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    dot32(q_hi.as_ptr(), x1_q) as f32 * x1_scale
+                };
+                sums[r] += a_lo * dot_lo - b_lo * x0_sum + a_hi * dot_hi - b_hi * x1_sum;
+                q_off[r] += 32;
+            }
+            is += 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn vec_dot_q5_k_4rows_x86_vnni_prequant_impl(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+    dot32: X86DotU8I8x32,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let block_base = i * (QK_K / QK8_0);
+        let mut d = [0.0f32; 4];
+        let mut dmin = [0.0f32; 4];
+        let mut scales = [&[][..]; 4];
+        let mut qh = [&[][..]; 4];
+        let mut ql_off = [0usize; 4];
+
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off));
+            dmin[r] = fp16_to_fp32(read_u16_le(rows[r], off + 2));
+            scales[r] = &rows[r][off + 4..off + 16];
+            qh[r] = &rows[r][off + 16..off + 16 + QK_K / 8];
+            ql_off[r] = off + 16 + QK_K / 8;
+        }
+
+        let mut is = 0usize;
+        let mut u1: u8 = 1;
+        let mut u2: u8 = 2;
+        for j in (0..QK_K).step_by(64) {
+            let (x0_q, x0_scale, x0_sum) = q8_prequant_block(preq, block_base + j / QK8_0);
+            let (x1_q, x1_scale, x1_sum) = q8_prequant_block(preq, block_base + j / QK8_0 + 1);
+
+            for r in 0..4 {
+                let (sc1, m1) = get_scale_min_k4(is, scales[r]);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales[r]);
+                let a_lo = d[r] * sc1 as f32;
+                let b_lo = dmin[r] * m1 as f32;
+                let a_hi = d[r] * sc2 as f32;
+                let b_hi = dmin[r] * m2 as f32;
+
+                let ql = &rows[r][ql_off[r]..ql_off[r] + QK8_0];
+                let mut lo_vals = [0u8; QK8_0];
+                let mut hi_vals = [0u8; QK8_0];
+                for l in 0..QK8_0 {
+                    let qv = ql[l];
+                    lo_vals[l] = (qv & 0x0f) + if (qh[r][l] & u1) != 0 { 16 } else { 0 };
+                    hi_vals[l] = (qv >> 4) + if (qh[r][l] & u2) != 0 { 16 } else { 0 };
+                }
+                let dot_lo = if x0_scale == 0.0 {
+                    0.0
+                } else {
+                    dot32(lo_vals.as_ptr(), x0_q) as f32 * x0_scale
+                };
+                let dot_hi = if x1_scale == 0.0 {
+                    0.0
+                } else {
+                    dot32(hi_vals.as_ptr(), x1_q) as f32 * x1_scale
+                };
+                sums[r] += a_lo * dot_lo - b_lo * x0_sum + a_hi * dot_hi - b_hi * x1_sum;
+                ql_off[r] += 32;
+            }
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn vec_dot_q6_k_4rows_x86_vnni_prequant_impl(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+    dot16: X86DotU8I8x16,
+) -> [f32; 4] {
+    let rows = [r0, r1, r2, r3];
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let off = i * block_sz;
+        let block_base = i * (QK_K / QK8_0);
+        let mut d = [0.0f32; 4];
+        let mut ql_off = [0usize; 4];
+        let mut qh_off = [0usize; 4];
+        let mut sc_off = [0usize; 4];
+        for r in 0..4 {
+            d[r] = fp16_to_fp32(read_u16_le(rows[r], off + QK_K / 2 + QK_K / 4 + QK_K / 16));
+            ql_off[r] = off;
+            qh_off[r] = off + QK_K / 2;
+            sc_off[r] = off + QK_K / 2 + QK_K / 4;
+        }
+
+        for n_outer in (0..QK_K).step_by(128) {
+            let x_blocks = [
+                block_base + n_outer / QK8_0,
+                block_base + n_outer / QK8_0 + 1,
+                block_base + n_outer / QK8_0 + 2,
+                block_base + n_outer / QK8_0 + 3,
+            ];
+
+            for r in 0..4 {
+                let ql = &rows[r][ql_off[r]..ql_off[r] + 64];
+                let qh = &rows[r][qh_off[r]..qh_off[r] + 32];
+                let sc = &rows[r][sc_off[r]..sc_off[r] + 8];
+                let mut q_u = [[0u8; QK8_0]; 4];
+
+                for l in 0..QK8_0 {
+                    let ql0 = ql[l];
+                    let ql1 = ql[l + 32];
+                    let qh0 = qh[l];
+                    let v1 = (ql0 & 0x0f) | (((qh0 >> 0) & 0x03) << 4);
+                    let v2 = (ql1 & 0x0f) | (((qh0 >> 2) & 0x03) << 4);
+                    let v3 = (ql0 >> 4) | (((qh0 >> 4) & 0x03) << 4);
+                    let v4 = (ql1 >> 4) | (((qh0 >> 6) & 0x03) << 4);
+                    q_u[0][l] = v1 + 96;
+                    q_u[1][l] = v2 + 96;
+                    q_u[2][l] = v3 + 96;
+                    q_u[3][l] = v4 + 96;
+                }
+
+                let scales = [
+                    d[r] * sc[0] as i8 as f32,
+                    d[r] * sc[1] as i8 as f32,
+                    d[r] * sc[2] as i8 as f32,
+                    d[r] * sc[3] as i8 as f32,
+                    d[r] * sc[4] as i8 as f32,
+                    d[r] * sc[5] as i8 as f32,
+                    d[r] * sc[6] as i8 as f32,
+                    d[r] * sc[7] as i8 as f32,
+                ];
+
+                let mut acc = 0.0f32;
+                for b in 0..4 {
+                    let x_block = x_blocks[b];
+                    let x_scale = preq.scales[x_block];
+                    if x_scale == 0.0 {
+                        continue;
+                    }
+                    let xq = preq.xq_i8.as_ptr().add(x_block * QK8_0);
+                    let dot_lo = dot16(q_u[b].as_ptr(), xq) - 128 * preq.i8_sums_lo[x_block];
+                    let dot_hi =
+                        dot16(q_u[b].as_ptr().add(16), xq.add(16)) - 128 * preq.i8_sums_hi[x_block];
+                    acc += x_scale
+                        * (scales[2 * b] * dot_lo as f32 + scales[2 * b + 1] * dot_hi as f32);
+                }
+                sums[r] += acc;
+            }
+            for r in 0..4 {
+                ql_off[r] += 64;
+                qh_off[r] += 32;
+                sc_off[r] += 8;
+            }
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni,fma")]
+unsafe fn vec_dot_q2_k_4rows_x86_avxvnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q2_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_16_x86_avxvnni)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512vnni,avx512vl,fma")]
+unsafe fn vec_dot_q2_k_4rows_x86_avx512vnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q2_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_16_x86_avx512vnni)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni,fma")]
+unsafe fn vec_dot_q4_k_4rows_x86_avxvnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q4_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_32_x86_avxvnni)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512vnni,avx512vl,fma")]
+unsafe fn vec_dot_q4_k_4rows_x86_avx512vnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q4_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_32_x86_avx512vnni)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni,fma")]
+unsafe fn vec_dot_q5_k_4rows_x86_avxvnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q5_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_32_x86_avxvnni)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512vnni,avx512vl,fma")]
+unsafe fn vec_dot_q5_k_4rows_x86_avx512vnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q5_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_32_x86_avx512vnni)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni,fma")]
+unsafe fn vec_dot_q6_k_4rows_x86_avxvnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q6_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_16_x86_avxvnni)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512vnni,avx512vl,fma")]
+unsafe fn vec_dot_q6_k_4rows_x86_avx512vnni_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    vec_dot_q6_k_4rows_x86_vnni_prequant_impl(preq, r0, r1, r2, r3, n, dot_u8_i8_16_x86_avx512vnni)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn matmul_qk_mr4_chunk_x86(
@@ -4235,6 +5932,7 @@ pub(crate) fn matmul_qk_mr4_chunk_x86(
         let r2 = &mapped[row2_off..row2_off + row_size];
         let r3 = &mapped[row3_off..row3_off + row_size];
         let sums = match ttype {
+            GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
@@ -4258,6 +5956,7 @@ pub(crate) fn matmul_qk_mr4_chunk_x86(
         let row_off = data_offset + (base_row + i) * row_size;
         let row = &mapped[row_off..row_off + row_size];
         out[i] = match ttype {
+            GGML_TYPE_Q2_K => vec_dot_q2_k(x, row, n),
             GGML_TYPE_Q3_K => vec_dot_q3_k(x, row, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
@@ -4270,8 +5969,385 @@ pub(crate) fn matmul_qk_mr4_chunk_x86(
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+fn x86_qk_mr4_uses_prequant(ttype: i32) -> bool {
+    if !matches!(
+        ttype,
+        GGML_TYPE_Q2_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+    ) {
+        return false;
+    }
+    if is_x86_amd() && use_x86_avx2_fma() {
+        return false;
+    }
+    use_x86_avx_vnni() || use_x86_avx512_vnni_q8()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn vec_dot_qk_4rows_x86_prequant(
+    preq: &Q8ActivationPrequant<'_>,
+    x: &[f32],
+    r0: &[u8],
+    r1: &[u8],
+    r2: &[u8],
+    r3: &[u8],
+    n: usize,
+    ttype: i32,
+) -> [f32; 4] {
+    if is_x86_amd() {
+        if use_x86_avx2_fma() {
+            return match ttype {
+                GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
+                GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
+                GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
+                GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avx2(x, r0, r1, r2, r3, n),
+                _ => unreachable!(),
+            };
+        }
+        if use_x86_avx_vnni() {
+            return match ttype {
+                GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                _ => unreachable!(),
+            };
+        }
+        if use_x86_avx512_vnni_q8() {
+            return match ttype {
+                GGML_TYPE_Q2_K => {
+                    vec_dot_q2_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                GGML_TYPE_Q4_K => {
+                    vec_dot_q4_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                GGML_TYPE_Q5_K => {
+                    vec_dot_q5_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                GGML_TYPE_Q6_K => {
+                    vec_dot_q6_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                _ => unreachable!(),
+            };
+        }
+    } else {
+        if use_x86_avx512_vnni_q8() {
+            return match ttype {
+                GGML_TYPE_Q2_K => {
+                    vec_dot_q2_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                GGML_TYPE_Q4_K => {
+                    vec_dot_q4_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                GGML_TYPE_Q5_K => {
+                    vec_dot_q5_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                GGML_TYPE_Q6_K => {
+                    vec_dot_q6_k_4rows_x86_avx512vnni_prequant(preq, r0, r1, r2, r3, n)
+                }
+                _ => unreachable!(),
+            };
+        }
+        if use_x86_avx_vnni() {
+            return match ttype {
+                GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86_avxvnni_prequant(preq, r0, r1, r2, r3, n),
+                _ => unreachable!(),
+            };
+        }
+    }
+
+    match ttype {
+        GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q6_K => vec_dot_q6_k_4rows_x86(x, r0, r1, r2, r3, n),
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn matmul_qk_mr4_chunk_x86_prequant(
+    out: &mut [f32],
+    base_row: usize,
+    preq: &Q8ActivationPrequant<'_>,
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) {
+    let total_rows = out.len();
+    let mut i = 0usize;
+    while i + 4 <= out.len() {
+        x86_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
+        let row0_off = data_offset + (base_row + i) * row_size;
+        let row1_off = row0_off + row_size;
+        let row2_off = row1_off + row_size;
+        let row3_off = row2_off + row_size;
+        let r0 = &mapped[row0_off..row0_off + row_size];
+        let r1 = &mapped[row1_off..row1_off + row_size];
+        let r2 = &mapped[row2_off..row2_off + row_size];
+        let r3 = &mapped[row3_off..row3_off + row_size];
+        let sums = unsafe { vec_dot_qk_4rows_x86_prequant(preq, x, r0, r1, r2, r3, n, ttype) };
+        out[i] = sums[0];
+        out[i + 1] = sums[1];
+        out[i + 2] = sums[2];
+        out[i + 3] = sums[3];
+        i += 4;
+    }
+    while i < out.len() {
+        x86_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
+        let row_off = data_offset + (base_row + i) * row_size;
+        let row = &mapped[row_off..row_off + row_size];
+        out[i] = match ttype {
+            GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
+            GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
+            GGML_TYPE_Q6_K => vec_dot_q6_k(x, row, n),
+            _ => unreachable!(),
+        };
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn matmul_legacy_mr4_chunk_x86(
+    out: &mut [f32],
+    base_row: usize,
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) {
+    let total_rows = out.len();
+    let mut i = 0usize;
+    while i + 4 <= out.len() {
+        x86_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
+        let row0_off = data_offset + (base_row + i) * row_size;
+        let row1_off = row0_off + row_size;
+        let row2_off = row1_off + row_size;
+        let row3_off = row2_off + row_size;
+        let r0 = &mapped[row0_off..row0_off + row_size];
+        let r1 = &mapped[row1_off..row1_off + row_size];
+        let r2 = &mapped[row2_off..row2_off + row_size];
+        let r3 = &mapped[row3_off..row3_off + row_size];
+        let sums = match ttype {
+            GGML_TYPE_Q4_0 => vec_dot_q4_0_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_1 => vec_dot_q4_1_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_0 => vec_dot_q5_0_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_1 => vec_dot_q5_1_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_IQ4_NL => vec_dot_iq4_nl_4rows_x86(x, r0, r1, r2, r3, n),
+            _ => unreachable!(),
+        };
+        out[i] = sums[0];
+        out[i + 1] = sums[1];
+        out[i + 2] = sums[2];
+        out[i + 3] = sums[3];
+        i += 4;
+    }
+    while i < out.len() {
+        x86_prefetch_row(
+            mapped,
+            data_offset,
+            row_size,
+            base_row + i,
+            base_row.saturating_add(total_rows),
+        );
+        let row_off = data_offset + (base_row + i) * row_size;
+        let row = &mapped[row_off..row_off + row_size];
+        out[i] = match ttype {
+            GGML_TYPE_Q4_0 => vec_dot_q4_0(x, row, n),
+            GGML_TYPE_Q4_1 => vec_dot_q4_1(x, row, n),
+            GGML_TYPE_Q5_0 => vec_dot_q5_0(x, row, n),
+            GGML_TYPE_Q5_1 => vec_dot_q5_1(x, row, n),
+            GGML_TYPE_IQ4_NL => vec_dot_iq4_nl(x, row, n),
+            _ => unreachable!(),
+        };
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn legacy_mr4_status_x86(ttype: i32) -> &'static AtomicU8 {
+    match ttype {
+        GGML_TYPE_Q4_0 => &X86_Q4_0_MR4_STATUS,
+        GGML_TYPE_Q4_1 => &X86_Q4_1_MR4_STATUS,
+        GGML_TYPE_Q5_0 => &X86_Q5_0_MR4_STATUS,
+        GGML_TYPE_Q5_1 => &X86_Q5_1_MR4_STATUS,
+        GGML_TYPE_IQ4_NL => &X86_IQ4_NL_MR4_STATUS,
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn validate_legacy_mr4_once_x86(
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) -> bool {
+    let status = legacy_mr4_status_x86(ttype);
+    match status.load(AtomicOrdering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+
+    let r0 = &mapped[data_offset..data_offset + row_size];
+    let r1 = &mapped[data_offset + row_size..data_offset + 2 * row_size];
+    let r2 = &mapped[data_offset + 2 * row_size..data_offset + 3 * row_size];
+    let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
+
+    let mr4 = match ttype {
+        GGML_TYPE_Q4_0 => vec_dot_q4_0_4rows_x86(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q4_1 => vec_dot_q4_1_4rows_x86(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q5_0 => vec_dot_q5_0_4rows_x86(x, r0, r1, r2, r3, n),
+        GGML_TYPE_Q5_1 => vec_dot_q5_1_4rows_x86(x, r0, r1, r2, r3, n),
+        GGML_TYPE_IQ4_NL => vec_dot_iq4_nl_4rows_x86(x, r0, r1, r2, r3, n),
+        _ => unreachable!(),
+    };
+    let scalar = match ttype {
+        GGML_TYPE_Q4_0 => [
+            vec_dot_q4_0(x, r0, n),
+            vec_dot_q4_0(x, r1, n),
+            vec_dot_q4_0(x, r2, n),
+            vec_dot_q4_0(x, r3, n),
+        ],
+        GGML_TYPE_Q4_1 => [
+            vec_dot_q4_1(x, r0, n),
+            vec_dot_q4_1(x, r1, n),
+            vec_dot_q4_1(x, r2, n),
+            vec_dot_q4_1(x, r3, n),
+        ],
+        GGML_TYPE_Q5_0 => [
+            vec_dot_q5_0(x, r0, n),
+            vec_dot_q5_0(x, r1, n),
+            vec_dot_q5_0(x, r2, n),
+            vec_dot_q5_0(x, r3, n),
+        ],
+        GGML_TYPE_Q5_1 => [
+            vec_dot_q5_1(x, r0, n),
+            vec_dot_q5_1(x, r1, n),
+            vec_dot_q5_1(x, r2, n),
+            vec_dot_q5_1(x, r3, n),
+        ],
+        GGML_TYPE_IQ4_NL => [
+            vec_dot_iq4_nl(x, r0, n),
+            vec_dot_iq4_nl(x, r1, n),
+            vec_dot_iq4_nl(x, r2, n),
+            vec_dot_iq4_nl(x, r3, n),
+        ],
+        _ => unreachable!(),
+    };
+
+    let mut ok = true;
+    for i in 0..4 {
+        let a = mr4[i];
+        let b = scalar[i];
+        let tol = 1e-4f32 * b.abs().max(1.0);
+        if (a - b).abs() > tol {
+            ok = false;
+            break;
+        }
+    }
+
+    status.store(if ok { 1 } else { 2 }, AtomicOrdering::Relaxed);
+    if !ok && kernel_validation_warnings_enabled() {
+        eprintln!(
+            "Warning: disabling x86_64 legacy Q4/Q5/IQ4_NL MR4 kernel for type {} due to validation mismatch",
+            ttype
+        );
+    }
+    ok
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn try_matmul_legacy_mr4_x86(
+    xout: &mut [f32],
+    x: &[f32],
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    n: usize,
+    ttype: i32,
+) -> bool {
+    if !use_x86_qk_mr4() || !use_x86_avx2_fma() {
+        return false;
+    }
+    if !matches!(
+        ttype,
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_IQ4_NL
+    ) {
+        return false;
+    }
+    if n < QK4_0 || n % QK4_0 != 0 || xout.len() < 4 {
+        return false;
+    }
+    if !validate_legacy_mr4_once_x86(x, mapped, data_offset, row_size, n, ttype) {
+        return false;
+    }
+
+    let chunk_rows = par_matmul_chunk_rows();
+    if xout.len() >= par_matmul_min_rows() {
+        xout.par_chunks_mut(chunk_rows)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let base_row = chunk_idx * chunk_rows;
+                matmul_legacy_mr4_chunk_x86(
+                    chunk,
+                    base_row,
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    ttype,
+                );
+            });
+    } else {
+        matmul_legacy_mr4_chunk_x86(xout, 0, x, mapped, data_offset, row_size, n, ttype);
+    }
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
 pub(crate) fn mr4_status_x86(ttype: i32) -> &'static AtomicU8 {
     match ttype {
+        GGML_TYPE_Q2_K => &X86_Q2K_MR4_STATUS,
         GGML_TYPE_Q3_K => &X86_Q3K_MR4_STATUS,
         GGML_TYPE_Q4_K => &X86_Q4K_MR4_STATUS,
         GGML_TYPE_Q5_K => &X86_Q5K_MR4_STATUS,
@@ -4303,6 +6379,7 @@ pub(crate) fn validate_qk_mr4_once_x86(
     let r3 = &mapped[data_offset + 3 * row_size..data_offset + 4 * row_size];
 
     let mr4 = match ttype {
+        GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
         GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
@@ -4310,6 +6387,12 @@ pub(crate) fn validate_qk_mr4_once_x86(
         _ => unreachable!(),
     };
     let scalar = match ttype {
+        GGML_TYPE_Q2_K => [
+            vec_dot_q2_k(x, r0, n),
+            vec_dot_q2_k(x, r1, n),
+            vec_dot_q2_k(x, r2, n),
+            vec_dot_q2_k(x, r3, n),
+        ],
         GGML_TYPE_Q3_K => [
             vec_dot_q3_k(x, r0, n),
             vec_dot_q3_k(x, r1, n),
@@ -4368,13 +6451,14 @@ pub(crate) fn try_matmul_qk_mr4_x86(
     row_size: usize,
     n: usize,
     ttype: i32,
+    scratch: &mut MatmulActivationScratch,
 ) -> bool {
     if !use_x86_qk_mr4() {
         return false;
     }
     if !matches!(
         ttype,
-        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+        GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
     ) {
         return false;
     }
@@ -4390,15 +6474,99 @@ pub(crate) fn try_matmul_qk_mr4_x86(
         return false;
     }
     let chunk_rows = par_matmul_chunk_rows();
+    if x86_qk_mr4_uses_prequant(ttype) {
+        let preq = prequantize_activation_q8(&x[..n], n, scratch);
+        if d >= par_matmul_min_rows() {
+            xout.par_chunks_mut(chunk_rows)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_row = chunk_idx * chunk_rows;
+                    matmul_qk_mr4_chunk_x86_prequant(
+                        chunk,
+                        base_row,
+                        &preq,
+                        x,
+                        mapped,
+                        data_offset,
+                        row_size,
+                        n,
+                        ttype,
+                    );
+                });
+        } else {
+            matmul_qk_mr4_chunk_x86_prequant(
+                xout,
+                0,
+                &preq,
+                x,
+                mapped,
+                data_offset,
+                row_size,
+                n,
+                ttype,
+            );
+        }
+    } else {
+        if d >= par_matmul_min_rows() {
+            xout.par_chunks_mut(chunk_rows)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_row = chunk_idx * chunk_rows;
+                    matmul_qk_mr4_chunk_x86(
+                        chunk,
+                        base_row,
+                        x,
+                        mapped,
+                        data_offset,
+                        row_size,
+                        n,
+                        ttype,
+                    );
+                });
+        } else {
+            matmul_qk_mr4_chunk_x86(xout, 0, x, mapped, data_offset, row_size, n, ttype);
+        }
+    }
+    true
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn try_matmul_qk_mr4_x86_prepared(
+    xout: &mut [f32],
+    prepared: &MatmulPreparedActivation<'_>,
+    mapped: &[u8],
+    data_offset: usize,
+    row_size: usize,
+    ttype: i32,
+) -> bool {
+    if !use_x86_qk_mr4() || !x86_qk_mr4_uses_prequant(ttype) {
+        return false;
+    }
+    let n = prepared.n;
+    if n < QK_K || n % QK_K != 0 {
+        return false;
+    }
+
+    let d = xout.len();
+    if d < 4 {
+        return false;
+    }
+    if !validate_qk_mr4_once_x86(prepared.x, mapped, data_offset, row_size, n, ttype) {
+        return false;
+    }
+
+    let chunk_rows = par_matmul_chunk_rows();
     if d >= par_matmul_min_rows() {
         xout.par_chunks_mut(chunk_rows)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
                 let base_row = chunk_idx * chunk_rows;
-                matmul_qk_mr4_chunk_x86(
+                matmul_qk_mr4_chunk_x86_prequant(
                     chunk,
                     base_row,
-                    x,
+                    &prepared.q8,
+                    prepared.x,
                     mapped,
                     data_offset,
                     row_size,
@@ -4407,7 +6575,17 @@ pub(crate) fn try_matmul_qk_mr4_x86(
                 );
             });
     } else {
-        matmul_qk_mr4_chunk_x86(xout, 0, x, mapped, data_offset, row_size, n, ttype);
+        matmul_qk_mr4_chunk_x86_prequant(
+            xout,
+            0,
+            &prepared.q8,
+            prepared.x,
+            mapped,
+            data_offset,
+            row_size,
+            n,
+            ttype,
+        );
     }
     true
 }
@@ -4429,6 +6607,89 @@ pub(crate) fn vec_dot_iq4_nl(x: &[f32], w: &[u8], n: usize) -> f32 {
         sum += block_sum * d;
     }
     sum
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn vec_dot_iq4_nl_4rows(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK4_NL;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_IQ4_NL));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK4_NL;
+        let x_ptr = unsafe { x.as_ptr().add(x_base) };
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let q = rows[r][off + 2..off + 2 + QK4_NL / 2].as_ptr();
+            let (lo, hi) =
+                unsafe { dot_iq4_nl_nibbles_16_neon_ptr(x_ptr, x_ptr.add(QK4_NL / 2), q) };
+            sums[r] += (lo + hi) * d;
+        }
+    }
+
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vec_dot_iq4_nl_4rows_x86(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    if use_x86_avx2_fma() {
+        unsafe {
+            return vec_dot_iq4_nl_4rows_x86_avx2(x, w0, w1, w2, w3, n);
+        }
+    }
+    [
+        vec_dot_iq4_nl(x, w0, n),
+        vec_dot_iq4_nl(x, w1, n),
+        vec_dot_iq4_nl(x, w2, n),
+        vec_dot_iq4_nl(x, w3, n),
+    ]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3,avx2,fma")]
+unsafe fn vec_dot_iq4_nl_4rows_x86_avx2(
+    x: &[f32],
+    w0: &[u8],
+    w1: &[u8],
+    w2: &[u8],
+    w3: &[u8],
+    n: usize,
+) -> [f32; 4] {
+    let rows = [w0, w1, w2, w3];
+    let nb = n / QK4_NL;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_IQ4_NL));
+    let mut sums = [0.0f32; 4];
+
+    for i in 0..nb {
+        let x_base = i * QK4_NL;
+        let x_ptr = x.as_ptr().add(x_base);
+        for r in 0..4 {
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(rows[r], off));
+            let q = rows[r][off + 2..off + 2 + QK4_NL / 2].as_ptr();
+            let (lo, hi) =
+                dot_iq4_nl_nibbles_pair_avx2_ptr(x_ptr, x_ptr.add(QK4_NL / 2), q, QK4_NL / 2);
+            sums[r] += (lo + hi) * d;
+        }
+    }
+
+    sums
 }
 
 pub(crate) fn get_row_size(n_cols: usize, ttype: GgmlType) -> usize {
@@ -4478,6 +6739,26 @@ pub(crate) fn matmul_quantized(
     qw: &QuantizedTensor,
     mapped: &[u8],
 ) -> Result<(), String> {
+    let mut scratch = MatmulActivationScratch::new();
+    matmul_quantized_with_scratch(xout, x, qw, mapped, &mut scratch)
+}
+
+pub(crate) fn matmul_quantized_with_prepared_activation(
+    xout: &mut [f32],
+    prepared: &MatmulPreparedActivation<'_>,
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+) -> Result<(), String> {
+    matmul_quantized_rows_with_prepared_activation(xout, prepared, qw, 0, qw.rows, mapped)
+}
+
+pub(crate) fn matmul_quantized_with_scratch(
+    xout: &mut [f32],
+    x: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    scratch: &mut MatmulActivationScratch,
+) -> Result<(), String> {
     let prof_t0 = prof_start();
     let d = qw.rows;
     let n = qw.cols;
@@ -4524,18 +6805,158 @@ pub(crate) fn matmul_quantized(
     }
 
     match qw.ttype.0 {
-        GGML_TYPE_Q4_0 => run_rows!(vec_dot_q4_0),
-        GGML_TYPE_Q4_1 => run_rows!(vec_dot_q4_1),
-        GGML_TYPE_Q5_0 => run_rows!(vec_dot_q5_0),
-        GGML_TYPE_Q5_1 => run_rows!(vec_dot_q5_1),
+        GGML_TYPE_Q4_0 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_0,
+                ) {
+                    run_rows!(vec_dot_q4_0);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_0,
+                ) {
+                    run_rows!(vec_dot_q4_0);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q4_0);
+            }
+        }
+        GGML_TYPE_Q4_1 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_1,
+                ) {
+                    run_rows!(vec_dot_q4_1);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_1,
+                ) {
+                    run_rows!(vec_dot_q4_1);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q4_1);
+            }
+        }
+        GGML_TYPE_Q5_0 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_0,
+                ) {
+                    run_rows!(vec_dot_q5_0);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_0,
+                ) {
+                    run_rows!(vec_dot_q5_0);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q5_0);
+            }
+        }
+        GGML_TYPE_Q5_1 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_1,
+                ) {
+                    run_rows!(vec_dot_q5_1);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_1,
+                ) {
+                    run_rows!(vec_dot_q5_1);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q5_1);
+            }
+        }
         GGML_TYPE_Q8_0 => {
             let mut handled = false;
             #[cfg(target_arch = "aarch64")]
             {
-                if try_matmul_q8_mr2(&mut xout[..d], x, mapped, data_offset, row_size, n) {
+                if try_matmul_q8_mr2_with_scratch(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    scratch,
+                ) {
                     handled = true;
                 } else if n >= QK8_0 && n.is_multiple_of(QK8_0) && use_aarch64_dotprod_q8() {
-                    let preq = prequantize_activation_q8(&x[..n], n);
+                    let preq = prequantize_activation_q8(&x[..n], n, scratch);
                     run_q8_rows_prequant(xout, mapped, data_offset, row_size, d, |row| unsafe {
                         vec_dot_q8_0_dotprod_prequant(&preq, row, n)
                     });
@@ -4549,7 +6970,7 @@ pub(crate) fn matmul_quantized(
                 // logits enough to change greedy decoding.
                 if !use_x86_avx2_fma() && n >= QK8_0 && n.is_multiple_of(QK8_0) {
                     if use_x86_avx512_vnni_q8() {
-                        let preq = prequantize_activation_q8(&x[..n], n);
+                        let preq = prequantize_activation_q8(&x[..n], n, scratch);
                         run_q8_rows_prequant(
                             xout,
                             mapped,
@@ -4560,7 +6981,7 @@ pub(crate) fn matmul_quantized(
                         );
                         handled = true;
                     } else if use_x86_avx_vnni() {
-                        let preq = prequantize_activation_q8(&x[..n], n);
+                        let preq = prequantize_activation_q8(&x[..n], n, scratch);
                         run_q8_rows_prequant(
                             xout,
                             mapped,
@@ -4577,7 +6998,41 @@ pub(crate) fn matmul_quantized(
                 run_rows!(vec_dot_q8_0);
             }
         }
-        GGML_TYPE_Q2_K => run_rows!(vec_dot_q2_k),
+        GGML_TYPE_Q2_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q2_K,
+                ) {
+                    run_rows!(vec_dot_q2_k);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_qk_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q2_K,
+                    scratch,
+                ) {
+                    run_rows!(vec_dot_q2_k);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q2_k);
+            }
+        }
         GGML_TYPE_Q3_K => {
             #[cfg(target_arch = "aarch64")]
             {
@@ -4603,6 +7058,7 @@ pub(crate) fn matmul_quantized(
                     row_size,
                     n,
                     GGML_TYPE_Q3_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q3_k);
                 }
@@ -4637,6 +7093,7 @@ pub(crate) fn matmul_quantized(
                     row_size,
                     n,
                     GGML_TYPE_Q4_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q4_k);
                 }
@@ -4671,6 +7128,7 @@ pub(crate) fn matmul_quantized(
                     row_size,
                     n,
                     GGML_TYPE_Q5_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q5_k);
                 }
@@ -4705,6 +7163,7 @@ pub(crate) fn matmul_quantized(
                     row_size,
                     n,
                     GGML_TYPE_Q6_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q6_k);
                 }
@@ -4714,7 +7173,40 @@ pub(crate) fn matmul_quantized(
                 run_rows!(vec_dot_q6_k);
             }
         }
-        GGML_TYPE_IQ4_NL => run_rows!(vec_dot_iq4_nl),
+        GGML_TYPE_IQ4_NL => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_IQ4_NL,
+                ) {
+                    run_rows!(vec_dot_iq4_nl);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_IQ4_NL,
+                ) {
+                    run_rows!(vec_dot_iq4_nl);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_iq4_nl);
+            }
+        }
         GGML_TYPE_F16 => run_rows!(vec_dot_f16),
         GGML_TYPE_BF16 => run_rows!(vec_dot_bf16),
         GGML_TYPE_F32 => run_rows!(vec_dot_f32),
@@ -4738,6 +7230,370 @@ pub(crate) fn matmul_quantized_rows(
     row_start: usize,
     n_rows: usize,
     mapped: &[u8],
+) -> Result<(), String> {
+    let mut scratch = MatmulActivationScratch::new();
+    matmul_quantized_rows_with_scratch(xout, x, qw, row_start, n_rows, mapped, &mut scratch)
+}
+
+pub(crate) fn matmul_quantized_rows_with_prepared_activation(
+    xout: &mut [f32],
+    prepared: &MatmulPreparedActivation<'_>,
+    qw: &QuantizedTensor,
+    row_start: usize,
+    n_rows: usize,
+    mapped: &[u8],
+) -> Result<(), String> {
+    let prof_t0 = prof_start();
+    let d = n_rows;
+    let n = qw.cols;
+    let row_size = get_row_size(n, qw.ttype);
+    if prepared.n != n {
+        return Err("matmul prepared activation shape mismatch".to_string());
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul row window exceeds tensor rows".to_string());
+    }
+    if xout.len() < d {
+        return Err("matmul shape mismatch".to_string());
+    }
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = d
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    macro_rules! run_rows {
+        ($dot:path) => {{
+            if d >= par_matmul_min_rows() {
+                let chunk_rows = par_matmul_chunk_rows();
+                xout[..d].par_chunks_mut(chunk_rows).enumerate().for_each(
+                    |(chunk_idx, out_chunk)| {
+                        let base_row = chunk_idx * chunk_rows;
+                        for (j, out) in out_chunk.iter_mut().enumerate() {
+                            matmul_prefetch_row(mapped, data_offset, row_size, base_row + j, d);
+                            let row_start = data_offset + (base_row + j) * row_size;
+                            let row = &mapped[row_start..row_start + row_size];
+                            *out = $dot(prepared.x, row, n);
+                        }
+                    },
+                );
+            } else {
+                for (i, out) in xout[..d].iter_mut().enumerate() {
+                    matmul_prefetch_row(mapped, data_offset, row_size, i, d);
+                    let row_start = data_offset + i * row_size;
+                    let row = &mapped[row_start..row_start + row_size];
+                    *out = $dot(prepared.x, row, n);
+                }
+            }
+        }};
+    }
+
+    match qw.ttype.0 {
+        GGML_TYPE_Q4_0 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_0,
+                ) {
+                    run_rows!(vec_dot_q4_0);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_0,
+                ) {
+                    run_rows!(vec_dot_q4_0);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q4_0);
+            }
+        }
+        GGML_TYPE_Q4_1 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_1,
+                ) {
+                    run_rows!(vec_dot_q4_1);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_1,
+                ) {
+                    run_rows!(vec_dot_q4_1);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q4_1);
+            }
+        }
+        GGML_TYPE_Q5_0 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_0,
+                ) {
+                    run_rows!(vec_dot_q5_0);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_0,
+                ) {
+                    run_rows!(vec_dot_q5_0);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q5_0);
+            }
+        }
+        GGML_TYPE_Q5_1 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_1,
+                ) {
+                    run_rows!(vec_dot_q5_1);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_1,
+                ) {
+                    run_rows!(vec_dot_q5_1);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q5_1);
+            }
+        }
+        GGML_TYPE_Q8_0 => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut handled = false;
+                if !use_x86_avx2_fma() && n >= QK8_0 && n.is_multiple_of(QK8_0) {
+                    if use_x86_avx512_vnni_q8() {
+                        run_q8_rows_prequant(
+                            xout,
+                            mapped,
+                            data_offset,
+                            row_size,
+                            d,
+                            |row| unsafe {
+                                vec_dot_q8_0_x86_avx512vnni_prequant(&prepared.q8, row, n)
+                            },
+                        );
+                        handled = true;
+                    } else if use_x86_avx_vnni() {
+                        run_q8_rows_prequant(
+                            xout,
+                            mapped,
+                            data_offset,
+                            row_size,
+                            d,
+                            |row| unsafe {
+                                vec_dot_q8_0_x86_avxvnni_prequant(&prepared.q8, row, n)
+                            },
+                        );
+                        handled = true;
+                    }
+                }
+                if !handled {
+                    run_rows!(vec_dot_q8_0);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                run_rows!(vec_dot_q8_0);
+            }
+        }
+        GGML_TYPE_Q2_K => run_rows!(vec_dot_q2_k),
+        GGML_TYPE_Q3_K => run_rows!(vec_dot_q3_k),
+        GGML_TYPE_Q4_K => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_qk_mr4_x86_prepared(
+                    &mut xout[..d],
+                    prepared,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    GGML_TYPE_Q4_K,
+                ) {
+                    run_rows!(vec_dot_q4_k);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                run_rows!(vec_dot_q4_k);
+            }
+        }
+        GGML_TYPE_Q5_K => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_qk_mr4_x86_prepared(
+                    &mut xout[..d],
+                    prepared,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    GGML_TYPE_Q5_K,
+                ) {
+                    run_rows!(vec_dot_q5_k);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                run_rows!(vec_dot_q5_k);
+            }
+        }
+        GGML_TYPE_Q6_K => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_qk_mr4_x86_prepared(
+                    &mut xout[..d],
+                    prepared,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    GGML_TYPE_Q6_K,
+                ) {
+                    run_rows!(vec_dot_q6_k);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                run_rows!(vec_dot_q6_k);
+            }
+        }
+        GGML_TYPE_IQ4_NL => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    prepared.n,
+                    GGML_TYPE_IQ4_NL,
+                ) {
+                    run_rows!(vec_dot_iq4_nl);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    prepared.x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    prepared.n,
+                    GGML_TYPE_IQ4_NL,
+                ) {
+                    run_rows!(vec_dot_iq4_nl);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_iq4_nl);
+            }
+        }
+        GGML_TYPE_F16 => run_rows!(vec_dot_f16),
+        GGML_TYPE_BF16 => run_rows!(vec_dot_bf16),
+        GGML_TYPE_F32 => run_rows!(vec_dot_f32),
+        GGML_TYPE_BIN1_40 | GGML_TYPE_BIN1_41 => run_rows!(vec_dot_bin1),
+        _ => {
+            return Err(format!(
+                "unsupported quantization type in matmul: {}",
+                qw.ttype.0
+            ));
+        }
+    }
+
+    prof_end(&PROF_MATMUL_NS, prof_t0);
+    Ok(())
+}
+
+pub(crate) fn matmul_quantized_rows_with_scratch(
+    xout: &mut [f32],
+    x: &[f32],
+    qw: &QuantizedTensor,
+    row_start: usize,
+    n_rows: usize,
+    mapped: &[u8],
+    scratch: &mut MatmulActivationScratch,
 ) -> Result<(), String> {
     let prof_t0 = prof_start();
     let d = n_rows;
@@ -4793,18 +7649,158 @@ pub(crate) fn matmul_quantized_rows(
     }
 
     match qw.ttype.0 {
-        GGML_TYPE_Q4_0 => run_rows!(vec_dot_q4_0),
-        GGML_TYPE_Q4_1 => run_rows!(vec_dot_q4_1),
-        GGML_TYPE_Q5_0 => run_rows!(vec_dot_q5_0),
-        GGML_TYPE_Q5_1 => run_rows!(vec_dot_q5_1),
+        GGML_TYPE_Q4_0 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_0,
+                ) {
+                    run_rows!(vec_dot_q4_0);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_0,
+                ) {
+                    run_rows!(vec_dot_q4_0);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q4_0);
+            }
+        }
+        GGML_TYPE_Q4_1 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_1,
+                ) {
+                    run_rows!(vec_dot_q4_1);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q4_1,
+                ) {
+                    run_rows!(vec_dot_q4_1);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q4_1);
+            }
+        }
+        GGML_TYPE_Q5_0 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_0,
+                ) {
+                    run_rows!(vec_dot_q5_0);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_0,
+                ) {
+                    run_rows!(vec_dot_q5_0);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q5_0);
+            }
+        }
+        GGML_TYPE_Q5_1 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_1,
+                ) {
+                    run_rows!(vec_dot_q5_1);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q5_1,
+                ) {
+                    run_rows!(vec_dot_q5_1);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q5_1);
+            }
+        }
         GGML_TYPE_Q8_0 => {
             let mut handled = false;
             #[cfg(target_arch = "aarch64")]
             {
-                if try_matmul_q8_mr2(&mut xout[..d], x, mapped, data_offset, row_size, n) {
+                if try_matmul_q8_mr2_with_scratch(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    scratch,
+                ) {
                     handled = true;
                 } else if n >= QK8_0 && n.is_multiple_of(QK8_0) && use_aarch64_dotprod_q8() {
-                    let preq = prequantize_activation_q8(&x[..n], n);
+                    let preq = prequantize_activation_q8(&x[..n], n, scratch);
                     run_q8_rows_prequant(xout, mapped, data_offset, row_size, d, |row| unsafe {
                         vec_dot_q8_0_dotprod_prequant(&preq, row, n)
                     });
@@ -4818,7 +7814,7 @@ pub(crate) fn matmul_quantized_rows(
                 // logits enough to change greedy decoding.
                 if !use_x86_avx2_fma() && n >= QK8_0 && n.is_multiple_of(QK8_0) {
                     if use_x86_avx512_vnni_q8() {
-                        let preq = prequantize_activation_q8(&x[..n], n);
+                        let preq = prequantize_activation_q8(&x[..n], n, scratch);
                         run_q8_rows_prequant(
                             xout,
                             mapped,
@@ -4829,7 +7825,7 @@ pub(crate) fn matmul_quantized_rows(
                         );
                         handled = true;
                     } else if use_x86_avx_vnni() {
-                        let preq = prequantize_activation_q8(&x[..n], n);
+                        let preq = prequantize_activation_q8(&x[..n], n, scratch);
                         run_q8_rows_prequant(
                             xout,
                             mapped,
@@ -4846,7 +7842,41 @@ pub(crate) fn matmul_quantized_rows(
                 run_rows!(vec_dot_q8_0);
             }
         }
-        GGML_TYPE_Q2_K => run_rows!(vec_dot_q2_k),
+        GGML_TYPE_Q2_K => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_qk_mr4(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q2_K,
+                ) {
+                    run_rows!(vec_dot_q2_k);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_qk_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_Q2_K,
+                    scratch,
+                ) {
+                    run_rows!(vec_dot_q2_k);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_q2_k);
+            }
+        }
         GGML_TYPE_Q3_K => {
             #[cfg(target_arch = "aarch64")]
             {
@@ -4872,6 +7902,7 @@ pub(crate) fn matmul_quantized_rows(
                     row_size,
                     n,
                     GGML_TYPE_Q3_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q3_k);
                 }
@@ -4906,6 +7937,7 @@ pub(crate) fn matmul_quantized_rows(
                     row_size,
                     n,
                     GGML_TYPE_Q4_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q4_k);
                 }
@@ -4940,6 +7972,7 @@ pub(crate) fn matmul_quantized_rows(
                     row_size,
                     n,
                     GGML_TYPE_Q5_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q5_k);
                 }
@@ -4974,6 +8007,7 @@ pub(crate) fn matmul_quantized_rows(
                     row_size,
                     n,
                     GGML_TYPE_Q6_K,
+                    scratch,
                 ) {
                     run_rows!(vec_dot_q6_k);
                 }
@@ -4983,7 +8017,40 @@ pub(crate) fn matmul_quantized_rows(
                 run_rows!(vec_dot_q6_k);
             }
         }
-        GGML_TYPE_IQ4_NL => run_rows!(vec_dot_iq4_nl),
+        GGML_TYPE_IQ4_NL => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !try_matmul_legacy_q4_q5_iq4_mr4_aarch64(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_IQ4_NL,
+                ) {
+                    run_rows!(vec_dot_iq4_nl);
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if !try_matmul_legacy_mr4_x86(
+                    &mut xout[..d],
+                    x,
+                    mapped,
+                    data_offset,
+                    row_size,
+                    n,
+                    GGML_TYPE_IQ4_NL,
+                ) {
+                    run_rows!(vec_dot_iq4_nl);
+                }
+            }
+            #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+            {
+                run_rows!(vec_dot_iq4_nl);
+            }
+        }
         GGML_TYPE_F16 => run_rows!(vec_dot_f16),
         GGML_TYPE_BF16 => run_rows!(vec_dot_bf16),
         GGML_TYPE_F32 => run_rows!(vec_dot_f32),
@@ -5300,6 +8367,672 @@ fn batch_exact_vec_dot(ttype: i32, x: &[f32], row: &[u8], n: usize) -> f32 {
     }
 }
 
+/// First exact tiled K-quant batch kernel.
+///
+/// This Q2_K implementation keeps the scalar [`vec_dot_q2_k`] accumulation
+/// order for each `(token,row)` output while moving the batch dimension inside
+/// the packed-weight decode loop. Each 16-value Q2 segment is decoded once per
+/// row and reused across all `m` input tokens, avoiding full-row F32 dequant
+/// scratch and repeated row scans.
+///
+/// It is intentionally not the default `batch_exact` dispatch yet: the current
+/// exact prefill path mirrors architecture-specific sequential MR4 dispatch for
+/// bit identity, while this helper is bit-identical to the scalar Q2_K oracle.
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_q2_k_exact(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    let n = qw.cols;
+    if qw.ttype.0 != GGML_TYPE_Q2_K {
+        return Err("matmul_quantized_batch_tiled_q2_k_exact: unsupported type".to_string());
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_tiled_q2_k_exact row window out of bounds".to_string());
+    }
+    if out.len() < m * n_rows || inp.len() < m * n {
+        return Err("matmul_quantized_batch_tiled_q2_k_exact shape mismatch".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if n < QK_K || !n.is_multiple_of(QK_K) {
+        return Err("matmul_quantized_batch_tiled_q2_k_exact unsupported column count".to_string());
+    }
+
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = n_rows
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    out[..m * n_rows].fill(0.0);
+
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+    let mut block_sums = vec![0.0f32; m];
+    for row_idx in 0..n_rows {
+        matmul_prefetch_row(mapped, data_offset, row_size, row_idx, n_rows);
+        let row_base = data_offset + row_idx * row_size;
+        let row = &mapped[row_base..row_base + row_size];
+
+        for i in 0..nb {
+            block_sums.fill(0.0);
+            let off = i * block_sz;
+            let scales = &row[off..off + QK_K / 16];
+            let mut q_off = off + QK_K / 16;
+            let d = fp16_to_fp32(read_u16_le(row, off + QK_K / 16 + QK_K / 4));
+            let dmin = fp16_to_fp32(read_u16_le(row, off + QK_K / 16 + QK_K / 4 + 2));
+            let x_block_base = i * QK_K;
+
+            let mut is = 0usize;
+            for n_outer in (0..QK_K).step_by(128) {
+                let q = &row[q_off..q_off + 32];
+                let mut shift = 0usize;
+                for j in 0..4usize {
+                    let sc = scales[is];
+                    is += 1;
+                    let dl = d * (sc & 0x0f) as f32;
+                    let ml = dmin * (sc >> 4) as f32;
+                    for l in 0..16usize {
+                        let col = x_block_base + n_outer + j * 32 + l;
+                        let wv = dl * ((q[l] >> shift) & 0x03) as f32 - ml;
+                        for b in 0..m {
+                            block_sums[b] += inp[b * n + col] * wv;
+                        }
+                    }
+
+                    let sc2 = scales[is];
+                    is += 1;
+                    let dl2 = d * (sc2 & 0x0f) as f32;
+                    let ml2 = dmin * (sc2 >> 4) as f32;
+                    for l in 0..16usize {
+                        let col = x_block_base + n_outer + j * 32 + 16 + l;
+                        let wv = dl2 * ((q[l + 16] >> shift) & 0x03) as f32 - ml2;
+                        for b in 0..m {
+                            block_sums[b] += inp[b * n + col] * wv;
+                        }
+                    }
+                    shift += 2;
+                }
+                q_off += 32;
+            }
+            for b in 0..m {
+                out[b * n_rows + row_idx] += block_sums[b];
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Exact tiled Q3_K batch kernel.
+///
+/// Mirrors [`vec_dot_q3_k`] for each `(token,row)` output, including the
+/// per-superblock accumulation boundary, while reusing each decoded 16-value
+/// Q3 segment across all batch tokens. Kept internal until tiled exact dispatch
+/// policy is settled for all K-quants.
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_q3_k_exact(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    let n = qw.cols;
+    if qw.ttype.0 != GGML_TYPE_Q3_K {
+        return Err("matmul_quantized_batch_tiled_q3_k_exact: unsupported type".to_string());
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_tiled_q3_k_exact row window out of bounds".to_string());
+    }
+    if out.len() < m * n_rows || inp.len() < m * n {
+        return Err("matmul_quantized_batch_tiled_q3_k_exact shape mismatch".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if n < QK_K || !n.is_multiple_of(QK_K) {
+        return Err("matmul_quantized_batch_tiled_q3_k_exact unsupported column count".to_string());
+    }
+
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = n_rows
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    out[..m * n_rows].fill(0.0);
+
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
+    let sc_off = QK_K / 8 + QK_K / 4;
+    let mut block_sums = vec![0.0f32; m];
+    for row_idx in 0..n_rows {
+        matmul_prefetch_row(mapped, data_offset, row_size, row_idx, n_rows);
+        let row_base = data_offset + row_idx * row_size;
+        let row = &mapped[row_base..row_base + row_size];
+
+        for i in 0..nb {
+            block_sums.fill(0.0);
+            let off = i * block_sz;
+            let hmask = &row[off..off + QK_K / 8];
+            let mut q_off = off + QK_K / 8;
+            let scales = q3_scales(&row[off + sc_off..off + sc_off + 12]);
+            let d_all = fp16_to_fp32(read_u16_le(row, off + sc_off + 12));
+            let x_block_base = i * QK_K;
+
+            let mut is = 0usize;
+            let mut mbit: u8 = 1;
+            for n_outer in (0..QK_K).step_by(128) {
+                let q = &row[q_off..q_off + 32];
+                let mut shift = 0usize;
+                for j in 0..4usize {
+                    let dl = d_all * (scales[is] as i32 - 32) as f32;
+                    is += 1;
+                    for l in 0..16usize {
+                        let col = x_block_base + n_outer + j * 32 + l;
+                        let wv = ((q[l] >> shift) & 3) as i8
+                            - if (hmask[l] & mbit) != 0 { 0 } else { 4 };
+                        for b in 0..m {
+                            block_sums[b] += inp[b * n + col] * dl * wv as f32;
+                        }
+                    }
+
+                    let dl2 = d_all * (scales[is] as i32 - 32) as f32;
+                    is += 1;
+                    for l in 0..16usize {
+                        let col = x_block_base + n_outer + j * 32 + 16 + l;
+                        let wv = ((q[l + 16] >> shift) & 3) as i8
+                            - if (hmask[l + 16] & mbit) != 0 { 0 } else { 4 };
+                        for b in 0..m {
+                            block_sums[b] += inp[b * n + col] * dl2 * wv as f32;
+                        }
+                    }
+                    shift += 2;
+                    mbit <<= 1;
+                }
+                q_off += 32;
+            }
+            for b in 0..m {
+                out[b * n_rows + row_idx] += block_sums[b];
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Exact tiled Q4_K batch kernel.
+///
+/// Reuses each decoded 32-value nibble pair across all batch tokens while
+/// preserving [`vec_dot_q4_k`] multiply/add grouping for every output.
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_q4_k_exact(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    let n = qw.cols;
+    if qw.ttype.0 != GGML_TYPE_Q4_K {
+        return Err("matmul_quantized_batch_tiled_q4_k_exact: unsupported type".to_string());
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_tiled_q4_k_exact row window out of bounds".to_string());
+    }
+    if out.len() < m * n_rows || inp.len() < m * n {
+        return Err("matmul_quantized_batch_tiled_q4_k_exact shape mismatch".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if n < QK_K || !n.is_multiple_of(QK_K) {
+        return Err("matmul_quantized_batch_tiled_q4_k_exact unsupported column count".to_string());
+    }
+
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = n_rows
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    out[..m * n_rows].fill(0.0);
+
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_K));
+    let mut block_sums = vec![0.0f32; m];
+    for row_idx in 0..n_rows {
+        matmul_prefetch_row(mapped, data_offset, row_size, row_idx, n_rows);
+        let row_base = data_offset + row_idx * row_size;
+        let row = &mapped[row_base..row_base + row_size];
+
+        for i in 0..nb {
+            block_sums.fill(0.0);
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(row, off));
+            let dmin = fp16_to_fp32(read_u16_le(row, off + 2));
+            let scales = &row[off + 4..off + 16];
+            let mut q_off = off + 16;
+            let x_block_base = i * QK_K;
+
+            let mut is = 0usize;
+            for j in (0..QK_K).step_by(64) {
+                let (sc1, m1) = get_scale_min_k4(is, scales);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                let d1 = d * sc1 as f32;
+                let m1f = dmin * m1 as f32;
+                let d2 = d * sc2 as f32;
+                let m2f = dmin * m2 as f32;
+                let q = &row[q_off..q_off + 32];
+                for l in 0..32usize {
+                    let qv = q[l];
+                    let w0 = d1 * (qv & 0x0f) as f32 - m1f;
+                    let w1 = d2 * (qv >> 4) as f32 - m2f;
+                    let col0 = x_block_base + j + l;
+                    let col1 = x_block_base + j + 32 + l;
+                    for b in 0..m {
+                        block_sums[b] += inp[b * n + col0] * w0 + inp[b * n + col1] * w1;
+                    }
+                }
+                q_off += 32;
+                is += 2;
+            }
+            for b in 0..m {
+                out[b * n_rows + row_idx] += block_sums[b];
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Exact tiled Q5_K batch kernel.
+///
+/// Keeps [`vec_dot_q5_k`] bit semantics while sharing low/high-bit decode work
+/// across every token in the prefill batch.
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_q5_k_exact(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    let n = qw.cols;
+    if qw.ttype.0 != GGML_TYPE_Q5_K {
+        return Err("matmul_quantized_batch_tiled_q5_k_exact: unsupported type".to_string());
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_tiled_q5_k_exact row window out of bounds".to_string());
+    }
+    if out.len() < m * n_rows || inp.len() < m * n {
+        return Err("matmul_quantized_batch_tiled_q5_k_exact shape mismatch".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if n < QK_K || !n.is_multiple_of(QK_K) {
+        return Err("matmul_quantized_batch_tiled_q5_k_exact unsupported column count".to_string());
+    }
+
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = n_rows
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    out[..m * n_rows].fill(0.0);
+
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_K));
+    let mut block_sums = vec![0.0f32; m];
+    for row_idx in 0..n_rows {
+        matmul_prefetch_row(mapped, data_offset, row_size, row_idx, n_rows);
+        let row_base = data_offset + row_idx * row_size;
+        let row = &mapped[row_base..row_base + row_size];
+
+        for i in 0..nb {
+            block_sums.fill(0.0);
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(row, off));
+            let dmin = fp16_to_fp32(read_u16_le(row, off + 2));
+            let scales = &row[off + 4..off + 16];
+            let qh = &row[off + 16..off + 16 + QK_K / 8];
+            let mut ql_off = off + 16 + QK_K / 8;
+            let x_block_base = i * QK_K;
+
+            let mut is = 0usize;
+            let mut u1: u8 = 1;
+            let mut u2: u8 = 2;
+            for j in (0..QK_K).step_by(64) {
+                let (sc1, m1) = get_scale_min_k4(is, scales);
+                let (sc2, m2) = get_scale_min_k4(is + 1, scales);
+                let d1 = d * sc1 as f32;
+                let m1f = dmin * m1 as f32;
+                let d2 = d * sc2 as f32;
+                let m2f = dmin * m2 as f32;
+                let ql = &row[ql_off..ql_off + 32];
+
+                for l in 0..32usize {
+                    let qv = ql[l];
+                    let lo = (qv & 0x0f) + if (qh[l] & u1) != 0 { 16 } else { 0 };
+                    let hi = (qv >> 4) + if (qh[l] & u2) != 0 { 16 } else { 0 };
+                    let w0 = d1 * lo as f32 - m1f;
+                    let w1 = d2 * hi as f32 - m2f;
+                    let col0 = x_block_base + j + l;
+                    let col1 = x_block_base + j + 32 + l;
+                    for b in 0..m {
+                        block_sums[b] += inp[b * n + col0] * w0 + inp[b * n + col1] * w1;
+                    }
+                }
+
+                ql_off += 32;
+                is += 2;
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+            for b in 0..m {
+                out[b * n_rows + row_idx] += block_sums[b];
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Exact tiled Q6_K batch kernel.
+///
+/// Preserves [`vec_dot_q6_k`] per-lane accumulation order and shares the
+/// four-way Q6 decode for all tokens in the current batch.
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_q6_k_exact(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    let n = qw.cols;
+    if qw.ttype.0 != GGML_TYPE_Q6_K {
+        return Err("matmul_quantized_batch_tiled_q6_k_exact: unsupported type".to_string());
+    }
+    if row_start + n_rows > qw.rows {
+        return Err("matmul_quantized_batch_tiled_q6_k_exact row window out of bounds".to_string());
+    }
+    if out.len() < m * n_rows || inp.len() < m * n {
+        return Err("matmul_quantized_batch_tiled_q6_k_exact shape mismatch".to_string());
+    }
+    if m == 0 {
+        return Ok(());
+    }
+    if n < QK_K || !n.is_multiple_of(QK_K) {
+        return Err("matmul_quantized_batch_tiled_q6_k_exact unsupported column count".to_string());
+    }
+
+    let row_size = get_row_size(n, qw.ttype);
+    let row_off = row_start
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized row offset overflow".to_string())?;
+    let data_offset = qw
+        .data_offset
+        .checked_add(row_off)
+        .ok_or_else(|| "quantized tensor offset overflow".to_string())?;
+    let data_size = n_rows
+        .checked_mul(row_size)
+        .ok_or_else(|| "quantized tensor row size overflow".to_string())?;
+    let data_end = data_offset
+        .checked_add(data_size)
+        .ok_or_else(|| "quantized tensor end overflow".to_string())?;
+    if data_end > mapped.len() {
+        return Err("quantized row outside mapped file".to_string());
+    }
+    ensure_model_range(data_offset, data_size)?;
+
+    out[..m * n_rows].fill(0.0);
+
+    let nb = n / QK_K;
+    let block_sz = get_type_size(GgmlType(GGML_TYPE_Q6_K));
+    let mut block_sums = vec![0.0f32; m];
+    for row_idx in 0..n_rows {
+        matmul_prefetch_row(mapped, data_offset, row_size, row_idx, n_rows);
+        let row_base = data_offset + row_idx * row_size;
+        let row = &mapped[row_base..row_base + row_size];
+
+        for i in 0..nb {
+            block_sums.fill(0.0);
+            let off = i * block_sz;
+            let d = fp16_to_fp32(read_u16_le(row, off + QK_K / 2 + QK_K / 4 + QK_K / 16));
+            let mut ql_off = off;
+            let mut qh_off = off + QK_K / 2;
+            let mut sc_off = off + QK_K / 2 + QK_K / 4;
+            let x_block_base = i * QK_K;
+
+            for n_outer in (0..QK_K).step_by(128) {
+                let ql = &row[ql_off..ql_off + 64];
+                let qh = &row[qh_off..qh_off + 32];
+                let sc = &row[sc_off..sc_off + 8];
+
+                for l in 0..32usize {
+                    let is = l / 16;
+                    let q1 = (((ql[l] & 0x0f) | (((qh[l]) & 0x03) << 4)) as i8) - 32;
+                    let q2 = (((ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 0x03) << 4)) as i8) - 32;
+                    let q3 = (((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i8) - 32;
+                    let q4 = (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i8) - 32;
+                    let s0 = d * sc[is] as i8 as f32;
+                    let s1 = d * sc[is + 2] as i8 as f32;
+                    let s2 = d * sc[is + 4] as i8 as f32;
+                    let s3 = d * sc[is + 6] as i8 as f32;
+                    let col0 = x_block_base + n_outer + l;
+                    let col1 = x_block_base + n_outer + 32 + l;
+                    let col2 = x_block_base + n_outer + 64 + l;
+                    let col3 = x_block_base + n_outer + 96 + l;
+                    for b in 0..m {
+                        block_sums[b] += inp[b * n + col0] * (s0 * q1 as f32);
+                        block_sums[b] += inp[b * n + col1] * (s1 * q2 as f32);
+                        block_sums[b] += inp[b * n + col2] * (s2 * q3 as f32);
+                        block_sums[b] += inp[b * n + col3] * (s3 * q4 as f32);
+                    }
+                }
+
+                ql_off += 64;
+                qh_off += 32;
+                sc_off += 8;
+            }
+            for b in 0..m {
+                out[b * n_rows + row_idx] += block_sums[b];
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[inline]
+fn tiled_k_exact_supported(ttype: GgmlType) -> bool {
+    matches!(
+        ttype.0,
+        GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+    )
+}
+
+/// Scalar-exact tiled K-quant dispatcher.
+///
+/// This is currently used only for small exact-mode row windows when the
+/// architecture-specific MR4 mirror is inactive. That avoids changing default
+/// fast-prefill policy while still eliminating per-token scalar row scans for
+/// the exact fallback/tail shape.
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_k_exact(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    match qw.ttype.0 {
+        GGML_TYPE_Q2_K => {
+            matmul_quantized_batch_tiled_q2_k_exact(out, inp, qw, mapped, m, row_start, n_rows)
+        }
+        GGML_TYPE_Q3_K => {
+            matmul_quantized_batch_tiled_q3_k_exact(out, inp, qw, mapped, m, row_start, n_rows)
+        }
+        GGML_TYPE_Q4_K => {
+            matmul_quantized_batch_tiled_q4_k_exact(out, inp, qw, mapped, m, row_start, n_rows)
+        }
+        GGML_TYPE_Q5_K => {
+            matmul_quantized_batch_tiled_q5_k_exact(out, inp, qw, mapped, m, row_start, n_rows)
+        }
+        GGML_TYPE_Q6_K => {
+            matmul_quantized_batch_tiled_q6_k_exact(out, inp, qw, mapped, m, row_start, n_rows)
+        }
+        ttype => Err(format!(
+            "matmul_quantized_batch_tiled_k_exact: unsupported type {ttype}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_k_exact_row_major(
+    out_row_major: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+) -> Result<(), String> {
+    if out_row_major.len() < m * n_rows {
+        return Err("matmul_quantized_batch_tiled_k_exact_row_major shape mismatch".to_string());
+    }
+
+    let mut token_major = vec![0.0f32; m * n_rows];
+    matmul_quantized_batch_tiled_k_exact(&mut token_major, inp, qw, mapped, m, row_start, n_rows)?;
+    for b in 0..m {
+        for r in 0..n_rows {
+            out_row_major[r * m + b] = token_major[b * n_rows + r];
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn matmul_quantized_batch_tiled_k_exact_with_scratch(
+    out: &mut [f32],
+    inp: &[f32],
+    qw: &QuantizedTensor,
+    mapped: &[u8],
+    m: usize,
+    row_start: usize,
+    n_rows: usize,
+    tmp: &mut Vec<f32>,
+) -> Result<(), String> {
+    let d = n_rows;
+    if d >= par_matmul_min_rows() {
+        if tmp.len() < d * m {
+            tmp.resize(d * m, 0.0);
+        }
+        let chunk_rows = par_matmul_chunk_rows();
+        let results: Vec<Result<(), String>> = tmp[..d * m]
+            .par_chunks_mut(chunk_rows * m)
+            .enumerate()
+            .map(|(chunk_idx, block)| {
+                let base_row = chunk_idx * chunk_rows;
+                let rows_here = block.len() / m;
+                matmul_quantized_batch_tiled_k_exact_row_major(
+                    block,
+                    inp,
+                    qw,
+                    mapped,
+                    m,
+                    row_start + base_row,
+                    rows_here,
+                )
+            })
+            .collect();
+        for result in results {
+            result?;
+        }
+        for b in 0..m {
+            for r in 0..d {
+                out[b * d + r] = tmp[r * m + b];
+            }
+        }
+        return Ok(());
+    }
+
+    matmul_quantized_batch_tiled_k_exact(out, inp, qw, mapped, m, row_start, n_rows)
+}
+
 /// Same 4-row kernel selection as the sequential MR4 chunk functions, so the
 /// batched path is bit-identical per row block on each architecture.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -5317,6 +9050,12 @@ fn batch_exact_vec_dot_4rows(
     #[cfg(target_arch = "x86_64")]
     {
         match ttype {
+            GGML_TYPE_Q4_0 => vec_dot_q4_0_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_1 => vec_dot_q4_1_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_0 => vec_dot_q5_0_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_1 => vec_dot_q5_1_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_IQ4_NL => vec_dot_iq4_nl_4rows_x86(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k_4rows_x86(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k_4rows_x86(x, r0, r1, r2, r3, n),
@@ -5327,7 +9066,13 @@ fn batch_exact_vec_dot_4rows(
     #[cfg(target_arch = "aarch64")]
     {
         match ttype {
-            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_0 => vec_dot_q4_0_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q4_1 => vec_dot_q4_1_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_0 => vec_dot_q5_0_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q5_1 => vec_dot_q5_1_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_IQ4_NL => vec_dot_iq4_nl_4rows(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q2_K => vec_dot_q2_k_4rows_aarch64(x, r0, r1, r2, r3, n),
+            GGML_TYPE_Q3_K => vec_dot_q3_k_4rows_aarch64(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q4_K => vec_dot_q4_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q5_K => vec_dot_q5_k_4rows(x, r0, r1, r2, r3, n),
             GGML_TYPE_Q6_K => vec_dot_q6_k_4rows(x, r0, r1, r2, r3, n),
@@ -5407,25 +9152,61 @@ pub(crate) fn matmul_quantized_batch_exact(
     // Same MR4 eligibility as `matmul_quantized` (incl. the shared validation
     // status), so row -> kernel assignment matches the sequential path.
     #[cfg(target_arch = "x86_64")]
-    let use_mr4 = matches!(
+    let use_mr4 = if matches!(
         ttype,
-        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
-    ) && use_x86_qk_mr4()
-        && n >= QK_K
-        && n.is_multiple_of(QK_K)
-        && d >= 4
-        && validate_qk_mr4_once_x86(&inp[..n], mapped, data_offset, row_size, n, ttype);
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_IQ4_NL
+    ) {
+        use_x86_qk_mr4()
+            && use_x86_avx2_fma()
+            && n >= QK4_0
+            && n.is_multiple_of(QK4_0)
+            && d >= 4
+            && validate_legacy_mr4_once_x86(&inp[..n], mapped, data_offset, row_size, n, ttype)
+    } else {
+        matches!(
+            ttype,
+            GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+        ) && use_x86_qk_mr4()
+            && n >= QK_K
+            && n.is_multiple_of(QK_K)
+            && d >= 4
+            && validate_qk_mr4_once_x86(&inp[..n], mapped, data_offset, row_size, n, ttype)
+    };
     #[cfg(target_arch = "aarch64")]
-    let use_mr4 = matches!(
+    let use_mr4 = if matches!(
         ttype,
-        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
-    ) && use_aarch64_qk_mr4()
-        && n >= QK_K
-        && n.is_multiple_of(QK_K)
-        && d >= 4
-        && validate_qk_mr4_once(&inp[..n], mapped, data_offset, row_size, n, ttype);
+        GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 | GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 | GGML_TYPE_IQ4_NL
+    ) {
+        use_aarch64_qk_mr4()
+            && n >= QK4_0
+            && n.is_multiple_of(QK4_0)
+            && d >= 4
+            && validate_legacy_q4_q5_iq4_mr4_once_aarch64(
+                &inp[..n],
+                mapped,
+                data_offset,
+                row_size,
+                n,
+                ttype,
+            )
+    } else {
+        matches!(
+            ttype,
+            GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
+        ) && use_aarch64_qk_mr4()
+            && n >= QK_K
+            && n.is_multiple_of(QK_K)
+            && d >= 4
+            && validate_qk_mr4_once(&inp[..n], mapped, data_offset, row_size, n, ttype)
+    };
     #[cfg(all(not(target_arch = "x86_64"), not(target_arch = "aarch64")))]
     let use_mr4 = false;
+
+    if !use_mr4 && tiled_k_exact_supported(qw.ttype) {
+        return matmul_quantized_batch_tiled_k_exact_with_scratch(
+            out, inp, qw, mapped, m, row_start, n_rows, tmp,
+        );
+    }
 
     if tmp.len() < d * m {
         tmp.resize(d * m, 0.0);
@@ -5651,10 +9432,48 @@ mod tests {
             assert!((got - want).abs() < 1e-6, "got={got} want={want}");
         }
     }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn prepared_q8_activation_can_differ_from_exact_q8_dot() {
+        let n = QK8_0;
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q8_0));
+        let mut row = vec![0u8; block_sz];
+        row[0] = 0x00;
+        row[1] = 0x3c; // fp16 1.0 scale
+        for q in &mut row[2..2 + QK8_0] {
+            *q = 127u8;
+        }
+
+        let mut x = vec![0.01f32; n];
+        x[0] = 100.0;
+
+        let exact = x
+            .iter()
+            .zip(&row[2..2 + QK8_0])
+            .map(|(&xv, &q)| xv * q as i8 as f32)
+            .sum::<f32>();
+        let mut scratch = MatmulActivationScratch::new();
+        let preq = prequantize_activation_q8(&x, n, &mut scratch);
+        let mut dot = 0i32;
+        for j in 0..QK8_0 {
+            dot += preq.xq_i8[j] as i32 * row[2 + j] as i8 as i32;
+        }
+        let fast_semantics = dot as f32 * preq.scales[0];
+
+        assert!(
+            (exact - fast_semantics).abs() > 1.0,
+            "fixture should expose activation-quantization drift: exact={exact}, fast={fast_semantics}"
+        );
+        assert!(
+            (exact - fast_semantics).abs() < exact.abs() * 0.01,
+            "drift should remain bounded for this fixture: exact={exact}, fast={fast_semantics}"
+        );
+    }
 }
 
 #[cfg(test)]
-mod q3k_mr4_tests {
+mod qk_mr4_tests {
     use super::*;
     use crate::engine::types::GgmlType;
 
@@ -5665,6 +9484,639 @@ mod q3k_mr4_tests {
         s ^= s << 17;
         *state = s;
         s
+    }
+
+    #[test]
+    fn q2k_4rows_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+        let mut st = 0xD1B5_4A32_9977_4401u64;
+
+        for nb in [1usize, 2, 5] {
+            let n = nb * QK_K;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d_at = i * block_sz + QK_K / 16 + QK_K / 4;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let dmin16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[d_at] = (d16 & 0xff) as u8;
+                    row[d_at + 1] = (d16 >> 8) as u8;
+                    row[d_at + 2] = (dmin16 & 0xff) as u8;
+                    row[d_at + 3] = (dmin16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q2_k_4rows(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q2_k(&x, &rows[0], n),
+                vec_dot_q2_k(&x, &rows[1], n),
+                vec_dot_q2_k(&x, &rows[2], n),
+                vec_dot_q2_k(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q2k_4rows_x86_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+        let mut st = 0xBADC_0FFE_E15E_A5E5u64;
+
+        for nb in [1usize, 3, 7] {
+            let n = nb * QK_K;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d_at = i * block_sz + QK_K / 16 + QK_K / 4;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let dmin16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[d_at] = (d16 & 0xff) as u8;
+                    row[d_at + 1] = (d16 >> 8) as u8;
+                    row[d_at + 2] = (dmin16 & 0xff) as u8;
+                    row[d_at + 3] = (dmin16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q2_k_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q2_k(&x, &rows[0], n),
+                vec_dot_q2_k(&x, &rows[1], n),
+                vec_dot_q2_k(&x, &rows[2], n),
+                vec_dot_q2_k(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q2k_4rows_x86_vnni_prequant_matches_single_row_when_available() {
+        if !use_x86_avx_vnni() && !use_x86_avx512_vnni_q8() {
+            return;
+        }
+
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+        let mut st = 0xC001_D00D_2220_0001u64;
+
+        for nb in [1usize, 3, 7] {
+            let n = nb * QK_K;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d_at = i * block_sz + QK_K / 16 + QK_K / 4;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let dmin16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[d_at] = (d16 & 0xff) as u8;
+                    row[d_at + 1] = (d16 >> 8) as u8;
+                    row[d_at + 2] = (dmin16 & 0xff) as u8;
+                    row[d_at + 3] = (dmin16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+            let mut scratch = MatmulActivationScratch::new();
+            let preq = prequantize_activation_q8(&x, n, &mut scratch);
+
+            let got = unsafe {
+                if use_x86_avx512_vnni_q8() {
+                    vec_dot_q2_k_4rows_x86_avx512vnni_prequant(
+                        &preq, &rows[0], &rows[1], &rows[2], &rows[3], n,
+                    )
+                } else {
+                    vec_dot_q2_k_4rows_x86_avxvnni_prequant(
+                        &preq, &rows[0], &rows[1], &rows[2], &rows[3], n,
+                    )
+                }
+            };
+            for r in 0..4 {
+                let want = vec_dot_q2_k(&x, &rows[r], n);
+                let tol = 5e-4f32 * want.abs().max(1.0);
+                assert!(
+                    (got[r] - want).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {want}, tol={tol}",
+                    got[r],
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q2k_4rows_aarch64_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q2_K));
+        let mut st = 0xA64A_C0DE_2220_0001u64;
+
+        for nb in [1usize, 3, 7] {
+            let n = nb * QK_K;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d_at = i * block_sz + QK_K / 16 + QK_K / 4;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let dmin16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[d_at] = (d16 & 0xff) as u8;
+                    row[d_at + 1] = (d16 >> 8) as u8;
+                    row[d_at + 2] = (dmin16 & 0xff) as u8;
+                    row[d_at + 3] = (dmin16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q2_k_4rows_aarch64(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q2_k(&x, &rows[0], n),
+                vec_dot_q2_k(&x, &rows[1], n),
+                vec_dot_q2_k(&x, &rows[2], n),
+                vec_dot_q2_k(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4_0_4rows_x86_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_0));
+        let mut st = 0xC001_C0DE_4440_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK4_0;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[i * block_sz] = (d16 & 0xff) as u8;
+                    row[i * block_sz + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q4_0_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q4_0(&x, &rows[0], n),
+                vec_dot_q4_0(&x, &rows[1], n),
+                vec_dot_q4_0(&x, &rows[2], n),
+                vec_dot_q4_0(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4_1_4rows_x86_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_1));
+        let mut st = 0xC001_C0DE_4441_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK4_1;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let m16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                    row[off + 2] = (m16 & 0xff) as u8;
+                    row[off + 3] = (m16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q4_1_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q4_1(&x, &rows[0], n),
+                vec_dot_q4_1(&x, &rows[1], n),
+                vec_dot_q4_1(&x, &rows[2], n),
+                vec_dot_q4_1(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q4_0_4rows_aarch64_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_0));
+        let mut st = 0xA64A_C0DE_4440_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK4_0;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[i * block_sz] = (d16 & 0xff) as u8;
+                    row[i * block_sz + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q4_0_4rows(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q4_0(&x, &rows[0], n),
+                vec_dot_q4_0(&x, &rows[1], n),
+                vec_dot_q4_0(&x, &rows[2], n),
+                vec_dot_q4_0(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q4_1_4rows_aarch64_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q4_1));
+        let mut st = 0xA64A_C0DE_4441_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK4_1;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let m16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                    row[off + 2] = (m16 & 0xff) as u8;
+                    row[off + 3] = (m16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q4_1_4rows(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q4_1(&x, &rows[0], n),
+                vec_dot_q4_1(&x, &rows[1], n),
+                vec_dot_q4_1(&x, &rows[2], n),
+                vec_dot_q4_1(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q5_0_4rows_aarch64_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_0));
+        let mut st = 0xA64A_C0DE_5550_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK5_0;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q5_0_4rows(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q5_0(&x, &rows[0], n),
+                vec_dot_q5_0(&x, &rows[1], n),
+                vec_dot_q5_0(&x, &rows[2], n),
+                vec_dot_q5_0(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q5_1_4rows_aarch64_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_1));
+        let mut st = 0xA64A_C0DE_5551_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK5_1;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let m16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                    row[off + 2] = (m16 & 0xff) as u8;
+                    row[off + 3] = (m16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q5_1_4rows(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q5_1(&x, &rows[0], n),
+                vec_dot_q5_1(&x, &rows[1], n),
+                vec_dot_q5_1(&x, &rows[2], n),
+                vec_dot_q5_1(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q5_0_4rows_x86_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_0));
+        let mut st = 0xC001_C0DE_5550_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK5_0;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q5_0_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q5_0(&x, &rows[0], n),
+                vec_dot_q5_0(&x, &rows[1], n),
+                vec_dot_q5_0(&x, &rows[2], n),
+                vec_dot_q5_0(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q5_1_4rows_x86_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q5_1));
+        let mut st = 0xC001_C0DE_5551_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK5_1;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    let m16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                    row[off + 2] = (m16 & 0xff) as u8;
+                    row[off + 3] = (m16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_q5_1_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_q5_1(&x, &rows[0], n),
+                vec_dot_q5_1(&x, &rows[1], n),
+                vec_dot_q5_1(&x, &rows[2], n),
+                vec_dot_q5_1(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn iq4_nl_4rows_x86_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_IQ4_NL));
+        let mut st = 0xC001_C0DE_1040_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK4_NL;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_iq4_nl_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_iq4_nl(&x, &rows[0], n),
+                vec_dot_iq4_nl(&x, &rows[1], n),
+                vec_dot_iq4_nl(&x, &rows[2], n),
+                vec_dot_iq4_nl(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn iq4_nl_4rows_aarch64_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_IQ4_NL));
+        let mut st = 0xA64A_C0DE_1040_0001u64;
+
+        for nb in [1usize, 5, 13] {
+            let n = nb * QK4_NL;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let off = i * block_sz;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[off] = (d16 & 0xff) as u8;
+                    row[off + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+
+            let got = vec_dot_iq4_nl_4rows(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            let want = [
+                vec_dot_iq4_nl(&x, &rows[0], n),
+                vec_dot_iq4_nl(&x, &rows[1], n),
+                vec_dot_iq4_nl(&x, &rows[2], n),
+                vec_dot_iq4_nl(&x, &rows[3], n),
+            ];
+            for r in 0..4 {
+                let tol = 1e-4f32 * want[r].abs().max(1.0);
+                assert!(
+                    (got[r] - want[r]).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
     }
 
     /// The 4-row Q3_K kernel must equal the reference single-row `vec_dot_q3_k`
@@ -5697,6 +10149,43 @@ mod q3k_mr4_tests {
                 .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
                 .collect();
             let got = vec_dot_q3_k_4rows_x86(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
+            for r in 0..4 {
+                let want = vec_dot_q3_k(&x, &rows[r], n);
+                let tol = 1e-4f32 * want.abs().max(1.0);
+                assert!(
+                    (got[r] - want).abs() <= tol,
+                    "nb={nb} row={r}: got {}, want {want}",
+                    got[r],
+                );
+            }
+        }
+    }
+
+    /// On ARM the MR4 dispatch uses the explicit NEON kernel, validated with the
+    /// same scalar-reference oracle as the portable and x86 variants.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn q3k_4rows_aarch64_matches_single_row() {
+        let block_sz = get_type_size(GgmlType(GGML_TYPE_Q3_K));
+        let mut st = 0x6C8E_9CF5_5709_32BDu64;
+        for nb in [1usize, 3] {
+            let n = nb * QK_K;
+            let mut rows: [Vec<u8>; 4] = std::array::from_fn(|_| vec![0u8; nb * block_sz]);
+            for row in rows.iter_mut() {
+                for b in row.iter_mut() {
+                    *b = (xorshift(&mut st) & 0xff) as u8;
+                }
+                for i in 0..nb {
+                    let d_at = i * block_sz + QK_K / 8 + QK_K / 4 + 12;
+                    let d16: u16 = 0x3000 | (xorshift(&mut st) as u16 & 0x03ff);
+                    row[d_at] = (d16 & 0xff) as u8;
+                    row[d_at + 1] = (d16 >> 8) as u8;
+                }
+            }
+            let x: Vec<f32> = (0..n)
+                .map(|_| (xorshift(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+            let got = vec_dot_q3_k_4rows_aarch64(&x, &rows[0], &rows[1], &rows[2], &rows[3], n);
             for r in 0..4 {
                 let want = vec_dot_q3_k(&x, &rows[r], n);
                 let tol = 1e-4f32 * want.abs().max(1.0);
@@ -5773,6 +10262,7 @@ mod batch_exact_tests {
     /// comparison via NaN != NaN).
     fn d16_offsets(ttype: i32, block_sz: usize) -> Vec<usize> {
         match ttype {
+            GGML_TYPE_Q2_K => vec![QK_K / 16 + QK_K / 4, QK_K / 16 + QK_K / 4 + 2],
             GGML_TYPE_Q3_K => vec![QK_K / 8 + QK_K / 4 + 12],
             GGML_TYPE_Q4_K | GGML_TYPE_Q5_K => vec![0, 2],
             GGML_TYPE_Q6_K => vec![block_sz - 2],
@@ -5818,7 +10308,13 @@ mod batch_exact_tests {
     fn batch_exact_is_bitwise_equal_to_per_token() {
         let mut st = 0xfeed_beef_dead_cafeu64;
         let n = 2 * QK_K;
-        for &ttype in &[GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+        for &ttype in &[
+            GGML_TYPE_Q2_K,
+            GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+        ] {
             for &d_rows in &[3usize, 6, 400] {
                 let (qw, mapped) = synth(ttype, d_rows, n, &mut st);
                 for &m in &[1usize, 2, 5] {
@@ -5846,6 +10342,309 @@ mod batch_exact_tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_q2k_exact_matches_scalar_vec_dot_bitwise() {
+        let mut st = 0x711e_d222_cafe_f00du64;
+        let n = 3 * QK_K;
+        let d_rows = 7usize;
+        let row_start = 1usize;
+        let n_rows = 5usize;
+        let m = 4usize;
+        let (qw, mapped) = synth(GGML_TYPE_Q2_K, d_rows, n, &mut st);
+        let row_size = get_row_size(n, qw.ttype);
+        let inp: Vec<f32> = (0..m * n)
+            .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+            .collect();
+        let mut tiled = vec![0.0f32; m * n_rows];
+
+        matmul_quantized_batch_tiled_q2_k_exact(
+            &mut tiled, &inp, &qw, &mapped, m, row_start, n_rows,
+        )
+        .unwrap();
+
+        for b in 0..m {
+            let x = &inp[b * n..(b + 1) * n];
+            for r in 0..n_rows {
+                let global_row = row_start + r;
+                let row_off = global_row * row_size;
+                let row = &mapped[row_off..row_off + row_size];
+                let want = vec_dot_q2_k(x, row, n);
+                let got = tiled[b * n_rows + r];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "token={b} row={r}: got {got}, want {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_q3k_exact_matches_scalar_vec_dot_bitwise() {
+        let mut st = 0x711e_d333_cafe_f00du64;
+        let n = 3 * QK_K;
+        let d_rows = 7usize;
+        let row_start = 1usize;
+        let n_rows = 5usize;
+        let m = 4usize;
+        let (qw, mapped) = synth(GGML_TYPE_Q3_K, d_rows, n, &mut st);
+        let row_size = get_row_size(n, qw.ttype);
+        let inp: Vec<f32> = (0..m * n)
+            .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+            .collect();
+        let mut tiled = vec![0.0f32; m * n_rows];
+
+        matmul_quantized_batch_tiled_q3_k_exact(
+            &mut tiled, &inp, &qw, &mapped, m, row_start, n_rows,
+        )
+        .unwrap();
+
+        for b in 0..m {
+            let x = &inp[b * n..(b + 1) * n];
+            for r in 0..n_rows {
+                let global_row = row_start + r;
+                let row_off = global_row * row_size;
+                let row = &mapped[row_off..row_off + row_size];
+                let want = vec_dot_q3_k(x, row, n);
+                let got = tiled[b * n_rows + r];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "token={b} row={r}: got {got}, want {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_q4k_exact_matches_scalar_vec_dot_bitwise() {
+        let mut st = 0x711e_d444_cafe_f00du64;
+        let n = 3 * QK_K;
+        let d_rows = 7usize;
+        let row_start = 1usize;
+        let n_rows = 5usize;
+        let m = 4usize;
+        let (qw, mapped) = synth(GGML_TYPE_Q4_K, d_rows, n, &mut st);
+        let row_size = get_row_size(n, qw.ttype);
+        let inp: Vec<f32> = (0..m * n)
+            .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+            .collect();
+        let mut tiled = vec![0.0f32; m * n_rows];
+
+        matmul_quantized_batch_tiled_q4_k_exact(
+            &mut tiled, &inp, &qw, &mapped, m, row_start, n_rows,
+        )
+        .unwrap();
+
+        for b in 0..m {
+            let x = &inp[b * n..(b + 1) * n];
+            for r in 0..n_rows {
+                let global_row = row_start + r;
+                let row_off = global_row * row_size;
+                let row = &mapped[row_off..row_off + row_size];
+                let want = vec_dot_q4_k(x, row, n);
+                let got = tiled[b * n_rows + r];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "token={b} row={r}: got {got}, want {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_q5k_exact_matches_scalar_vec_dot_bitwise() {
+        let mut st = 0x711e_d555_cafe_f00du64;
+        let n = 3 * QK_K;
+        let d_rows = 7usize;
+        let row_start = 1usize;
+        let n_rows = 5usize;
+        let m = 4usize;
+        let (qw, mapped) = synth(GGML_TYPE_Q5_K, d_rows, n, &mut st);
+        let row_size = get_row_size(n, qw.ttype);
+        let inp: Vec<f32> = (0..m * n)
+            .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+            .collect();
+        let mut tiled = vec![0.0f32; m * n_rows];
+
+        matmul_quantized_batch_tiled_q5_k_exact(
+            &mut tiled, &inp, &qw, &mapped, m, row_start, n_rows,
+        )
+        .unwrap();
+
+        for b in 0..m {
+            let x = &inp[b * n..(b + 1) * n];
+            for r in 0..n_rows {
+                let global_row = row_start + r;
+                let row_off = global_row * row_size;
+                let row = &mapped[row_off..row_off + row_size];
+                let want = vec_dot_q5_k(x, row, n);
+                let got = tiled[b * n_rows + r];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "token={b} row={r}: got {got}, want {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_q6k_exact_matches_scalar_vec_dot_bitwise() {
+        let mut st = 0x711e_d666_cafe_f00du64;
+        let n = 3 * QK_K;
+        let d_rows = 7usize;
+        let row_start = 1usize;
+        let n_rows = 5usize;
+        let m = 4usize;
+        let (qw, mapped) = synth(GGML_TYPE_Q6_K, d_rows, n, &mut st);
+        let row_size = get_row_size(n, qw.ttype);
+        let inp: Vec<f32> = (0..m * n)
+            .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+            .collect();
+        let mut tiled = vec![0.0f32; m * n_rows];
+
+        matmul_quantized_batch_tiled_q6_k_exact(
+            &mut tiled, &inp, &qw, &mapped, m, row_start, n_rows,
+        )
+        .unwrap();
+
+        for b in 0..m {
+            let x = &inp[b * n..(b + 1) * n];
+            for r in 0..n_rows {
+                let global_row = row_start + r;
+                let row_off = global_row * row_size;
+                let row = &mapped[row_off..row_off + row_size];
+                let want = vec_dot_q6_k(x, row, n);
+                let got = tiled[b * n_rows + r];
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "token={b} row={r}: got {got}, want {want}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_k_exact_parallel_chunks_match_scalar_vec_dot_bitwise() {
+        let mut st = 0x711e_da7a_cafe_f00du64;
+        let n = QK_K;
+        let row_start = 1usize;
+        let n_rows = par_matmul_min_rows() + par_matmul_chunk_rows() + 3;
+        let d_rows = n_rows + 2;
+        let m = 3usize;
+
+        for &ttype in &[
+            GGML_TYPE_Q2_K,
+            GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+        ] {
+            let (qw, mapped) = synth(ttype, d_rows, n, &mut st);
+            let row_size = get_row_size(n, qw.ttype);
+            let inp: Vec<f32> = (0..m * n)
+                .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+            let mut tiled = vec![0.0f32; m * n_rows];
+            let mut tmp = Vec::new();
+
+            matmul_quantized_batch_tiled_k_exact_with_scratch(
+                &mut tiled, &inp, &qw, &mapped, m, row_start, n_rows, &mut tmp,
+            )
+            .unwrap();
+
+            assert!(
+                tmp.len() >= m * n_rows,
+                "parallel tiled path should use caller scratch for ttype={ttype}"
+            );
+            for b in 0..m {
+                let x = &inp[b * n..(b + 1) * n];
+                for r in 0..n_rows {
+                    let global_row = row_start + r;
+                    let row_off = global_row * row_size;
+                    let row = &mapped[row_off..row_off + row_size];
+                    let want = match ttype {
+                        GGML_TYPE_Q2_K => vec_dot_q2_k(x, row, n),
+                        GGML_TYPE_Q3_K => vec_dot_q3_k(x, row, n),
+                        GGML_TYPE_Q4_K => vec_dot_q4_k(x, row, n),
+                        GGML_TYPE_Q5_K => vec_dot_q5_k(x, row, n),
+                        GGML_TYPE_Q6_K => vec_dot_q6_k(x, row, n),
+                        _ => unreachable!(),
+                    };
+                    let got = tiled[b * n_rows + r];
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "ttype={ttype} token={b} row={r}: got {got}, want {want}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_fast_row_window_matches_exact_with_tolerance() {
+        let mut st = 0x1234_f00d_cafe_5678u64;
+        let n = 2 * QK_K;
+        let d_rows = 9usize;
+        let row_start = 2usize;
+        let n_rows = 5usize;
+        let m = 3usize;
+
+        for &ttype in &[
+            GGML_TYPE_Q2_K,
+            GGML_TYPE_Q3_K,
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+        ] {
+            let (qw, mapped) = synth(ttype, d_rows, n, &mut st);
+            let inp: Vec<f32> = (0..m * n)
+                .map(|_| (xs(&mut st) as f64 / u64::MAX as f64 * 2.0 - 1.0) as f32)
+                .collect();
+            let mut exact = vec![0.0f32; m * n_rows];
+            let mut fast = vec![0.0f32; m * n_rows];
+            let mut exact_tmp = Vec::new();
+            let mut fast_tmp = Vec::new();
+
+            matmul_quantized_batch_exact(
+                &mut exact,
+                &inp,
+                &qw,
+                &mapped,
+                m,
+                row_start,
+                n_rows,
+                &mut exact_tmp,
+            )
+            .unwrap();
+            matmul_quantized_batch_fast(
+                &mut fast,
+                &inp,
+                &qw,
+                &mapped,
+                m,
+                row_start,
+                n_rows,
+                &mut fast_tmp,
+            )
+            .unwrap();
+
+            for i in 0..m * n_rows {
+                let tol = 5e-4f32 * exact[i].abs().max(1.0);
+                assert!(
+                    (fast[i] - exact[i]).abs() <= tol,
+                    "ttype={ttype} i={i}: fast={}, exact={}, tol={tol}",
+                    fast[i],
+                    exact[i]
+                );
             }
         }
     }

@@ -327,7 +327,7 @@ If required multimodal tensors/components are missing, the runner fails fast wit
 
 - Feature coverage: `docs/features.md`
 - Performance history: `docs/performance.md`
-- Performance ideas/tuning notes: `docs/performance-improvement-suggestions.md`
+- Tokenizer benchmark flow: `docs/tokenizer-benchmark.md`
 - Module layout: `docs/module-structure.md`
 
 ## GGUF Metadata Dump (No Inference)

@@ -373,7 +373,7 @@ src/
 
 - Numerical and sampling kernels used by inference.
 - `math.rs`: normalization, softmax, vector math, Qwen3Next SSM linear attention helpers.
-- `quant.rs`: quantized dequant/dot/matmul paths, architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, and x86 Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, AMD-aware x86 MR4 dispatch preference (AVX2-first on AMD), architecture-specific matmul row prefetch helpers (x86 + aarch64), and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
+- `quant.rs`: quantized dequant/dot/matmul paths, reusable activation scratch and explicit prepared-activation matmul entry points for allocation-free Q8 prequantized fast paths and x86 Q2_K/Q4_K/Q5_K/Q6_K VNNI activation reuse (including half-block activation sums for Q2_K min correction), architecture-specific fast paths (including pre-quantized activation reuse for Q8 matmul on aarch64, x86 AVX2/FMA-preferred Q8 paths with optional fallback to lossy VNNI Q8 kernels, Q2_K/Q3_K/Q4_K/Q5_K/Q6_K MR4 dispatch, ARM Q2_K/Q3_K and legacy Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL MR4 NEON coverage, x86 Q2_K/Q3_K plus legacy Q4_0/Q4_1/Q5_0/Q5_1 and IQ4_NL MR4 AVX2/FMA table-shuffle coverage, and x86 Q2_K/Q4_K/Q5_K/Q6_K MR4 AVX-VNNI/AVX512-VNNI paths), MR4 validation, AMD-aware x86 MR4 dispatch preference (AVX2-first on AMD), architecture-specific matmul row prefetch helpers (x86 + aarch64), exact batched-prefill helpers including serial and parallel tiled Q2_K/Q3_K/Q4_K/Q5_K/Q6_K scalar-exact dispatch for non-MR4 row windows, and the batched quantized matmul helper used by the RAG BERT embed path with caller-owned dequant scratch reuse.
   - one-time kernel self-check disable warnings are now quiet by default and can be re-enabled with `GGUF_KERNEL_VALIDATION_WARNINGS=1`
 - `sampling.rs`: token selection helpers (`argmax`, multinomial sample, top-k/top-p sampler).
 
@@ -388,6 +388,7 @@ src/
   - `transformer_with_embedding_without_logits(...)` for embedded prefill steps that only need KV/cache state
   - accepts multimodal prefill vectors at either `dim` or `input_embedding_dim`
   - applies per-layer deepstack residual injection for Qwen3-VL-style expanded embeddings
+  - reuses kernel activation scratch across the high-frequency sequential projection calls in a token step, including prepared-activation reuse across compatible dense, BERT fused, Qwen3Next full-attention, and FFN gate/up projection groups
   - applies llama-style Qwen3.5 M-RoPE cache reconstruction for text decode (`[t,h,w,e]=[pos,pos,pos,0]`)
   - owns reusable per-token scratch buffers for routed MoE experts, including selected-expert contribution staging in `RunState`
   - quantized KV cache storage for attention state:
