@@ -1,6 +1,7 @@
 name: Push
 
 on:
+  workflow_dispatch: 
   push:
     branches:
       - main
@@ -70,6 +71,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             rustflags: -C target-cpu=x86-64
             artifact_name: gguf-runner-windows-amd64
+            artifact_path: target/x86_64-pc-windows-msvc/release/gguf-runner.exe
+          - name: windows-arm64
+            os: windows-11-arm 
+            target: aarch64-pc-windows-msvc
+            rustflags: -C target-cpu=oryon
+            artifact_name: gguf-runner-windows-arm64
             artifact_path: target/x86_64-pc-windows-msvc/release/gguf-runner.exe
     runs-on: ${{ matrix.os }}
     steps:
