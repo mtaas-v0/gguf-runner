@@ -75,9 +75,10 @@ jobs:
           - name: windows-arm64
             os: windows-11-arm 
             target: aarch64-pc-windows-msvc
-            rustflags: -C target-cpu=oryon
+            rustflags: -C target-cpu=neoverse-v1
+            #oryon not found yet
             artifact_name: gguf-runner-windows-arm64
-            artifact_path: target/x86_64-pc-windows-msvc/release/gguf-runner.exe
+            artifact_path: target/aarch64-pc-windows-msvc/release/gguf-runner.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
