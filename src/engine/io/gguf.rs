@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::path::Path;
+#[cfg(not(unix))]
+use std::io::{SeekFrom};
 
 pub(crate) fn read_u16_le(data: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([data[off], data[off + 1]])
@@ -206,6 +208,7 @@ fn parse_gguf_inner<R: Read + Seek>(
     debug_mode: bool,
     mapped: MappedFile,
 ) -> Result<GGUFFile, String> {
+    #[cfg(not(unix))]
     reader.seek(SeekFrom::Start(0))?; //in-case-nonUnix
     let magic = read_u32(reader).map_err(|e| format!("failed to read magic number: {e}"))?;
     if magic != GGUF_MAGIC {
@@ -389,13 +392,13 @@ fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, S
     let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
     let mapped = MappedFile::map(&file).map_err(|e| format!("mmap failed: {e}"))?;
     #[cfg(unix)]
-    parse_gguf_inner(&mut file, debug_mode, mapped)
+    parse_gguf_inner(&mut file, debug_mode, mapped);
 
     #[cfg(not(unix))]
     let mut file2 = File::open(filename).map_err(|e| format!("file2 map_err {filename}: {e}"))?;
 
     #[cfg(not(unix))]
-    parse_gguf_inner(&mut file2, debug_mode, mapped)
+    parse_gguf_inner(&mut file2, debug_mode, mapped);
 }
 
 /// Parse a GGUF model from a static byte slice (e.g. embedded via `include_bytes!`).
