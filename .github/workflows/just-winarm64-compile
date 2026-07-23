@@ -1,0 +1,55 @@
+name: Push
+
+on:
+  workflow_dispatch: 
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-arm64
+            os: windows-11-arm 
+            target: aarch64-pc-windows-msvc
+            rustflags: -C target-cpu=apple-m1
+            #-C target-cpu=neoverse-v1 may include SVE?
+            #oryon not found yet
+            artifact_name: gguf-runner-windows-arm64
+            artifact_path: target/aarch64-pc-windows-msvc/release/gguf-runner.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Configure Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.target }}
+      - name: Build release binary (custom rustflags)
+        if: matrix.rustflags != ''
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --target ${{ matrix.target }} --locked
+      - name: Build release binary (default target flags)
+        if: matrix.rustflags == ''
+        run: cargo build --release --target ${{ matrix.target }} --locked
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}-run${{ github.run_number }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+          retention-days: 1
