@@ -380,9 +380,22 @@ fn parse_gguf_inner<R: Read + Seek>(
 }
 
 fn parse_gguf_file_local(filename: &str, debug_mode: bool) -> Result<GGUFFile, String> {
-    let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
-    let mapped = MappedFile::map(&file).map_err(|e| format!("mmap failed: {e}"))?;
-    parse_gguf_inner(&mut file, debug_mode, mapped)
+    cfg_if::cfg_if! {
+        if #[cfg(unix)] {
+            // Unix-specific lines
+            println!("parse_gguf_file_local cfg(unix)");
+            let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
+            let mapped = MappedFile::map(&file).map_err(|e| format!("mmap failed: {e}"))?;
+            parse_gguf_inner(&mut file, debug_mode, mapped)
+        } else {
+            // Non-Unix lines (equivalent to #[cfg(not(unix))])
+            println!("parse_gguf_file_local cfg(not(unix))");
+            let mut file = File::open(filename).map_err(|e| format!("cannot open file {filename}: {e}"))?;
+            let mapped = MappedFile::map(&file).map_err(|e| format!("mmap failed: {e}"))?;
+            let mut file2 = File::open(filename).map_err(|e| format!("file2 map_err {filename}: {e}"))?;
+            parse_gguf_inner(&mut file2, debug_mode, mapped)
+        }
+    }
 }
 
 /// Parse a GGUF model from a static byte slice (e.g. embedded via `include_bytes!`).
