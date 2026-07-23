@@ -298,6 +298,9 @@ impl MappedFile {
             ));
         }
 
+        // Print the exact size of the file in bytes
+        println!("backing.len(): {} bytes", backing.len());
+
         let mut backing = bytes.into_boxed_slice();
         let ptr = backing.as_mut_ptr();
         let len = backing.len();
