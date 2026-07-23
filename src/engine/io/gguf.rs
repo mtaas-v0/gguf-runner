@@ -206,6 +206,7 @@ fn parse_gguf_inner<R: Read + Seek>(
     debug_mode: bool,
     mapped: MappedFile,
 ) -> Result<GGUFFile, String> {
+    reader.seek(SeekFrom::Start(0))?; //in-case-nonUnix
     let magic = read_u32(reader).map_err(|e| format!("failed to read magic number: {e}"))?;
     if magic != GGUF_MAGIC {
         return Err(format!(
