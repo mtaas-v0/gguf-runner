@@ -75,7 +75,8 @@ jobs:
           - name: windows-arm64
             os: windows-11-arm 
             target: aarch64-pc-windows-msvc
-            rustflags: -C target-cpu=neoverse-v1
+            rustflags: -C target-cpu=apple-m1
+            #-C target-cpu=neoverse-v1 may include SVE?
             #oryon not found yet
             artifact_name: gguf-runner-windows-arm64
             artifact_path: target/aarch64-pc-windows-msvc/release/gguf-runner.exe
