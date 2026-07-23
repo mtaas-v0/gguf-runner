@@ -59,6 +59,7 @@ pub(crate) fn bf16_to_fp32(h: u16) -> f32 {
 
 fn read_exact_array<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
     let mut b = [0u8; N];
+    println!("r.read_exact->: {} bytes", usize);
     r.read_exact(&mut b)?;
     Ok(b)
 }
