@@ -57,9 +57,19 @@ pub(crate) fn bf16_to_fp32(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
 
+fn print_type_size<T>() {
+    // 1. Get the size of T in bytes
+    let size_in_bytes: usize = size_of::<T>();
+    
+    // 2. Print the result
+    println!("The size of T is: {} bytes", size_in_bytes);
+}
+
+
 fn read_exact_array<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
     let mut b = [0u8; N];
-    println!("r.read_exact->: {} bytes", usize);
+    let size_in_bytes: usize = size_of::<T>();
+    println!("r.read_exact->: {} bytes", size_in_bytes);
     r.read_exact(&mut b)?;
     Ok(b)
 }
