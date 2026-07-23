@@ -1,4 +1,4 @@
-name: Push
+name: aarch64-pc-windows-msvc
 
 on:
   workflow_dispatch: 
