@@ -69,7 +69,7 @@ fn print_type_size<T>() {
 fn read_exact_array<const N: usize>(r: &mut impl Read) -> io::Result<[u8; N]> {
     let mut b = [0u8; N];
     // let size_in_bytes: usize = size_of::<N>();
-    println!("r.read_exact->: {} bytes", b.len());
+    // println!("r.read_exact->: {} bytes", b.len());
     r.read_exact(&mut b)?;
     Ok(b)
 }
